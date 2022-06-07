@@ -476,6 +476,11 @@ impl MappableCommand {
         diff_peek, "Show the diff of the change at cursor (HEAD and branch diff)",
         git_blame_line, "Show git blame popup for line at cursor",
         reset_branch_change, "Reset branch diff hunk at cursor to merge-base content",
+        grow_buffer_width, "Grow focused container width",
+        shrink_buffer_width, "Shrink focused container width",
+        grow_buffer_height, "Grow focused container height",
+        shrink_buffer_height, "Shrink focused container height",
+        buffer_focus_mode, "Enable focus mode on buffer",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -949,6 +954,26 @@ fn goto_line_start(cx: &mut Context) {
             Movement::Move
         },
     )
+}
+
+fn grow_buffer_width(cx: &mut Context) {
+    cx.editor.grow_buffer_width();
+}
+
+fn shrink_buffer_width(cx: &mut Context) {
+    cx.editor.shrink_buffer_width();
+}
+
+fn grow_buffer_height(cx: &mut Context) {
+    cx.editor.grow_buffer_height();
+}
+
+fn shrink_buffer_height(cx: &mut Context) {
+    cx.editor.shrink_buffer_height();
+}
+
+fn buffer_focus_mode(cx: &mut Context) {
+    cx.editor.buffer_focus_mode();
 }
 
 fn goto_next_buffer(cx: &mut Context) {
