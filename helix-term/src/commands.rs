@@ -476,11 +476,11 @@ impl MappableCommand {
         diff_peek, "Show the diff of the change at cursor (HEAD and branch diff)",
         git_blame_line, "Show git blame popup for line at cursor",
         reset_branch_change, "Reset branch diff hunk at cursor to merge-base content",
-        grow_buffer_width, "Grow focused container width",
-        shrink_buffer_width, "Shrink focused container width",
-        grow_buffer_height, "Grow focused container height",
-        shrink_buffer_height, "Shrink focused container height",
-        toggle_focus_window, "Toggle focus mode on buffer",
+        grow_view_width, "Grow focused container width",
+        shrink_view_width, "Shrink focused container width",
+        grow_view_height, "Grow focused container height",
+        shrink_view_height, "Shrink focused container height",
+        toggle_view_focus, "Toggle focus mode on buffer",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -956,24 +956,24 @@ fn goto_line_start(cx: &mut Context) {
     )
 }
 
-fn grow_buffer_width(cx: &mut Context) {
-    cx.editor.resize_buffer(Resize::Grow, Dimension::Width);
+fn grow_view_width(cx: &mut Context) {
+    cx.editor.resize_view(Resize::Grow, Dimension::Width);
 }
 
-fn shrink_buffer_width(cx: &mut Context) {
-    cx.editor.resize_buffer(Resize::Shrink, Dimension::Width);
+fn shrink_view_width(cx: &mut Context) {
+    cx.editor.resize_view(Resize::Shrink, Dimension::Width);
 }
 
-fn grow_buffer_height(cx: &mut Context) {
-    cx.editor.resize_buffer(Resize::Grow, Dimension::Height);
+fn grow_view_height(cx: &mut Context) {
+    cx.editor.resize_view(Resize::Grow, Dimension::Height);
 }
 
-fn shrink_buffer_height(cx: &mut Context) {
-    cx.editor.resize_buffer(Resize::Shrink, Dimension::Height);
+fn shrink_view_height(cx: &mut Context) {
+    cx.editor.resize_view(Resize::Shrink, Dimension::Height);
 }
 
-fn toggle_focus_window(cx: &mut Context) {
-    cx.editor.toggle_focus_window();
+fn toggle_view_focus(cx: &mut Context) {
+    cx.editor.toggle_view_focus();
 }
 
 fn goto_next_buffer(cx: &mut Context) {
