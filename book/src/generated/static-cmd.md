@@ -168,6 +168,10 @@
 | `diff_peek` | Show the diff of the change at cursor (HEAD and branch diff) | normal: `` <space>K ``, select: `` <space>K `` |
 | `git_blame_line` | Show git blame popup for line at cursor | normal: `` <space>L ``, select: `` <space>L `` |
 | `reset_branch_change` | Reset branch diff hunk at cursor to merge-base content | normal: `` <space>v ``, select: `` <space>v `` |
+| `grow_view_width` | Grow focused container width | normal: `` <C-w>rl ``, `` <space>wrl ``, `` <C-w>r<right> ``, `` <space>wr<right> ``, select: `` <C-w>rl ``, `` <space>wrl ``, `` <C-w>r<right> ``, `` <space>wr<right> `` |
+| `shrink_view_width` | Shrink focused container width | normal: `` <C-w>rh ``, `` <space>wrh ``, `` <C-w>r<left> ``, `` <space>wr<left> ``, select: `` <C-w>rh ``, `` <space>wrh ``, `` <C-w>r<left> ``, `` <space>wr<left> `` |
+| `grow_view_height` | Grow focused container height | normal: `` <C-w>rk ``, `` <C-w>r<up> ``, `` <space>wrk ``, `` <space>wr<up> ``, select: `` <C-w>rk ``, `` <C-w>r<up> ``, `` <space>wrk ``, `` <space>wr<up> `` |
+| `shrink_view_height` | Shrink focused container height | normal: `` <C-w>rj ``, `` <space>wrj ``, `` <C-w>r<down> ``, `` <space>wr<down> ``, select: `` <C-w>rj ``, `` <space>wrj ``, `` <C-w>r<down> ``, `` <space>wr<down> `` |
 | `goto_line_start` | Goto line start | normal: `` gh ``, `` <home> ``, select: `` gh ``, insert: `` <home> `` |
 | `goto_line_end` | Goto line end | normal: `` gl ``, `` <end> ``, select: `` gl `` |
 | `goto_column` | Goto column | normal: `` g\| `` |
