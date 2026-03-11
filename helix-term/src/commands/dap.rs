@@ -2,7 +2,7 @@ use super::{Context, Editor};
 use crate::{
     compositor::{self, Compositor},
     job::{Callback, Jobs},
-    ui::{self, overlay::overlaid, Picker, Popup, Prompt, PromptEvent, Text},
+    ui::{self, overlay::overlaid, DebugVariables, Picker, Prompt, PromptEvent},
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugConfigCompletion, DebugTemplate};
@@ -11,7 +11,6 @@ use helix_lsp::block_on;
 use helix_view::editor::Breakpoint;
 
 use serde_json::{to_value, Value};
-use tui::text::Spans;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -545,44 +544,11 @@ pub fn dap_variables(cx: &mut Context) {
         }
     };
 
-    // TODO: allow expanding variables into sub-fields
-    let mut variables = Vec::new();
+    let debugger_id = debugger.id();
+    let mut variables = DebugVariables::new(debugger_id, scopes);
+    variables.expand_initial(cx.editor);
 
-    let theme = &cx.editor.theme;
-    let scope_style = theme.get("ui.linenr.selected");
-    let type_style = theme.get("ui.text");
-    let text_style = theme.get("ui.text.focus");
-
-    for scope in scopes.iter() {
-        // use helix_view::graphics::Style;
-        use tui::text::Span;
-        let response = block_on(debugger.variables(scope.variables_reference));
-
-        variables.push(Spans::from(Span::styled(
-            format!("▸ {}", scope.name),
-            scope_style,
-        )));
-
-        if let Ok(vars) = response {
-            variables.reserve(vars.len());
-            for var in vars {
-                let mut spans = Vec::with_capacity(5);
-
-                spans.push(Span::styled(var.name.to_owned(), text_style));
-                if let Some(ty) = var.ty {
-                    spans.push(Span::raw(": "));
-                    spans.push(Span::styled(ty.to_owned(), type_style));
-                }
-                spans.push(Span::raw(" = "));
-                spans.push(Span::styled(var.value.to_owned(), text_style));
-                variables.push(Spans::from(spans));
-            }
-        }
-    }
-
-    let contents = Text::from(tui::text::Text::from(variables));
-    let popup = Popup::new("dap-variables", contents);
-    cx.replace_or_push_layer("dap-variables", popup);
+    cx.replace_or_push_layer(DebugVariables::ID, overlaid(variables));
 }
 
 pub fn dap_terminate(cx: &mut Context) {

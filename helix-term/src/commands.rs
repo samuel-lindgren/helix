@@ -590,7 +590,7 @@ impl MappableCommand {
         dap_step_in, "Step in",
         dap_step_out, "Step out",
         dap_next, "Step to next",
-        dap_variables, "List variables",
+        dap_variables, "Open debug variables browser",
         dap_terminate, "End debug session",
         dap_edit_condition, "Edit breakpoint condition on current line",
         dap_edit_log, "Edit breakpoint log message on current line",
