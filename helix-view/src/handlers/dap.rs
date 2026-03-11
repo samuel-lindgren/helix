@@ -4,11 +4,13 @@ use dap::requests::DisconnectArguments;
 use dap::requests::ThreadsArguments;
 use helix_core::Selection;
 use helix_dap::{
-    self as dap, registry::DebugAdapterId, Client, ConnectionType, Payload, Request, ThreadId,
+    self as dap, events, registry::DebugAdapterId, Client, ConnectionType, Payload, Request,
+    ThreadId,
 };
 use helix_lsp::block_on;
 use log::{error, warn};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 
@@ -31,18 +33,75 @@ pub fn dap_pos_to_pos(doc: &helix_core::Rope, line: usize, column: usize) -> Opt
     Some(pos)
 }
 
-pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: bool) {
-    let debugger = debugger!(editor);
-
-    if !force && debugger.thread_id.is_some() {
-        return;
+fn should_select_thread(
+    active_thread_id: Option<ThreadId>,
+    thread_states: &dap::ThreadStates,
+    thread_id: ThreadId,
+    force: bool,
+) -> bool {
+    if force {
+        return true;
     }
 
-    debugger.thread_id = Some(thread_id);
-    fetch_stack_trace(debugger, thread_id).await;
+    match active_thread_id {
+        None => true,
+        Some(active_thread_id) if active_thread_id == thread_id => true,
+        Some(active_thread_id) => thread_states
+            .get(&active_thread_id)
+            .map_or(true, |state| state == "running"),
+    }
+}
 
-    let frame = debugger.stack_frames[&thread_id].first().cloned();
-    if let Some(frame) = &frame {
+fn apply_thread_event(
+    thread_states: &mut dap::ThreadStates,
+    stack_frames: &mut HashMap<ThreadId, Vec<helix_dap::StackFrame>>,
+    active_thread_id: &mut Option<ThreadId>,
+    active_frame: &mut Option<usize>,
+    thread: &events::ThreadBody,
+) {
+    match thread.reason.as_str() {
+        "started" => {
+            thread_states.insert(thread.thread_id, "running".to_owned());
+        }
+        "exited" => {
+            thread_states.remove(&thread.thread_id);
+            stack_frames.remove(&thread.thread_id);
+            if *active_thread_id == Some(thread.thread_id) {
+                *active_thread_id = None;
+                *active_frame = None;
+            }
+        }
+        reason => {
+            thread_states.insert(thread.thread_id, reason.to_owned());
+        }
+    }
+}
+
+pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: bool) {
+    {
+        let debugger = debugger!(editor);
+
+        if !should_select_thread(
+            debugger.thread_id,
+            &debugger.thread_states,
+            thread_id,
+            force,
+        ) {
+            return;
+        }
+
+        debugger.thread_id = Some(thread_id);
+        fetch_stack_trace(debugger, thread_id).await;
+    }
+
+    let debugger = debugger!(editor);
+    let frame = debugger
+        .stack_frames
+        .get(&thread_id)
+        .and_then(|frames| frames.first())
+        .cloned();
+    debugger.active_frame = frame.as_ref().map(|_| 0);
+    if let Some(frame) = frame.as_ref() {
         jump_to_stack_frame(editor, frame);
     }
 }
@@ -50,10 +109,12 @@ pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: b
 pub async fn fetch_stack_trace(debugger: &mut Client, thread_id: ThreadId) {
     let (frames, _) = match debugger.stack_trace(thread_id).await {
         Ok(frames) => frames,
-        Err(_) => return,
+        Err(_) => {
+            debugger.stack_frames.remove(&thread_id);
+            return;
+        }
     };
     debugger.stack_frames.insert(thread_id, frames);
-    debugger.active_frame = Some(0);
 }
 
 pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
@@ -180,19 +241,28 @@ impl Editor {
 
                         let all_threads_stopped = all_threads_stopped.unwrap_or_default();
 
+                        if let Some(thread_id) = thread_id {
+                            debugger.thread_states.insert(thread_id, reason.clone());
+                            // TODO: dap uses "type" || "reason" here
+                        }
+
                         if all_threads_stopped {
                             if let Ok(response) = debugger
                                 .request::<dap::requests::Threads>(Some(ThreadsArguments {}))
                                 .await
                             {
+                                let mut fallback_thread_id = None;
+
                                 for thread in response.threads {
+                                    fallback_thread_id.get_or_insert(thread.id);
                                     fetch_stack_trace(debugger, thread.id).await;
                                 }
-                                select_thread_id(self, thread_id.unwrap_or_default(), false).await;
+
+                                if let Some(thread_id) = thread_id.or(fallback_thread_id) {
+                                    select_thread_id(self, thread_id, false).await;
+                                }
                             }
                         } else if let Some(thread_id) = thread_id {
-                            debugger.thread_states.insert(thread_id, reason.clone()); // TODO: dap uses "type" || "reason" here
-
                             fetch_stack_trace(debugger, thread_id).await;
                             // whichever thread stops is made "current" (if no previously selected thread).
                             select_thread_id(self, thread_id, false).await;
@@ -236,8 +306,13 @@ impl Editor {
                             None => return false,
                         };
 
-                        debugger.thread_id = Some(thread.thread_id);
-                        // set the stack frame for the thread
+                        apply_thread_event(
+                            &mut debugger.thread_states,
+                            &mut debugger.stack_frames,
+                            &mut debugger.thread_id,
+                            &mut debugger.active_frame,
+                            &thread,
+                        );
                     }
                     Event::Breakpoint(events::BreakpointBody { reason, breakpoint }) => {
                         match &reason[..] {
@@ -513,5 +588,117 @@ impl Editor {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thread_id(id: isize) -> ThreadId {
+        serde_json::from_value(serde_json::json!(id)).unwrap()
+    }
+
+    #[test]
+    fn selects_new_stopped_thread_when_active_thread_is_not_stopped() {
+        let mut thread_states = dap::ThreadStates::new();
+        thread_states.insert(thread_id(1), "running".to_owned());
+
+        assert!(should_select_thread(
+            Some(thread_id(1)),
+            &thread_states,
+            thread_id(2),
+            false
+        ));
+        assert!(should_select_thread(
+            Some(thread_id(1)),
+            &dap::ThreadStates::new(),
+            thread_id(2),
+            false
+        ));
+        assert!(should_select_thread(
+            None,
+            &thread_states,
+            thread_id(2),
+            false
+        ));
+    }
+
+    #[test]
+    fn preserves_explicitly_selected_stopped_thread_until_forced() {
+        let mut thread_states = dap::ThreadStates::new();
+        thread_states.insert(thread_id(1), "breakpoint".to_owned());
+
+        assert!(!should_select_thread(
+            Some(thread_id(1)),
+            &thread_states,
+            thread_id(2),
+            false
+        ));
+        assert!(should_select_thread(
+            Some(thread_id(1)),
+            &thread_states,
+            thread_id(2),
+            true
+        ));
+        assert!(should_select_thread(
+            Some(thread_id(1)),
+            &thread_states,
+            thread_id(1),
+            false
+        ));
+    }
+
+    #[test]
+    fn thread_started_updates_state_without_changing_active_thread() {
+        let mut thread_states = dap::ThreadStates::new();
+        let mut stack_frames = HashMap::new();
+        let mut active_thread_id = Some(thread_id(7));
+        let mut active_frame = Some(0);
+
+        apply_thread_event(
+            &mut thread_states,
+            &mut stack_frames,
+            &mut active_thread_id,
+            &mut active_frame,
+            &events::ThreadBody {
+                reason: "started".to_owned(),
+                thread_id: thread_id(9),
+            },
+        );
+
+        assert_eq!(active_thread_id, Some(thread_id(7)));
+        assert_eq!(active_frame, Some(0));
+        assert_eq!(
+            thread_states.get(&thread_id(9)).map(String::as_str),
+            Some("running")
+        );
+    }
+
+    #[test]
+    fn thread_exit_clears_selected_thread_state_and_stack_frames() {
+        let mut thread_states = dap::ThreadStates::new();
+        let mut stack_frames = HashMap::new();
+        let mut active_thread_id = Some(thread_id(9));
+        let mut active_frame = Some(3);
+
+        thread_states.insert(thread_id(9), "breakpoint".to_owned());
+        stack_frames.insert(thread_id(9), Vec::new());
+
+        apply_thread_event(
+            &mut thread_states,
+            &mut stack_frames,
+            &mut active_thread_id,
+            &mut active_frame,
+            &events::ThreadBody {
+                reason: "exited".to_owned(),
+                thread_id: thread_id(9),
+            },
+        );
+
+        assert_eq!(active_thread_id, None);
+        assert_eq!(active_frame, None);
+        assert!(!thread_states.contains_key(&thread_id(9)));
+        assert!(!stack_frames.contains_key(&thread_id(9)));
     }
 }
