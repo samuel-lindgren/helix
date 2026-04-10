@@ -415,6 +415,7 @@ impl MappableCommand {
         changed_file_picker, "Open changed file picker",
         branch_changed_file_picker, "Open changed file picker for current branch vs main/master",
         toggle_branch_diff, "Toggle branch diff gutter overlay (current branch vs main/master)",
+        recent_files_picker, "Open recent files picker",
         goto_next_breakpoint, "Goto next breakpoint",
         goto_prev_breakpoint, "Goto previous breakpoint",
         select_references_to_symbol_under_cursor, "Select symbol references",
@@ -3445,6 +3446,51 @@ fn changed_file_picker(cx: &mut Context) {
 
 fn branch_changed_file_picker(cx: &mut Context) {
     changed_file_picker_impl(cx, ChangedFileSource::Branch)
+}
+
+fn recent_files_picker(cx: &mut Context) {
+    let cwd = helix_stdx::env::current_working_dir();
+    let entries = crate::handlers::recent_files::load();
+
+    if entries.is_empty() {
+        cx.editor.set_status("No recent files");
+        return;
+    }
+
+    struct RecentFileData {
+        cwd: PathBuf,
+    }
+
+    let columns = [PickerColumn::new(
+        "path",
+        |path: &PathBuf, data: &RecentFileData| {
+            path.strip_prefix(&data.cwd)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+                .into()
+        },
+    )];
+
+    let picker = Picker::new(
+        columns,
+        0,
+        entries,
+        RecentFileData { cwd },
+        |cx, path: &PathBuf, action| {
+            if let Err(e) = cx.editor.open(path, action) {
+                let err = if let Some(err) = e.source() {
+                    format!("{}", err)
+                } else {
+                    format!("unable to open \"{}\"", path.display())
+                };
+                cx.editor.set_error(err);
+            }
+        },
+    )
+    .with_preview(|_editor, path| Some((path.as_path().into(), None)));
+
+    cx.push_layer(Box::new(overlaid(picker)));
 }
 
 pub fn command_palette(cx: &mut Context) {

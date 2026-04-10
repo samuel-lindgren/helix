@@ -240,6 +240,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "g" => changed_file_picker,
             "B" => branch_changed_file_picker,
             "T" => toggle_branch_diff,
+            "o" => recent_files_picker,
             "a" => code_action,
             "'" => last_picker,
             "G" => { "Debug (experimental)" sticky=true
