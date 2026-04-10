@@ -413,6 +413,7 @@ impl MappableCommand {
         syntax_symbol_picker, "Open symbol picker from syntax information",
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
+        recent_files_picker, "Open recent files picker",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
         syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",
@@ -3420,6 +3421,51 @@ fn changed_file_picker(cx: &mut Context) {
                 true
             }
         });
+    cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn recent_files_picker(cx: &mut Context) {
+    let cwd = helix_stdx::env::current_working_dir();
+    let entries = crate::handlers::recent_files::load();
+
+    if entries.is_empty() {
+        cx.editor.set_status("No recent files");
+        return;
+    }
+
+    struct RecentFileData {
+        cwd: PathBuf,
+    }
+
+    let columns = [PickerColumn::new(
+        "path",
+        |path: &PathBuf, data: &RecentFileData| {
+            path.strip_prefix(&data.cwd)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+                .into()
+        },
+    )];
+
+    let picker = Picker::new(
+        columns,
+        0,
+        entries,
+        RecentFileData { cwd },
+        |cx, path: &PathBuf, action| {
+            if let Err(e) = cx.editor.open(path, action) {
+                let err = if let Some(err) = e.source() {
+                    format!("{}", err)
+                } else {
+                    format!("unable to open \"{}\"", path.display())
+                };
+                cx.editor.set_error(err);
+            }
+        },
+    )
+    .with_preview(|_editor, path| Some((path.as_path().into(), None)));
+
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
