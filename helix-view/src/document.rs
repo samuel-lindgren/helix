@@ -197,6 +197,12 @@ pub struct Document {
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
+    /// Optional second diff against the merge-base between HEAD and the branch
+    /// base (`main`/`master`). Populated only when the editor's
+    /// `branch_diff_enabled` flag is on. Gutter rendering overlays this on top
+    /// of `diff_handle` so users can see committed-in-branch changes alongside
+    /// uncommitted working-tree edits.
+    branch_diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 
     // when document was used for most-recent-used buffer picker
@@ -723,6 +729,7 @@ impl Document {
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
+            branch_diff_handle: None,
             config,
             version_control_head: None,
             focused_at: std::time::Instant::now(),
@@ -1256,6 +1263,16 @@ impl Document {
             None => self.diff_handle = None,
         }
 
+        // Refresh the branch diff handle only if one was already attached
+        // (i.e. the editor had branch diff enabled when this doc was opened).
+        // The handle's existence is the "enabled for this doc" signal.
+        if self.branch_diff_handle.is_some() {
+            match provider_registry.get_branch_diff_base(&path) {
+                Some(diff_base) => self.set_branch_diff_base(diff_base),
+                None => self.branch_diff_handle = None,
+            }
+        }
+
         self.version_control_head = provider_registry.get_current_head_name(&path);
 
         Ok(())
@@ -1462,6 +1479,9 @@ impl Document {
         // start computing the diff in parallel
         if let Some(diff_handle) = &self.diff_handle {
             diff_handle.update_document(self.text.clone(), false);
+        }
+        if let Some(branch_diff_handle) = &self.branch_diff_handle {
+            branch_diff_handle.update_document(self.text.clone(), false);
         }
 
         // map diagnostics over changes too
@@ -1889,6 +1909,30 @@ impl Document {
         } else {
             self.diff_handle = None;
         }
+    }
+
+    /// Accessor for the optional branch diff handle (merge-base vs HEAD).
+    pub fn branch_diff_handle(&self) -> Option<&DiffHandle> {
+        self.branch_diff_handle.as_ref()
+    }
+
+    /// Initialize/update the branch differ. Populated only when the editor's
+    /// `branch_diff_enabled` flag is on and the file exists at the merge-base.
+    pub fn set_branch_diff_base(&mut self, diff_base: Vec<u8>) {
+        if let Ok((diff_base, ..)) = from_reader(&mut diff_base.as_slice(), Some(self.encoding)) {
+            if let Some(differ) = &self.branch_diff_handle {
+                differ.update_diff_base(diff_base);
+                return;
+            }
+            self.branch_diff_handle = Some(DiffHandle::new(diff_base, self.text.clone()))
+        } else {
+            self.branch_diff_handle = None;
+        }
+    }
+
+    /// Drop the branch differ. Called when the editor toggles branch diff off.
+    pub fn clear_branch_diff(&mut self) {
+        self.branch_diff_handle = None;
     }
 
     pub fn version_control_head(&self) -> Option<Arc<Box<str>>> {
