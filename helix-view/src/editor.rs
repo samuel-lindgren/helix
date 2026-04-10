@@ -1202,6 +1202,11 @@ pub struct Editor {
     pub language_servers: helix_lsp::Registry,
     pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
+    /// When true, documents get a second diff handle computed against the
+    /// merge-base of HEAD and the base branch (`main`/`master`). Used by the
+    /// gutter to paint a "committed in branch" overlay alongside the usual
+    /// working-tree diff. Toggled at runtime via `toggle_branch_diff`.
+    pub branch_diff_enabled: bool,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1356,6 +1361,7 @@ impl Editor {
             language_servers,
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
+            branch_diff_enabled: false,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             watch_expressions: Vec::new(),
@@ -1937,6 +1943,13 @@ impl Editor {
 
             if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
                 doc.set_diff_base(diff_base);
+            }
+            if self.branch_diff_enabled {
+                if let Some(branch_diff_base) =
+                    self.diff_providers.get_branch_diff_base(&path)
+                {
+                    doc.set_branch_diff_base(branch_diff_base);
+                }
             }
             doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
 

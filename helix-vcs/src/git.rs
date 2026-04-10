@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use gix::filter::plumbing::driver::apply::Delay;
+use std::collections::HashSet;
 use std::io::Read;
-use std::path::Path;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -59,6 +61,53 @@ pub fn get_diff_base(file: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// Returns the content of `file` at the merge-base between HEAD and the base
+/// branch (`main` or `master`). Used to power the "branch diff" gutter overlay
+/// that shows every line changed in the current branch, including lines that
+/// are already committed (not just working-tree edits).
+pub fn get_branch_diff_base(file: &Path) -> Result<Vec<u8>> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let head_id = repo.head_id()?.detach();
+
+    // Auto-detect base branch: try main, fall back to master.
+    let base_ref = repo
+        .find_reference("refs/heads/main")
+        .or_else(|_| repo.find_reference("refs/heads/master"))
+        .context("neither refs/heads/main nor refs/heads/master found")?;
+    let base_id = base_ref.into_fully_peeled_id()?.detach();
+
+    let merge_base_id = repo.merge_base(head_id, base_id)?.detach();
+    let merge_base_commit = repo.find_commit(merge_base_id)?;
+
+    // If the file didn't exist at the merge-base, `find_file_in_commit` will
+    // bail; the caller turns that into `None`, meaning no branch handle is
+    // attached (correct — the file is entirely new in the branch).
+    let file_oid = find_file_in_commit(&repo, &merge_base_commit, &file)?;
+
+    let file_object = repo.find_object(file_oid)?;
+    let data = file_object.detach().data;
+    if let Some(work_dir) = repo.workdir() {
+        let rela_path = file.strip_prefix(work_dir)?;
+        let rela_path = gix::path::try_into_bstr(rela_path)?;
+        let (mut pipeline, _) = repo.filter_pipeline(None)?;
+        let mut worktree_outcome =
+            pipeline.convert_to_worktree(&data, rela_path.as_ref(), Delay::Forbid)?;
+        let mut buf = Vec::with_capacity(data.len());
+        worktree_outcome.read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(data)
+    }
+}
+
 pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
@@ -81,6 +130,13 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
     status(&open_repo(cwd)?.to_thread_local(), f)
+}
+
+pub fn for_each_branch_changed_file(
+    cwd: &Path,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
+    branch_status(&open_repo(cwd)?.to_thread_local(), f)
 }
 
 fn open_repo(path: &Path) -> Result<ThreadSafeRepository> {
@@ -198,6 +254,193 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
     }
 
     Ok(())
+}
+
+/// Like [`status`], but shows files that differ between the current branch and
+/// its base (`main` or `master`), unioned with working-tree changes. Working-tree
+/// changes take precedence when a file appears in both sets.
+fn branch_status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
+        .to_path_buf();
+
+    let head_id = repo.head_id()?.detach();
+
+    // Auto-detect base branch: try main, fall back to master.
+    let base_ref = repo
+        .find_reference("refs/heads/main")
+        .or_else(|_| repo.find_reference("refs/heads/master"))
+        .context("neither refs/heads/main nor refs/heads/master found")?;
+    let base_id = base_ref.into_fully_peeled_id()?.detach();
+
+    // Collect working-tree changes first; these win over committed changes.
+    let working_tree_changes = collect_status(repo)?;
+
+    // Track which paths the working-tree set already covers so we don't emit duplicates.
+    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(working_tree_changes.len());
+    for change in &working_tree_changes {
+        match change {
+            FileChange::Untracked { path }
+            | FileChange::Modified { path }
+            | FileChange::Conflict { path }
+            | FileChange::Deleted { path } => {
+                seen.insert(path.clone());
+            }
+            FileChange::Renamed { from_path, to_path } => {
+                seen.insert(from_path.clone());
+                seen.insert(to_path.clone());
+            }
+        }
+    }
+
+    // Emit working-tree changes immediately.
+    for change in working_tree_changes {
+        if !f(Ok(change)) {
+            return Ok(());
+        }
+    }
+
+    // Compute committed diff: merge-base(HEAD, base) -> HEAD.
+    // Skip if base isn't reachable or we're already at/behind it.
+    let merge_base_id = match repo.merge_base(head_id, base_id) {
+        Ok(id) => id.detach(),
+        Err(err) => {
+            // No common ancestor — treat as empty committed diff, but surface
+            // the error so the user knows why.
+            f(Err(err.into()));
+            return Ok(());
+        }
+    };
+
+    if merge_base_id == head_id {
+        return Ok(());
+    }
+
+    let merge_base_tree = repo.find_commit(merge_base_id)?.tree()?;
+    let head_tree = repo.find_commit(head_id)?.tree()?;
+
+    let mut platform = merge_base_tree.changes()?;
+    // Disable rewrite tracking for speed; we don't need rename detection here.
+    // Addition + Deletion for a rename is still useful output.
+    platform.options(|opts| {
+        opts.track_path();
+        opts.track_rewrites(None);
+    });
+
+    let mut committed: Vec<FileChange> = Vec::new();
+    platform.for_each_to_obtain_tree(
+        &head_tree,
+        |change| -> std::result::Result<ControlFlow<()>, std::convert::Infallible> {
+            use gix::object::tree::diff::Change as DiffChange;
+            let file_change = match change {
+                DiffChange::Addition {
+                    location,
+                    entry_mode,
+                    ..
+                } => {
+                    if !matches!(
+                        entry_mode.kind(),
+                        EntryKind::Blob | EntryKind::BlobExecutable
+                    ) {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    let Ok(rel) = location.to_path() else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    FileChange::Untracked {
+                        path: work_dir.join(rel),
+                    }
+                }
+                DiffChange::Deletion {
+                    location,
+                    entry_mode,
+                    ..
+                } => {
+                    if !matches!(
+                        entry_mode.kind(),
+                        EntryKind::Blob | EntryKind::BlobExecutable
+                    ) {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    let Ok(rel) = location.to_path() else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    FileChange::Deleted {
+                        path: work_dir.join(rel),
+                    }
+                }
+                DiffChange::Modification {
+                    location,
+                    entry_mode,
+                    ..
+                } => {
+                    if !matches!(
+                        entry_mode.kind(),
+                        EntryKind::Blob | EntryKind::BlobExecutable
+                    ) {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                    let Ok(rel) = location.to_path() else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    FileChange::Modified {
+                        path: work_dir.join(rel),
+                    }
+                }
+                DiffChange::Rewrite {
+                    source_location,
+                    location,
+                    ..
+                } => {
+                    let (Ok(from), Ok(to)) =
+                        (source_location.to_path(), location.to_path())
+                    else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    FileChange::Renamed {
+                        from_path: work_dir.join(from),
+                        to_path: work_dir.join(to),
+                    }
+                }
+            };
+            committed.push(file_change);
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+
+    for change in committed {
+        let already_seen = match &change {
+            FileChange::Untracked { path }
+            | FileChange::Modified { path }
+            | FileChange::Conflict { path }
+            | FileChange::Deleted { path } => seen.contains(path),
+            FileChange::Renamed { from_path, to_path } => {
+                seen.contains(from_path) || seen.contains(to_path)
+            }
+        };
+        if already_seen {
+            continue;
+        }
+        if !f(Ok(change)) {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+/// Run working-tree status and collect the results into a `Vec` so a caller
+/// can inspect them before emitting. Mirrors [`status`] internally.
+fn collect_status(repo: &Repository) -> Result<Vec<FileChange>> {
+    let out = std::cell::RefCell::new(Vec::new());
+    status(repo, |change| {
+        if let Ok(c) = change {
+            out.borrow_mut().push(c);
+        }
+        true
+    })?;
+    Ok(out.into_inner())
 }
 
 /// Finds the object that contains the contents of a file at a specific commit.

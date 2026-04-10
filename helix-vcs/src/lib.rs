@@ -43,6 +43,26 @@ impl DiffProviderRegistry {
             })
     }
 
+    /// Like [`get_diff_base`], but returns the file contents at the merge-base
+    /// between HEAD and the base branch (`main` / `master`). Used by the branch
+    /// diff gutter overlay to show committed-in-branch changes in addition to
+    /// working-tree edits.
+    pub fn get_branch_diff_base(&self, file: &Path) -> Option<Vec<u8>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.get_branch_diff_base(file) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!(
+                        "failed to open branch diff base for {}",
+                        file.display()
+                    );
+                    None
+                }
+            })
+    }
+
     /// Get the current name of the current [HEAD](https://stackoverflow.com/questions/2304087/what-is-head-in-git).
     pub fn get_current_head_name(&self, file: &Path) -> Option<Arc<ArcSwap<Box<str>>>> {
         self.providers
@@ -69,6 +89,26 @@ impl DiffProviderRegistry {
                 .providers
                 .iter()
                 .find_map(|provider| provider.for_each_changed_file(&cwd, &f).ok())
+                .is_none()
+            {
+                f(Err(anyhow!("no diff provider returns success")));
+            }
+        });
+    }
+
+    /// Fire-and-forget branch-diff iteration: emits files that differ between
+    /// the current branch and its base (`main`/`master`), unioned with working-tree
+    /// changes. Working-tree status wins on paths in both sets.
+    pub fn for_each_branch_changed_file(
+        self,
+        cwd: PathBuf,
+        f: impl Fn(Result<FileChange>) -> bool + Send + 'static,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            if self
+                .providers
+                .iter()
+                .find_map(|provider| provider.for_each_branch_changed_file(&cwd, &f).ok())
                 .is_none()
             {
                 f(Err(anyhow!("no diff provider returns success")));
@@ -110,6 +150,14 @@ impl DiffProvider {
         }
     }
 
+    fn get_branch_diff_base(&self, file: &Path) -> Result<Vec<u8>> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::get_branch_diff_base(file),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
     fn get_current_head_name(&self, file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
         match self {
             #[cfg(feature = "git")]
@@ -126,6 +174,18 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::for_each_changed_file(cwd, f),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    fn for_each_branch_changed_file(
+        &self,
+        cwd: &Path,
+        f: impl Fn(Result<FileChange>) -> bool,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::for_each_branch_changed_file(cwd, f),
             Self::None => bail!("No diff support compiled in"),
         }
     }

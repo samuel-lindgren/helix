@@ -413,6 +413,8 @@ impl MappableCommand {
         syntax_symbol_picker, "Open symbol picker from syntax information",
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
+        branch_changed_file_picker, "Open changed file picker for current branch vs main/master",
+        toggle_branch_diff, "Toggle branch diff gutter overlay (current branch vs main/master)",
         goto_next_breakpoint, "Goto next breakpoint",
         goto_prev_breakpoint, "Goto previous breakpoint",
         select_references_to_symbol_under_cursor, "Select symbol references",
@@ -460,6 +462,12 @@ impl MappableCommand {
         goto_prev_change, "Goto previous change",
         goto_first_change, "Goto first change",
         goto_last_change, "Goto last change",
+        goto_next_branch_change, "Goto next branch change (vs main/master)",
+        goto_prev_branch_change, "Goto previous branch change (vs main/master)",
+        goto_first_branch_change, "Goto first branch change (vs main/master)",
+        goto_last_branch_change, "Goto last branch change (vs main/master)",
+        diff_peek, "Peek removed content of the hunk at cursor (HEAD and branch diff)",
+        reset_branch_change, "Reset branch diff hunk at cursor to merge-base content",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -3330,7 +3338,12 @@ fn jumplist_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
-fn changed_file_picker(cx: &mut Context) {
+enum ChangedFileSource {
+    WorkingTree,
+    Branch,
+}
+
+fn changed_file_picker_impl(cx: &mut Context, source: ChangedFileSource) {
     pub struct FileChangeData {
         cwd: PathBuf,
         style_untracked: Style,
@@ -3411,17 +3424,27 @@ fn changed_file_picker(cx: &mut Context) {
     .with_preview(|_editor, meta| Some((meta.path().into(), None)));
     let injector = picker.injector();
 
-    cx.editor
-        .diff_providers
-        .clone()
-        .for_each_changed_file(cwd, move |change| match change {
-            Ok(change) => injector.push(change).is_ok(),
-            Err(err) => {
-                status::report_blocking(err);
-                true
-            }
-        });
+    let providers = cx.editor.diff_providers.clone();
+    let on_change = move |change| match change {
+        Ok(change) => injector.push(change).is_ok(),
+        Err(err) => {
+            status::report_blocking(err);
+            true
+        }
+    };
+    match source {
+        ChangedFileSource::WorkingTree => providers.for_each_changed_file(cwd, on_change),
+        ChangedFileSource::Branch => providers.for_each_branch_changed_file(cwd, on_change),
+    }
     cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn changed_file_picker(cx: &mut Context) {
+    changed_file_picker_impl(cx, ChangedFileSource::WorkingTree)
+}
+
+fn branch_changed_file_picker(cx: &mut Context) {
+    changed_file_picker_impl(cx, ChangedFileSource::Branch)
 }
 
 pub fn command_palette(cx: &mut Context) {
@@ -4040,18 +4063,71 @@ fn goto_prev_diag(cx: &mut Context) {
     cx.editor.apply_motion(motion)
 }
 
+/// Selects which diff handle a change-goto motion operates on: the
+/// working-tree-vs-HEAD diff (what `[g`/`]g` has always used) or the
+/// branch-vs-merge-base diff (committed changes on this branch).
+#[derive(Copy, Clone)]
+enum ChangeDiffSource {
+    Head,
+    Branch,
+}
+
+impl ChangeDiffSource {
+    fn handle<'a>(&self, doc: &'a Document) -> Option<&'a DiffHandle> {
+        match self {
+            ChangeDiffSource::Head => doc.diff_handle(),
+            ChangeDiffSource::Branch => doc.branch_diff_handle(),
+        }
+    }
+
+    fn missing_message(&self) -> &'static str {
+        match self {
+            ChangeDiffSource::Head => "Diff is not available in current buffer",
+            ChangeDiffSource::Branch => {
+                "Branch diff is not available in current buffer (toggle with space T)"
+            }
+        }
+    }
+}
+
+/// Extract the pre-change text of the hunk containing `cursor_line` from the
+/// given diff handle's base rope. Returns `None` when there is no hunk at the
+/// cursor or when the hunk is a pure addition (nothing previously at that
+/// position).
+fn peek_removed_text(handle: Option<&DiffHandle>, cursor_line: u32) -> Option<String> {
+    let diff = handle?.load();
+    let idx = diff.hunk_at(cursor_line, true)?;
+    let hunk = diff.nth_hunk(idx);
+    if hunk.before.is_empty() {
+        return None;
+    }
+    let base = diff.diff_base();
+    let start = base.line_to_char(hunk.before.start as usize);
+    let end = base.line_to_char(hunk.before.end as usize);
+    let text = base.slice(start..end).to_string();
+    Some(text.trim_end_matches('\n').to_string())
+}
+
 fn goto_first_change(cx: &mut Context) {
-    goto_first_change_impl(cx, false);
+    goto_first_change_impl(cx, false, ChangeDiffSource::Head);
 }
 
 fn goto_last_change(cx: &mut Context) {
-    goto_first_change_impl(cx, true);
+    goto_first_change_impl(cx, true, ChangeDiffSource::Head);
 }
 
-fn goto_first_change_impl(cx: &mut Context, reverse: bool) {
+fn goto_first_branch_change(cx: &mut Context) {
+    goto_first_change_impl(cx, false, ChangeDiffSource::Branch);
+}
+
+fn goto_last_branch_change(cx: &mut Context) {
+    goto_first_change_impl(cx, true, ChangeDiffSource::Branch);
+}
+
+fn goto_first_change_impl(cx: &mut Context, reverse: bool, source: ChangeDiffSource) {
     let editor = &mut cx.editor;
     let (view, doc) = current!(editor);
-    if let Some(handle) = doc.diff_handle() {
+    if let Some(handle) = source.handle(doc) {
         let hunk = {
             let diff = handle.load();
             let idx = if reverse {
@@ -4070,22 +4146,30 @@ fn goto_first_change_impl(cx: &mut Context, reverse: bool) {
 }
 
 fn goto_next_change(cx: &mut Context) {
-    goto_next_change_impl(cx, Direction::Forward)
+    goto_next_change_impl(cx, Direction::Forward, ChangeDiffSource::Head)
 }
 
 fn goto_prev_change(cx: &mut Context) {
-    goto_next_change_impl(cx, Direction::Backward)
+    goto_next_change_impl(cx, Direction::Backward, ChangeDiffSource::Head)
 }
 
-fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
+fn goto_next_branch_change(cx: &mut Context) {
+    goto_next_change_impl(cx, Direction::Forward, ChangeDiffSource::Branch)
+}
+
+fn goto_prev_branch_change(cx: &mut Context) {
+    goto_next_change_impl(cx, Direction::Backward, ChangeDiffSource::Branch)
+}
+
+fn goto_next_change_impl(cx: &mut Context, direction: Direction, source: ChangeDiffSource) {
     let count = cx.count() as u32 - 1;
     let motion = move |editor: &mut Editor| {
         let (view, doc) = current!(editor);
         let doc_text = doc.text().slice(..);
-        let diff_handle = if let Some(diff_handle) = doc.diff_handle() {
+        let diff_handle = if let Some(diff_handle) = source.handle(doc) {
             diff_handle
         } else {
-            editor.set_status("Diff is not available in current buffer");
+            editor.set_status(source.missing_message());
             return;
         };
 
@@ -4123,6 +4207,139 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
         doc.set_selection(view.id, selection)
     };
     cx.editor.apply_motion(motion);
+}
+
+/// Replace the working-tree content of the branch-diff hunk at cursor with
+/// its merge-base content. Git history is untouched — this only rewrites the
+/// buffer, so the prior branch-committed state becomes an uncommitted change.
+fn reset_branch_change(cx: &mut Context) {
+    enum Outcome {
+        NotAvailable,
+        NoHunk,
+        Ready {
+            before_text: String,
+            after_start: usize,
+            after_end: usize,
+        },
+    }
+
+    let outcome = {
+        let (view, doc) = current_ref!(cx.editor);
+        match doc.branch_diff_handle() {
+            None => Outcome::NotAvailable,
+            Some(handle) => {
+                let text = doc.text();
+                let text_slice = text.slice(..);
+                let cursor_line =
+                    doc.selection(view.id).primary().cursor_line(text_slice) as u32;
+                let diff = handle.load();
+                match diff.hunk_at(cursor_line, true) {
+                    None => Outcome::NoHunk,
+                    Some(idx) => {
+                        let hunk = diff.nth_hunk(idx);
+                        let base = diff.diff_base();
+                        let before_start_char = base.line_to_char(hunk.before.start as usize);
+                        let before_end_char = base.line_to_char(hunk.before.end as usize);
+                        let before_text = base.slice(before_start_char..before_end_char).to_string();
+                        let after_start = text.line_to_char(hunk.after.start as usize);
+                        let after_end = text.line_to_char(hunk.after.end as usize);
+                        Outcome::Ready {
+                            before_text,
+                            after_start,
+                            after_end,
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match outcome {
+        Outcome::NotAvailable => {
+            cx.editor
+                .set_error("Branch diff is not available in current buffer (toggle with space T)");
+        }
+        Outcome::NoHunk => {
+            cx.editor.set_status("No branch change at cursor");
+        }
+        Outcome::Ready {
+            before_text,
+            after_start,
+            after_end,
+        } => {
+            let (view, doc) = current!(cx.editor);
+            let transaction = Transaction::change(
+                doc.text(),
+                std::iter::once((after_start, after_end, Some(before_text.into()))),
+            );
+            doc.apply(&transaction, view.id);
+            doc.append_changes_to_history(view);
+            cx.editor.set_status("Reset branch hunk to merge-base");
+        }
+    }
+}
+
+fn diff_peek(cx: &mut Context) {
+    use crate::ui::Markdown;
+
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+    let cursor_line = doc.selection(view.id).primary().cursor_line(text) as u32;
+    let lang = doc.language_name().unwrap_or("text").to_string();
+
+    let head = peek_removed_text(doc.diff_handle(), cursor_line);
+    let branch = peek_removed_text(doc.branch_diff_handle(), cursor_line);
+
+    let md = match (head, branch) {
+        (None, None) => {
+            cx.editor.set_status("No change at cursor");
+            return;
+        }
+        (Some(h), None) => format!("```{lang}\n{h}\n```"),
+        (None, Some(b)) => format!("```{lang}\n{b}\n```"),
+        (Some(h), Some(b)) => format!(
+            "### HEAD\n```{lang}\n{h}\n```\n\n### Branch\n```{lang}\n{b}\n```"
+        ),
+    };
+
+    let syn_loader = cx.editor.syn_loader.clone();
+    cx.callback.push(Box::new(move |compositor, _cx| {
+        let contents = Markdown::new(md, syn_loader);
+        let popup = Popup::new("diff-peek", contents).auto_close(true);
+        compositor.replace_or_push("diff-peek", popup);
+    }));
+}
+
+/// Toggle the branch-diff gutter overlay. When enabled, each open document
+/// grows a second diff handle computed against the merge-base between HEAD and
+/// `main`/`master`. The gutter paints HEAD-diff markers (working tree) in the
+/// usual colors and merge-base-diff markers (committed in branch) in a
+/// distinct color, with HEAD taking priority on any overlapping line.
+fn toggle_branch_diff(cx: &mut Context) {
+    let enable = !cx.editor.branch_diff_enabled;
+    cx.editor.branch_diff_enabled = enable;
+
+    if enable {
+        let targets: Vec<(DocumentId, PathBuf)> = cx
+            .editor
+            .documents()
+            .filter_map(|d| d.path().map(|p| (d.id(), p.clone())))
+            .collect();
+        let providers = cx.editor.diff_providers.clone();
+        for (id, path) in targets {
+            if let Some(base) = providers.get_branch_diff_base(&path) {
+                if let Some(doc) = cx.editor.document_mut(id) {
+                    doc.set_branch_diff_base(base);
+                }
+            }
+        }
+        cx.editor.set_status("Branch diff gutter: on");
+    } else {
+        for doc in cx.editor.documents_mut() {
+            doc.clear_branch_diff();
+        }
+        cx.editor.set_status("Branch diff gutter: off");
+    }
 }
 
 /// Returns the [Range] for a [Hunk] in the given text.

@@ -150,3 +150,167 @@ fn symlink_to_git_repo() {
     assert_eq!(git::get_diff_base(&file_link).unwrap(), contents);
     assert_eq!(git::get_diff_base(&file).unwrap(), contents);
 }
+
+/// Verify `for_each_branch_changed_file` emits both committed changes (between
+/// merge-base and HEAD) and working-tree changes, with working-tree winning on
+/// overlapping paths.
+#[test]
+fn branch_changed_files_union() {
+    use crate::FileChange;
+    use std::collections::BTreeSet;
+
+    let temp_git = empty_git_repo();
+    let root = temp_git.path();
+
+    // Initial commit on main with two files.
+    File::create(root.join("unchanged.txt"))
+        .unwrap()
+        .write_all(b"initial")
+        .unwrap();
+    File::create(root.join("will_be_modified.txt"))
+        .unwrap()
+        .write_all(b"old")
+        .unwrap();
+    create_commit(root, true);
+
+    // Create and switch to a feature branch.
+    exec_git_cmd("checkout -b feature", root);
+
+    // Commit-level change: new file + modification of existing file.
+    File::create(root.join("added_in_branch.txt"))
+        .unwrap()
+        .write_all(b"new")
+        .unwrap();
+    File::create(root.join("will_be_modified.txt"))
+        .unwrap()
+        .write_all(b"committed change")
+        .unwrap();
+    create_commit(root, true);
+
+    // Working-tree changes: a brand new untracked file, AND an uncommitted
+    // modification to a file that was ALSO changed in the branch commit (to
+    // verify working-tree wins).
+    File::create(root.join("untracked_in_worktree.txt"))
+        .unwrap()
+        .write_all(b"untracked")
+        .unwrap();
+    File::create(root.join("will_be_modified.txt"))
+        .unwrap()
+        .write_all(b"worktree edit on top of commit")
+        .unwrap();
+
+    let collected = std::cell::RefCell::new(Vec::<FileChange>::new());
+    git::for_each_branch_changed_file(root, |change| {
+        if let Ok(c) = change {
+            collected.borrow_mut().push(c);
+        }
+        true
+    })
+    .unwrap();
+    let collected = collected.into_inner();
+
+    let mut display: BTreeSet<String> = BTreeSet::new();
+    for change in &collected {
+        match change {
+            FileChange::Untracked { path } => {
+                display.insert(format!(
+                    "untracked:{}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            FileChange::Modified { path } => {
+                display.insert(format!(
+                    "modified:{}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            FileChange::Deleted { path } => {
+                display.insert(format!(
+                    "deleted:{}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            FileChange::Conflict { path } => {
+                display.insert(format!(
+                    "conflict:{}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+            FileChange::Renamed { from_path, to_path } => {
+                display.insert(format!(
+                    "renamed:{}->{}",
+                    from_path.file_name().unwrap().to_string_lossy(),
+                    to_path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    // working-tree untracked file appears
+    assert!(
+        display.contains("untracked:untracked_in_worktree.txt"),
+        "untracked working-tree file missing from {display:?}"
+    );
+    // committed new file appears (as Untracked per our mapping)
+    assert!(
+        display.contains("untracked:added_in_branch.txt"),
+        "branch-committed addition missing from {display:?}"
+    );
+    // the file that was both committed AND has working-tree edits should only
+    // appear once — with the working-tree status (modified), not duplicated.
+    let modified_count = display
+        .iter()
+        .filter(|s| s.ends_with(":will_be_modified.txt"))
+        .count();
+    assert_eq!(
+        modified_count, 1,
+        "will_be_modified.txt appeared {modified_count} times in {display:?}; expected 1"
+    );
+    // unchanged.txt must never appear.
+    assert!(
+        !display.iter().any(|s| s.ends_with(":unchanged.txt")),
+        "unchanged file leaked into branch diff: {display:?}"
+    );
+}
+
+/// If HEAD is the same as the base branch tip, the branch picker should still
+/// show working-tree changes but no committed changes.
+#[test]
+fn branch_changed_files_head_on_base() {
+    use crate::FileChange;
+
+    let temp_git = empty_git_repo();
+    let root = temp_git.path();
+
+    File::create(root.join("a.txt"))
+        .unwrap()
+        .write_all(b"a")
+        .unwrap();
+    create_commit(root, true);
+
+    // Dirty the working tree without branching.
+    File::create(root.join("b.txt"))
+        .unwrap()
+        .write_all(b"b")
+        .unwrap();
+
+    let collected = std::cell::RefCell::new(Vec::<FileChange>::new());
+    git::for_each_branch_changed_file(root, |change| {
+        if let Ok(c) = change {
+            collected.borrow_mut().push(c);
+        }
+        true
+    })
+    .unwrap();
+    let collected = collected.into_inner();
+
+    assert_eq!(
+        collected.len(),
+        1,
+        "expected exactly one change when HEAD is on base branch"
+    );
+    assert!(
+        matches!(&collected[0], FileChange::Untracked { path } if path.file_name().unwrap() == "b.txt"),
+        "expected untracked b.txt"
+    );
+}

@@ -4,7 +4,7 @@ use helix_core::syntax::config::LanguageServerFeature;
 
 use crate::{
     editor::GutterType,
-    graphics::{Style, UnderlineStyle},
+    graphics::{Color, Style, UnderlineStyle},
     Document, Editor, Theme, View,
 };
 
@@ -94,49 +94,106 @@ pub fn diff<'doc>(
     theme: &Theme,
     _is_focused: bool,
 ) -> GutterFn<'doc> {
-    let added = theme.get("diff.plus.gutter");
-    let deleted = theme.get("diff.minus.gutter");
-    let modified = theme.get("diff.delta.gutter");
-    if let Some(diff_handle) = doc.diff_handle() {
-        let hunks = diff_handle.load();
-        let mut hunk_i = 0;
-        let mut hunk = hunks.nth_hunk(hunk_i);
-        Box::new(
-            move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
+    // Working-tree diff (vs HEAD) styles — the existing behavior.
+    let head_added = theme.get("diff.plus.gutter");
+    let head_deleted = theme.get("diff.minus.gutter");
+    let head_modified = theme.get("diff.delta.gutter");
+
+    // Branch-diff overlay styles. Use `try_get_exact` (not `get`) so we don't
+    // fall back to the parent `diff.plus.gutter` scope, which would make the
+    // overlay visually indistinguishable from HEAD changes. If the theme
+    // doesn't define the branch scopes, use a hardcoded distinct color so
+    // the overlay stays visible.
+    let branch_added = theme
+        .try_get_exact("diff.plus.gutter.branch")
+        .unwrap_or_else(|| Style::default().fg(Color::Cyan));
+    let branch_deleted = theme
+        .try_get_exact("diff.minus.gutter.branch")
+        .unwrap_or_else(|| Style::default().fg(Color::LightMagenta));
+    let branch_modified = theme
+        .try_get_exact("diff.delta.gutter.branch")
+        .unwrap_or_else(|| Style::default().fg(Color::Cyan));
+
+    let head_diff = doc.diff_handle().map(|h| h.load());
+    let branch_diff = doc.branch_diff_handle().map(|h| h.load());
+
+    if head_diff.is_none() && branch_diff.is_none() {
+        return Box::new(|_, _, _, _| None);
+    }
+
+    // Two independent monotonic cursors — one per diff source. At each visual
+    // line we advance both past anything ending before `line`, then check HEAD
+    // first (priority rule: working-tree edits win over committed-in-branch
+    // markers on any overlapping line).
+    let mut head_i: u32 = 0;
+    let mut head_hunk = head_diff.as_ref().map(|h| h.nth_hunk(0));
+    let mut branch_i: u32 = 0;
+    let mut branch_hunk = branch_diff.as_ref().map(|h| h.nth_hunk(0));
+
+    Box::new(
+        move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
+            let line_u = line as u32;
+
+            // Advance + check HEAD cursor.
+            if let (Some(hunks), Some(hunk)) = (head_diff.as_ref(), head_hunk.as_mut()) {
                 // truncating the line is fine here because we don't compute diffs
                 // for files with more lines than i32::MAX anyways
                 // we need to special case removals here
                 // these technically do not have a range of lines to highlight (`hunk.after.start == hunk.after.end`).
                 // However we still want to display these hunks correctly we must not yet skip to the next hunk here
-                while hunk.after.end < line as u32
-                    || !hunk.is_pure_removal() && line as u32 == hunk.after.end
+                while hunk.after.end < line_u
+                    || !hunk.is_pure_removal() && line_u == hunk.after.end
                 {
-                    hunk_i += 1;
-                    hunk = hunks.nth_hunk(hunk_i);
+                    head_i += 1;
+                    *hunk = hunks.nth_hunk(head_i);
                 }
 
-                if hunk.after.start > line as u32 {
-                    return None;
+                if hunk.after.start <= line_u {
+                    let (icon, style) = if hunk.is_pure_insertion() {
+                        ("▍", head_added)
+                    } else if hunk.is_pure_removal() {
+                        if !first_visual_line {
+                            return None;
+                        }
+                        ("▔", head_deleted)
+                    } else {
+                        ("▍", head_modified)
+                    };
+
+                    write!(out, "{}", icon).unwrap();
+                    return Some(style);
+                }
+            }
+
+            // HEAD didn't claim this line — fall through to the branch overlay.
+            if let (Some(hunks), Some(hunk)) = (branch_diff.as_ref(), branch_hunk.as_mut()) {
+                while hunk.after.end < line_u
+                    || !hunk.is_pure_removal() && line_u == hunk.after.end
+                {
+                    branch_i += 1;
+                    *hunk = hunks.nth_hunk(branch_i);
                 }
 
-                let (icon, style) = if hunk.is_pure_insertion() {
-                    ("▍", added)
-                } else if hunk.is_pure_removal() {
-                    if !first_visual_line {
-                        return None;
-                    }
-                    ("▔", deleted)
-                } else {
-                    ("▍", modified)
-                };
+                if hunk.after.start <= line_u {
+                    let (icon, style) = if hunk.is_pure_insertion() {
+                        ("▍", branch_added)
+                    } else if hunk.is_pure_removal() {
+                        if !first_visual_line {
+                            return None;
+                        }
+                        ("▔", branch_deleted)
+                    } else {
+                        ("▍", branch_modified)
+                    };
 
-                write!(out, "{}", icon).unwrap();
-                Some(style)
-            },
-        )
-    } else {
-        Box::new(move |_, _, _, _| None)
-    }
+                    write!(out, "{}", icon).unwrap();
+                    return Some(style);
+                }
+            }
+
+            None
+        },
+    )
 }
 
 pub fn line_numbers<'doc>(
