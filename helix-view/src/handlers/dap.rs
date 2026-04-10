@@ -268,6 +268,24 @@ impl Editor {
                             select_thread_id(self, thread_id, false).await;
                         }
 
+                        // Remove temporary breakpoints (from run-to-cursor) and
+                        // re-sync with the debug adapter.
+                        let mut changed_paths = Vec::new();
+                        for (path, breakpoints) in &mut self.breakpoints {
+                            let before = breakpoints.len();
+                            breakpoints.retain(|bp| !bp.temporary);
+                            if breakpoints.len() != before {
+                                changed_paths.push(path.clone());
+                            }
+                        }
+                        if let Some(debugger) = self.debug_adapters.get_client_mut(id) {
+                            for path in changed_paths {
+                                if let Some(breakpoints) = self.breakpoints.get_mut(&path) {
+                                    let _ = breakpoints_changed(debugger, path, breakpoints);
+                                }
+                            }
+                        }
+
                         let scope = match thread_id {
                             Some(id) => format!("Thread {}", id),
                             None => "Target".to_owned(),
@@ -367,18 +385,36 @@ impl Editor {
                     Event::Output(events::OutputBody {
                         category, output, ..
                     }) => {
+                        let is_stderr = category.as_deref() == Some("stderr");
                         let prefix = match category {
                             Some(category) => {
                                 if &category == "telemetry" {
                                     return false;
                                 }
-                                format!("Debug ({}):", category)
+                                format!("[{}]", category)
                             }
-                            None => "Debug:".to_owned(),
+                            None => "[debug]".to_owned(),
                         };
 
                         log::info!("{}", output);
-                        self.set_status(format!("{} {}", prefix, output));
+
+                        // Collect output for the debug output panel.
+                        for line in output.lines() {
+                            if !line.trim().is_empty() {
+                                self.debug_output_log
+                                    .push(format!("{} {}", prefix, line));
+                            }
+                        }
+
+                        // Stderr gets sticky error display; stdout is transient.
+                        let trimmed = output.trim();
+                        if !trimmed.is_empty() {
+                            if is_stderr {
+                                self.set_error(format!("Debug: {}", trimmed));
+                            } else {
+                                self.set_status(format!("Debug: {}", trimmed));
+                            }
+                        }
                     }
                     Event::Initialized(_) => {
                         self.set_status("Debugger initialized...");
@@ -395,8 +431,18 @@ impl Editor {
                         // TODO: fetch breakpoints (in case we're attaching)
 
                         if debugger.configuration_done().await.is_ok() {
-                            self.set_status("Debugged application started");
-                        }; // TODO: do we need to handle error?
+                            let has_errors = self
+                                .debug_output_log
+                                .iter()
+                                .any(|l| l.starts_with("[stderr]"));
+                            if has_errors {
+                                self.set_status(
+                                    "Debugged application started (errors in debug output)",
+                                );
+                            } else {
+                                self.set_status("Debugged application started");
+                            }
+                        };
 
                         self.debug_adapters.set_active_client(id);
                     }

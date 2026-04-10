@@ -10,7 +10,7 @@ use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
 };
-use helix_vcs::{FileChange, Hunk};
+use helix_vcs::{DiffHandle, FileChange, Hunk};
 pub use lsp::*;
 pub use syntax::*;
 use tui::{
@@ -413,6 +413,8 @@ impl MappableCommand {
         syntax_symbol_picker, "Open symbol picker from syntax information",
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
+        goto_next_breakpoint, "Goto next breakpoint",
+        goto_prev_breakpoint, "Goto previous breakpoint",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
         syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",
@@ -596,6 +598,12 @@ impl MappableCommand {
         dap_edit_log, "Edit breakpoint log message on current line",
         dap_switch_thread, "Switch current thread",
         dap_switch_stack_frame, "Switch stack frame",
+        dap_eval_prompt, "Evaluate expression in debug context",
+        dap_eval_selection, "Evaluate word or selection in debug context",
+        dap_run_to_cursor, "Run to cursor line",
+        dap_breakpoint_picker, "List all breakpoints",
+        dap_add_watch, "Add watch expression",
+        dap_remove_watch, "Remove watch expression",
         dap_enable_exceptions, "Enable exception breakpoints",
         dap_disable_exceptions, "Disable exception breakpoints",
         shell_pipe, "Pipe selections through shell command",
@@ -3161,7 +3169,7 @@ fn buffer_picker(cx: &mut Context) {
 
     struct BufferMeta {
         id: DocumentId,
-        path: Option<PathBuf>,
+        name: String,
         is_modified: bool,
         is_current: bool,
         focused_at: std::time::Instant,
@@ -3169,7 +3177,10 @@ fn buffer_picker(cx: &mut Context) {
 
     let new_meta = |doc: &Document| BufferMeta {
         id: doc.id(),
-        path: doc.path().cloned(),
+        // `display_name` handles the full fallback chain: a synthetic
+        // `virtual_name` (e.g. `[dap-eval]`) takes precedence, then the
+        // relative path, then `[scratch]`.
+        name: doc.display_name().into_owned(),
         is_modified: doc.is_modified(),
         is_current: doc.id() == current,
         focused_at: doc.focused_at,
@@ -3197,17 +3208,7 @@ fn buffer_picker(cx: &mut Context) {
             }
             flags.into()
         }),
-        PickerColumn::new("path", |meta: &BufferMeta, _| {
-            let path = meta
-                .path
-                .as_deref()
-                .map(helix_stdx::path::get_relative_path);
-            path.as_deref()
-                .and_then(Path::to_str)
-                .unwrap_or(SCRATCH_BUFFER_NAME)
-                .to_string()
-                .into()
-        }),
+        PickerColumn::new("path", |meta: &BufferMeta, _| meta.name.clone().into()),
     ];
 
     let initial_cursor = if cx
@@ -4136,6 +4137,71 @@ fn hunk_range(hunk: Hunk, text: RopeSlice) -> Range {
     };
 
     Range::new(anchor, head)
+}
+
+fn goto_next_breakpoint(cx: &mut Context) {
+    let motion = move |editor: &mut Editor| {
+        let (view, doc) = current!(editor);
+        let path = match doc.path() {
+            Some(path) => path,
+            None => return,
+        };
+        let breakpoints = match editor.breakpoints.get(path) {
+            Some(bp) if !bp.is_empty() => bp,
+            _ => {
+                editor.set_status("No breakpoints in current file");
+                return;
+            }
+        };
+        let text = doc.text().slice(..);
+        let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+
+        let target = breakpoints
+            .iter()
+            .map(|bp| bp.line)
+            .find(|&line| line > cursor_line)
+            .or_else(|| breakpoints.iter().map(|bp| bp.line).min());
+
+        if let Some(line) = target {
+            let pos = doc.text().line_to_char(line);
+            push_jump(view, doc);
+            doc.set_selection(view.id, Selection::point(pos));
+        }
+    };
+    cx.editor.apply_motion(motion);
+}
+
+fn goto_prev_breakpoint(cx: &mut Context) {
+    let motion = move |editor: &mut Editor| {
+        let (view, doc) = current!(editor);
+        let path = match doc.path() {
+            Some(path) => path,
+            None => return,
+        };
+        let breakpoints = match editor.breakpoints.get(path) {
+            Some(bp) if !bp.is_empty() => bp,
+            _ => {
+                editor.set_status("No breakpoints in current file");
+                return;
+            }
+        };
+        let text = doc.text().slice(..);
+        let cursor_line = doc.selection(view.id).primary().cursor_line(text);
+
+        let target = breakpoints
+            .iter()
+            .map(|bp| bp.line)
+            .rev()
+            .find(|&line| line < cursor_line)
+            .or_else(|| breakpoints.iter().map(|bp| bp.line).max());
+
+        if let Some(line) = target {
+            let pos = doc.text().line_to_char(line);
+            push_jump(view, doc);
+            doc.set_selection(view.id, Selection::point(pos));
+        }
+    };
+    cx.editor.apply_motion(motion);
 }
 
 pub mod insert {

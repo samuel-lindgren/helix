@@ -23,6 +23,23 @@ pub fn overlaid<T>(content: T) -> Overlay<T> {
     }
 }
 
+/// Places the component in the bottom-right corner (compact panel).
+pub fn corner_overlaid<T>(content: T) -> Overlay<T> {
+    Overlay {
+        content,
+        calc_child_size: Box::new(|rect: Rect| {
+            let width = (rect.width * 45 / 100).max(30).min(rect.width);
+            let height = (rect.height * 30 / 100).max(5).min(rect.height);
+            Rect::new(
+                rect.right().saturating_sub(width).saturating_sub(1),
+                rect.bottom().saturating_sub(height).saturating_sub(2),
+                width,
+                height,
+            )
+        }),
+    }
+}
+
 fn clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: u8) -> Rect {
     fn mul_and_cast(size: u16, factor: u8) -> u16 {
         ((size as u32) * (factor as u32) / 100).try_into().unwrap()

@@ -715,6 +715,9 @@ pub enum StatusLineElement {
 
     /// The base of current working directory
     CurrentWorkingDirectory,
+
+    /// Debug adapter status (stopped/running/inactive)
+    DebugStatus,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs
@@ -1170,6 +1173,8 @@ pub struct Breakpoint {
     pub condition: Option<String>,
     pub hit_condition: Option<String>,
     pub log_message: Option<String>,
+    /// Temporary breakpoints are removed after the next stop event (run-to-cursor).
+    pub temporary: bool,
 }
 
 use futures_util::stream::{Flatten, Once};
@@ -1200,6 +1205,14 @@ pub struct Editor {
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
+    /// Expressions to evaluate on every debug stop (watch window).
+    pub watch_expressions: Vec<String>,
+    /// Collected debug adapter output for review via `:debug-log`.
+    pub debug_output_log: Vec<String>,
+    /// DocumentId of the dedicated DAP eval result buffer, if one is open.
+    /// Used to reuse a single buffer across `dap_eval_prompt`/`dap_eval_selection`
+    /// invocations so the result acts like a dedicated "watch window".
+    pub debug_eval_doc_id: Option<DocumentId>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
     pub theme_loader: Arc<theme::Loader>,
@@ -1345,6 +1358,9 @@ impl Editor {
             diff_providers: DiffProviderRegistry::default(),
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
+            watch_expressions: Vec::new(),
+            debug_output_log: Vec::new(),
+            debug_eval_doc_id: None,
             syn_loader,
             theme_loader,
             last_theme: None,

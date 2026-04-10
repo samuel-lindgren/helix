@@ -156,6 +156,11 @@ pub struct Document {
 
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
+    /// Overrides the buffer name shown in the status line and buffer picker.
+    /// Used for synthetic buffers (e.g. the DAP eval result buffer) that do not
+    /// correspond to a real file but want a distinctive display name instead of
+    /// `[scratch]`.
+    virtual_name: Option<String>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -699,6 +704,7 @@ impl Document {
             active_snippet: None,
             path: None,
             relative_path: OnceCell::new(),
+            virtual_name: None,
             encoding,
             has_bom,
             text,
@@ -2006,8 +2012,18 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
+        if let Some(name) = &self.virtual_name {
+            return Cow::Borrowed(name.as_str());
+        }
         self.relative_path()
             .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
+    }
+
+    /// Set a synthetic display name for this document. Used by features that
+    /// create scratch-like buffers (e.g. DAP eval results) and want a
+    /// distinctive name in the status line and buffer picker.
+    pub fn set_virtual_name(&mut self, name: Option<String>) {
+        self.virtual_name = name;
     }
 
     // transact(Fn) ?

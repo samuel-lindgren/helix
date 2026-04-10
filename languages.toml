@@ -876,19 +876,25 @@ port-arg = "-l 127.0.0.1:{}"
 name = "source"
 request = "launch"
 completion = [ { name = "entrypoint", completion = "filename", default = "." } ]
-args = { mode = "debug", program = "{0}" }
+args = { mode = "debug", program = "{0}", outputMode = "remote" }
 
 [[language.debugger.templates]]
 name = "binary"
 request = "launch"
 completion = [ { name = "binary", completion = "filename" } ]
-args = { mode = "exec", program = "{0}" }
+args = { mode = "exec", program = "{0}", outputMode = "remote" }
 
 [[language.debugger.templates]]
 name = "test"
 request = "launch"
 completion = [ { name = "tests", completion = "directory", default = "." } ]
-args = { mode = "test", program = "{0}" }
+args = { mode = "test", program = "{0}", outputMode = "remote" }
+
+[[language.debugger.templates]]
+name = "test-func"
+request = "launch"
+completion = [ { name = "test", completion = "go-test-function" } ]
+args = { mode = "test", program = "{0}", args = ["-test.run", "{1}", "-test.v"], outputMode = "remote" }
 
 [[language.debugger.templates]]
 name = "attach"

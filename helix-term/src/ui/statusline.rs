@@ -157,6 +157,7 @@ where
         helix_view::editor::StatusLineElement::VersionControl => render_version_control,
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
+        helix_view::editor::StatusLineElement::DebugStatus => render_debug_status,
     }
 }
 
@@ -446,15 +447,10 @@ fn render_file_name<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let title = {
-        let rel_path = context.doc.relative_path();
-        let path = rel_path
-            .as_ref()
-            .map(|p| p.to_string_lossy())
-            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into());
-        format!(" {} ", path)
-    };
-
+    // `display_name` handles the full fallback chain: a synthetic
+    // `virtual_name` (e.g. `[dap-eval]`) takes precedence, then the
+    // relative path, then `[scratch]`.
+    let title = format!(" {} ", context.doc.display_name());
     write(context, title.into());
 }
 
@@ -582,4 +578,45 @@ where
         .to_string_lossy()
         .to_string();
     write(context, cwd.into())
+}
+
+fn render_debug_status<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let debugger = match context.editor.debug_adapters.get_active_client() {
+        Some(debugger) => debugger,
+        None => return,
+    };
+
+    let status = if let Some(thread_id) = debugger.thread_id {
+        let state = debugger
+            .thread_states
+            .get(&thread_id)
+            .map(String::as_str)
+            .unwrap_or("unknown");
+
+        if let Some(frame) = debugger.current_stack_frame() {
+            let name = frame
+                .source
+                .as_ref()
+                .and_then(|s| s.name.as_deref())
+                .or_else(|| {
+                    frame
+                        .source
+                        .as_ref()
+                        .and_then(|s| s.path.as_ref())
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_str().unwrap_or("?"))
+                })
+                .unwrap_or("?");
+            format!("DBG {} {}:{}", state, name, frame.line)
+        } else {
+            format!("DBG {}", state)
+        }
+    } else {
+        "DBG".to_string()
+    };
+
+    write(context, status.into());
 }

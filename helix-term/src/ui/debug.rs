@@ -28,6 +28,9 @@ pub struct DebugVariables {
     page_size: usize,
     viewport: (u16, u16),
     status: Option<String>,
+    /// The frame ID used to fetch the current scopes.
+    /// When the active frame changes, the browser refreshes automatically.
+    frame_id: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +77,11 @@ struct Styles {
 impl DebugVariables {
     pub const ID: &'static str = "dap-variables";
 
-    pub fn new(debugger_id: DebugAdapterId, mut scopes: Vec<dap::Scope>) -> Self {
+    pub fn new(
+        debugger_id: DebugAdapterId,
+        mut scopes: Vec<dap::Scope>,
+        frame_id: Option<usize>,
+    ) -> Self {
         scopes.sort_by_cached_key(Self::scope_sort_key);
 
         let roots = scopes.into_iter().map(Node::from_scope).collect();
@@ -87,9 +94,67 @@ impl DebugVariables {
             page_size: 1,
             viewport: (0, 0),
             status: None,
+            frame_id,
         };
         variables.refresh_visible_paths();
         variables
+    }
+
+    /// Evaluate watch expressions and prepend a "Watch" scope to the tree.
+    pub fn build_watch_scope(&mut self, editor: &Editor) {
+        if editor.watch_expressions.is_empty() {
+            return;
+        }
+
+        let frame_id = self.frame_id;
+        let Some(debugger) = editor.debug_adapters.get_client(self.debugger_id) else {
+            return;
+        };
+
+        let mut children = Vec::new();
+        for expr in &editor.watch_expressions {
+            let node = match block_on(debugger.eval(expr.clone(), frame_id)) {
+                Ok(resp) => Node {
+                    kind: NodeKind::Variable {
+                        name: expr.clone(),
+                        value: sanitize_inline(resp.result),
+                        ty: resp.ty.map(sanitize_inline),
+                        variables_reference: resp.variables_reference,
+                    },
+                    children: if resp.variables_reference == 0 {
+                        Children::Loaded(Vec::new())
+                    } else {
+                        Children::Unloaded
+                    },
+                    expanded: false,
+                },
+                Err(e) => Node {
+                    kind: NodeKind::Variable {
+                        name: expr.clone(),
+                        value: format!("<{}>", e),
+                        ty: None,
+                        variables_reference: 0,
+                    },
+                    children: Children::Loaded(Vec::new()),
+                    expanded: false,
+                },
+            };
+            children.push(node);
+        }
+
+        let watch_scope = Node {
+            kind: NodeKind::Scope {
+                name: "Watch".to_string(),
+                presentation_hint: Some("watch".to_string()),
+                expensive: false,
+                variables_reference: 0,
+            },
+            children: Children::Loaded(children),
+            expanded: true,
+        };
+
+        // Insert watch scope at the beginning.
+        self.roots.insert(0, watch_scope);
     }
 
     pub fn expand_initial(&mut self, editor: &mut Editor) {
@@ -443,6 +508,119 @@ impl DebugVariables {
         Spans::from(spans)
     }
 
+    /// Check if the active debug frame has changed and refresh scopes if needed.
+    fn maybe_refresh(&mut self, editor: &mut Editor) {
+        let current_frame_id = editor
+            .debug_adapters
+            .get_client(self.debugger_id)
+            .and_then(|d| d.current_stack_frame())
+            .map(|f| f.id);
+
+        if current_frame_id == self.frame_id || current_frame_id.is_none() {
+            return;
+        }
+
+        let frame_id = current_frame_id.unwrap();
+        let Some(debugger) = editor.debug_adapters.get_client(self.debugger_id) else {
+            return;
+        };
+        let scopes = match block_on(debugger.scopes(frame_id)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Collect which paths (by name) were expanded so we can restore them.
+        let expanded_names = self.collect_expanded_names();
+
+        let mut sorted_scopes = scopes;
+        sorted_scopes.sort_by_cached_key(Self::scope_sort_key);
+        self.roots = sorted_scopes.into_iter().map(Node::from_scope).collect();
+        self.frame_id = Some(frame_id);
+
+        // Re-add watch expressions scope.
+        self.build_watch_scope(editor);
+
+        // Re-expand the "Locals" (or first non-watch) scope.
+        self.refresh_visible_paths();
+        let initial = self
+            .roots
+            .iter()
+            .position(Node::is_local_scope)
+            .or_else(|| (!self.roots.is_empty()).then_some(0));
+        if let Some(index) = initial {
+            let path = vec![index];
+            let _ = self.expand_path(&path, editor);
+            self.refresh_visible_paths();
+
+            // Try to restore previously expanded child paths within this scope.
+            self.restore_expanded(&expanded_names, &[index], editor);
+            self.refresh_visible_paths();
+        }
+
+        self.status = None;
+    }
+
+    /// Collect the names of all expanded nodes for state restoration.
+    fn collect_expanded_names(&self) -> Vec<Vec<String>> {
+        let mut result = Vec::new();
+        Self::collect_expanded_names_impl(&self.roots, &mut Vec::new(), &mut result);
+        result
+    }
+
+    fn collect_expanded_names_impl(
+        nodes: &[Node],
+        prefix: &mut Vec<String>,
+        result: &mut Vec<Vec<String>>,
+    ) {
+        for node in nodes {
+            if node.expanded {
+                let name = node.display_name();
+                prefix.push(name);
+                result.push(prefix.clone());
+                if let Children::Loaded(children) = &node.children {
+                    Self::collect_expanded_names_impl(children, prefix, result);
+                }
+                prefix.pop();
+            }
+        }
+    }
+
+    /// Try to re-expand nodes that match previously expanded names.
+    fn restore_expanded(
+        &mut self,
+        expanded_names: &[Vec<String>],
+        scope_path: &[usize],
+        editor: &mut Editor,
+    ) {
+        // Collect indices to expand first, then expand them (avoids borrow conflict).
+        let indices_to_expand: Vec<usize> = {
+            let Some(scope_node) = self.node(scope_path) else {
+                return;
+            };
+            let Children::Loaded(children) = &scope_node.children else {
+                return;
+            };
+            children
+                .iter()
+                .enumerate()
+                .filter(|(_, child)| {
+                    let name = child.display_name();
+                    child.is_expandable()
+                        && expanded_names
+                            .iter()
+                            .any(|names| names.len() >= 2 && names[1] == name)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+
+        for i in indices_to_expand {
+            let mut child_path = scope_path.to_vec();
+            child_path.push(i);
+            let _ = self.expand_path(&child_path, editor);
+        }
+    }
+
     fn footer_text(&self) -> &str {
         self.status.as_deref().unwrap_or(HELP)
     }
@@ -509,6 +687,7 @@ impl Component for DebugVariables {
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, ctx: &mut Context) {
+        self.maybe_refresh(ctx.editor);
         let styles = Self::styles(ctx.editor);
 
         surface.clear_with(area, styles.base);
@@ -660,6 +839,12 @@ impl Node {
         }
     }
 
+    fn display_name(&self) -> String {
+        match &self.kind {
+            NodeKind::Scope { name, .. } | NodeKind::Variable { name, .. } => name.clone(),
+        }
+    }
+
     fn is_local_scope(&self) -> bool {
         match &self.kind {
             NodeKind::Scope {
@@ -764,10 +949,177 @@ mod tests {
             page_size: 10,
             viewport: (80, 25),
             status: None,
+            frame_id: None,
         };
 
         variables.refresh_visible_paths();
 
         assert_eq!(variables.visible_paths, vec![vec![0], vec![0, 0]]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Debug Output Panel — shows DAP output during startup in a dismissible overlay
+// ---------------------------------------------------------------------------
+
+const OUTPUT_TITLE: &str = " Debug Output ";
+
+pub struct DebugOutputPanel {
+    /// Number of log lines last frame — used to detect new output and auto-scroll.
+    last_len: usize,
+    /// When true, auto-close on successful init. False for manual `:debug-log`.
+    auto_close: bool,
+    /// Tracks whether the panel has already seen an active session (prevents
+    /// immediate close if a prior session was still active).
+    seen_inactive: bool,
+}
+
+impl DebugOutputPanel {
+    pub const ID: &'static str = "dap-output";
+
+    /// Panel opened during startup — will auto-close on success.
+    pub fn for_startup() -> Self {
+        Self {
+            last_len: 0,
+            auto_close: true,
+            // The panel is created before the session is active, so we've
+            // already "seen" the inactive state.
+            seen_inactive: true,
+        }
+    }
+
+    /// Panel opened manually via `:debug-log` — stays open.
+    pub fn manual() -> Self {
+        Self {
+            last_len: 0,
+            auto_close: false,
+            seen_inactive: true,
+        }
+    }
+
+    fn close() -> EventResult {
+        let close_fn: Callback = Box::new(|compositor: &mut Compositor, _| {
+            compositor.remove(Self::ID);
+        });
+        EventResult::Consumed(Some(close_fn))
+    }
+}
+
+impl Component for DebugOutputPanel {
+    fn handle_event(&mut self, event: &Event, _ctx: &mut Context) -> EventResult {
+        // Non-modal: only consume Esc to close, everything else passes through.
+        if let Event::Key(key_event) = event {
+            if matches!(*key_event, key!(Esc) | ctrl!('c')) {
+                return Self::close();
+            }
+        }
+        EventResult::Ignored(None)
+    }
+
+    fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
+        Some(viewport)
+    }
+
+    fn render(&mut self, area: Rect, surface: &mut Surface, ctx: &mut Context) {
+        let theme = &ctx.editor.theme;
+        let base = theme.get("ui.popup");
+        let text_style = theme.get("ui.text");
+        let error_style = theme.get("error");
+        let help_style = theme.get("ui.help");
+
+        surface.clear_with(area, base);
+
+        let log = &ctx.editor.debug_output_log;
+
+        // Auto-close logic: wait until we've seen the session go from
+        // inactive → active, then close if no errors.
+        if self.auto_close {
+            let has_active = ctx.editor.debug_adapters.get_active_client().is_some();
+            if !has_active {
+                self.seen_inactive = true;
+            }
+            if has_active && self.seen_inactive {
+                let has_errors = log.iter().any(|l| l.starts_with("[stderr]"));
+                if !has_errors {
+                    ctx.jobs.callback(Box::pin(async {
+                        Ok(crate::job::Callback::EditorCompositor(Box::new(
+                            |_editor, compositor| {
+                                compositor.remove("dap-output");
+                            },
+                        )))
+                    }));
+                    self.auto_close = false; // prevent repeated callbacks
+                }
+            }
+        }
+
+        // Auto-scroll when new lines arrive.
+        let new_lines = log.len() != self.last_len;
+        self.last_len = log.len();
+
+        let block = Block::bordered().title(OUTPUT_TITLE);
+        block.render(area, surface);
+
+        let inner = area.inner(Margin::all(1));
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let footer_height: u16 = 1;
+        let list_area = inner.clip_bottom(footer_height);
+        let footer_area = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+
+        let page_size = list_area.height as usize;
+
+        if log.is_empty() {
+            surface.set_stringn(
+                list_area.left(),
+                list_area.top(),
+                "Waiting for debug adapter...",
+                list_area.width as usize,
+                text_style,
+            );
+        } else {
+            // Always show the tail (most recent output).
+            let skip = if new_lines || log.len() <= page_size {
+                log.len().saturating_sub(page_size)
+            } else {
+                log.len().saturating_sub(page_size)
+            };
+
+            for (i, line) in log.iter().skip(skip).take(page_size).enumerate() {
+                let y = list_area.top() + i as u16;
+                if y >= list_area.bottom() {
+                    break;
+                }
+                let style = if line.starts_with("[stderr]") {
+                    error_style
+                } else {
+                    text_style
+                };
+                surface.set_stringn(
+                    list_area.left(),
+                    y,
+                    line,
+                    list_area.width as usize,
+                    style,
+                );
+            }
+        }
+
+        let has_active = ctx.editor.debug_adapters.get_active_client().is_some();
+        let status = if has_active {
+            "esc close | session running"
+        } else {
+            "esc close | starting..."
+        };
+        let footer = TuiText::from(status);
+        Paragraph::new(&footer)
+            .style(help_style)
+            .render(footer_area, surface);
+    }
+
+    fn id(&self) -> Option<&'static str> {
+        Some(Self::ID)
     }
 }

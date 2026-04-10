@@ -112,9 +112,12 @@ impl ActiveSnippet {
                 if retain {
                     range.start = range.start.max(snippet_range.start);
                     range.end = range.end.max(range.start).min(snippet_range.end);
-                    // guaranteed by assoc
-                    debug_assert!(prev.start <= range.start);
-                    debug_assert!(range.start <= range.end);
+                    // After mapping through a transaction (e.g. DAP document
+                    // switch), these invariants may not hold.  Discard the
+                    // range rather than panicking.
+                    if prev.start > range.start || range.start > range.end {
+                        return false;
+                    }
                     if prev.end > range.start {
                         // not really sure what to do in this case. It shouldn't
                         // really occur in practice, the below just ensures

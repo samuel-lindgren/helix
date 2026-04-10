@@ -1968,6 +1968,31 @@ fn debug_eval(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> a
     Ok(())
 }
 
+fn debug_log(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if cx.editor.debug_output_log.is_empty() {
+        cx.editor.set_status("No debug output collected.");
+        return Ok(());
+    }
+
+    use crate::ui::{overlay::corner_overlaid, DebugOutputPanel};
+
+    let open_panel = Box::pin(async {
+        let call: crate::job::Callback =
+            crate::job::Callback::EditorCompositor(Box::new(|_editor, compositor| {
+                compositor.remove(DebugOutputPanel::ID);
+                compositor.push(Box::new(corner_overlaid(DebugOutputPanel::manual())));
+            }));
+        Ok(call)
+    });
+    cx.jobs.callback(open_panel);
+
+    Ok(())
+}
+
 fn debug_start(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -3514,6 +3539,14 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             positionals: (1, Some(1)),
             ..Signature::DEFAULT
         },
+    },
+    TypableCommand {
+        name: "debug-log",
+        aliases: &["dbg-log"],
+        doc: "Show debug adapter output log.",
+        fun: debug_log,
+        completer: CommandCompleter::none(),
+        signature: Signature::DEFAULT,
     },
     TypableCommand {
         name: "vsplit",

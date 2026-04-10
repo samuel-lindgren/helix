@@ -20,7 +20,7 @@ use crate::compositor::Compositor;
 use crate::filter_picker_entry;
 use crate::job::{self, Callback};
 pub use completion::Completion;
-pub use debug::DebugVariables;
+pub use debug::{DebugOutputPanel, DebugVariables};
 pub use editor::EditorView;
 use helix_stdx::rope;
 use helix_view::theme::Style;
@@ -423,7 +423,6 @@ pub mod completers {
     use helix_core::command_line::{self, Tokenizer};
     use helix_core::fuzzy::fuzzy_match;
     use helix_core::syntax::config::LanguageServerFeature;
-    use helix_view::document::SCRATCH_BUFFER_NAME;
     use helix_view::theme;
     use helix_view::{editor::Config, Editor};
     use once_cell::sync::Lazy;
@@ -438,11 +437,13 @@ pub mod completers {
     }
 
     pub fn buffer(editor: &Editor, input: &str) -> Vec<Completion> {
-        let names = editor.documents.values().map(|doc| {
-            doc.relative_path()
-                .map(|p| p.display().to_string().into())
-                .unwrap_or_else(|| Cow::from(SCRATCH_BUFFER_NAME))
-        });
+        // Use `display_name` so synthetic buffers (e.g. `[dap-eval]`) complete
+        // under their virtual name instead of `[scratch]`. Names must be owned
+        // because the returned `Vec<Completion>` outlives the editor borrow.
+        let names = editor
+            .documents
+            .values()
+            .map(|doc| doc.display_name().into_owned());
 
         fuzzy_match(input, names, true)
             .into_iter()

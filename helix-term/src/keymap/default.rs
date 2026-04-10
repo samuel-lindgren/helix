@@ -113,6 +113,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "D" => goto_first_diag,
             "g" => goto_prev_change,
             "G" => goto_first_change,
+            "b" => goto_prev_breakpoint,
             "f" => goto_prev_function,
             "t" => goto_prev_class,
             "a" => goto_prev_parameter,
@@ -128,6 +129,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "D" => goto_last_diag,
             "g" => goto_next_change,
             "G" => goto_last_change,
+            "b" => goto_next_breakpoint,
             "f" => goto_next_function,
             "t" => goto_next_class,
             "a" => goto_next_parameter,
@@ -247,6 +249,12 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "n" => dap_next,
                 "v" => dap_variables,
                 "t" => dap_terminate,
+                "e" => dap_eval_prompt,
+                "w" => dap_eval_selection,
+                "g" => dap_run_to_cursor,
+                "B" => dap_breakpoint_picker,
+                "a" => dap_add_watch,
+                "A" => dap_remove_watch,
                 "C-c" => dap_edit_condition,
                 "C-l" => dap_edit_log,
                 "s" => { "Switch"
@@ -254,7 +262,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                     "f" => dap_switch_stack_frame,
                     // sl, sb
                 },
-                "e" => dap_enable_exceptions,
+                "C-e" => dap_enable_exceptions,
                 "E" => dap_disable_exceptions,
             },
             "w" => { "Window"
