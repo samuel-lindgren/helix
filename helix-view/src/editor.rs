@@ -35,7 +35,10 @@ use std::{
 };
 
 use tokio::{
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        watch,
+    },
     time::{sleep, Duration, Instant, Sleep},
 };
 
@@ -1212,8 +1215,12 @@ pub struct Editor {
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
     /// Expressions to evaluate on every debug stop (watch window).
     pub watch_expressions: Vec<String>,
-    /// Collected debug adapter output for review via `:debug-log`.
+    /// Collected debug adapter and debuggee output for review via `:debug-log`.
     pub debug_output_log: Vec<String>,
+    /// DocumentId of the dedicated debug output buffer, if one is open.
+    pub debug_output_doc_id: Option<DocumentId>,
+    /// Cancellation handles for file-backed debug output tailers.
+    pub debug_output_tails: HashMap<DebugAdapterId, Vec<watch::Sender<bool>>>,
     /// DocumentId of the dedicated DAP eval result buffer, if one is open.
     /// Used to reuse a single buffer across `dap_eval_prompt`/`dap_eval_selection`
     /// invocations so the result acts like a dedicated "watch window".
@@ -1366,6 +1373,8 @@ impl Editor {
             breakpoints: HashMap::new(),
             watch_expressions: Vec::new(),
             debug_output_log: Vec::new(),
+            debug_output_doc_id: None,
+            debug_output_tails: HashMap::new(),
             debug_eval_doc_id: None,
             syn_loader,
             theme_loader,
@@ -1423,6 +1432,148 @@ impl Editor {
 
     pub fn config(&self) -> DynGuard<Config> {
         self.config.load()
+    }
+
+    fn debug_output_buffer_content(&self) -> String {
+        if self.debug_output_log.is_empty() {
+            String::new()
+        } else {
+            let mut content = self.debug_output_log.join("\n");
+            content.push('\n');
+            content
+        }
+    }
+
+    fn replace_debug_output_buffer(&mut self, doc_id: DocumentId, view_id: ViewId) {
+        let content = self.debug_output_buffer_content();
+        let cursor = content.chars().count();
+
+        let view = self.tree.get_mut(view_id);
+        let doc = doc_mut!(self, &doc_id);
+        doc.ensure_view_init(view.id);
+        doc.readonly = true;
+        doc.set_soft_wrap_override(Some(true));
+
+        let old_len = doc.text().len_chars();
+        let transaction = helix_core::Transaction::change(
+            doc.text(),
+            std::iter::once((0, old_len, Some(content.into()))),
+        )
+        .with_selection(Selection::point(cursor));
+
+        doc.apply(&transaction, view.id);
+        doc.append_changes_to_history(view);
+        doc.reset_modified();
+    }
+
+    fn sync_debug_output_buffer(&mut self, open: bool) {
+        let existing_id = match self.debug_output_doc_id {
+            Some(id) if self.documents.contains_key(&id) => Some(id),
+            _ => None,
+        };
+
+        match existing_id {
+            Some(id) => {
+                let visible_view_id = self
+                    .tree
+                    .traverse()
+                    .find(|(_, view)| view.doc == id)
+                    .map(|(view_id, _)| view_id);
+
+                let target_view_id = match visible_view_id {
+                    Some(view_id) => {
+                        if open {
+                            self.focus(view_id);
+                        }
+                        Some(view_id)
+                    }
+                    None if open => {
+                        self.switch(id, Action::VerticalSplit);
+                        Some(view!(self).id)
+                    }
+                    None => None,
+                };
+
+                if let Some(view_id) = target_view_id {
+                    self.replace_debug_output_buffer(id, view_id);
+                }
+            }
+            None if open => {
+                let doc_id = self.new_file(Action::VerticalSplit);
+                self.debug_output_doc_id = Some(doc_id);
+                let content = self.debug_output_buffer_content();
+                let cursor = content.chars().count();
+
+                let doc = doc_mut!(self, &doc_id);
+                doc.set_virtual_name(Some("[dap-log]".to_string()));
+                doc.readonly = true;
+                doc.set_soft_wrap_override(Some(true));
+
+                let view = view_mut!(self);
+                doc.ensure_view_init(view.id);
+                let transaction = helix_core::Transaction::insert(
+                    doc.text(),
+                    doc.selection(view.id),
+                    content.into(),
+                )
+                .with_selection(Selection::point(cursor));
+                doc.apply(&transaction, view.id);
+                doc.append_changes_to_history(view);
+                doc.reset_modified();
+            }
+            None => {}
+        }
+    }
+
+    pub fn show_debug_output_buffer(&mut self) {
+        self.sync_debug_output_buffer(true);
+    }
+
+    pub fn clear_debug_output(&mut self) {
+        self.debug_output_log.clear();
+        self.sync_debug_output_buffer(false);
+    }
+
+    pub fn append_debug_output(&mut self, prefix: &str, output: &str) {
+        for line in output.lines() {
+            if !line.trim().is_empty() {
+                self.debug_output_log.push(format!("{prefix} {line}"));
+            }
+        }
+
+        self.sync_debug_output_buffer(false);
+    }
+
+    pub fn push_debug_output(&mut self, prefix: &str, output: &str, is_stderr: bool) {
+        self.append_debug_output(prefix, output);
+
+        let trimmed = output.trim();
+        if !trimmed.is_empty() {
+            if is_stderr {
+                self.set_error(format!("Debug: {}", trimmed));
+            } else {
+                self.set_status(format!("Debug: {}", trimmed));
+            }
+        }
+    }
+
+    pub fn register_debug_output_tail(&mut self, id: DebugAdapterId, stop_tx: watch::Sender<bool>) {
+        self.debug_output_tails.entry(id).or_default().push(stop_tx);
+    }
+
+    pub fn stop_debug_output_tails(&mut self, id: DebugAdapterId) {
+        if let Some(stops) = self.debug_output_tails.remove(&id) {
+            for stop in stops {
+                let _ = stop.send(true);
+            }
+        }
+    }
+
+    pub fn stop_all_debug_output_tails(&mut self) {
+        let ids = self.debug_output_tails.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            self.stop_debug_output_tails(id);
+        }
     }
 
     /// Call if the config has changed to let the editor update all

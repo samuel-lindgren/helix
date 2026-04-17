@@ -1973,22 +1973,12 @@ fn debug_log(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
-    if cx.editor.debug_output_log.is_empty() {
+    if cx.editor.debug_output_log.is_empty() && cx.editor.debug_output_doc_id.is_none() {
         cx.editor.set_status("No debug output collected.");
         return Ok(());
     }
 
-    use crate::ui::{overlay::corner_overlaid, DebugOutputPanel};
-
-    let open_panel = Box::pin(async {
-        let call: crate::job::Callback =
-            crate::job::Callback::EditorCompositor(Box::new(|_editor, compositor| {
-                compositor.remove(DebugOutputPanel::ID);
-                compositor.push(Box::new(corner_overlaid(DebugOutputPanel::manual())));
-            }));
-        Ok(call)
-    });
-    cx.jobs.callback(open_panel);
+    cx.editor.show_debug_output_buffer();
 
     Ok(())
 }

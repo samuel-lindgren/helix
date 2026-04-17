@@ -47,6 +47,8 @@ pub enum Payload {
     Response(Response),
     // type = "request"
     Request(Request),
+    // Internal payload used to surface adapter stderr in the UI debug log.
+    Stderr { output: String },
 }
 
 #[derive(Debug)]
@@ -73,10 +75,15 @@ impl Transport {
 
         let transport = Arc::new(transport);
 
-        tokio::spawn(Self::recv(id, transport.clone(), server_stdout, client_tx));
+        tokio::spawn(Self::recv(
+            id,
+            transport.clone(),
+            server_stdout,
+            client_tx.clone(),
+        ));
         tokio::spawn(Self::send(transport, server_stdin, client_rx));
         if let Some(stderr) = server_stderr {
-            tokio::spawn(Self::err(stderr));
+            tokio::spawn(Self::err(stderr, client_tx));
         }
 
         (rx, tx)
@@ -138,14 +145,14 @@ impl Transport {
     async fn recv_server_error(
         err: &mut (impl AsyncBufRead + Unpin + Send),
         buffer: &mut String,
-    ) -> Result<()> {
+    ) -> Result<String> {
         buffer.truncate(0);
         if err.read_line(buffer).await? == 0 {
             return Err(Error::StreamClosed);
         };
         error!("err <- {}", buffer);
 
-        Ok(())
+        Ok(buffer.clone())
     }
 
     async fn send_payload_to_server(
@@ -157,6 +164,11 @@ impl Transport {
             if let Some(back) = request.back_ch.take() {
                 self.pending_requests.lock().await.insert(request.seq, back);
             }
+        }
+        if matches!(payload, Payload::Stderr { .. }) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "cannot send internal stderr payload to server"
+            )));
         }
         let json = serde_json::to_string(&payload)?;
         self.send_string_to_server(server_stdin, json).await
@@ -240,6 +252,10 @@ impl Transport {
                 client_tx.send(msg).expect("Failed to send");
                 Ok(())
             }
+            Payload::Stderr { .. } => {
+                client_tx.send(msg).expect("Failed to send");
+                Ok(())
+            }
         }
     }
 
@@ -309,13 +325,22 @@ impl Transport {
         }
     }
 
-    async fn err(mut server_stderr: Box<dyn AsyncBufRead + Unpin + Send>) {
+    async fn err(
+        mut server_stderr: Box<dyn AsyncBufRead + Unpin + Send>,
+        client_tx: UnboundedSender<Payload>,
+    ) {
         let mut recv_buffer = String::new();
         loop {
             match Self::recv_server_error(&mut server_stderr, &mut recv_buffer).await {
-                Ok(_) => {}
+                Ok(output) => {
+                    client_tx
+                        .send(Payload::Stderr { output })
+                        .expect("Failed to send");
+                }
                 Err(err) => {
-                    error!("err: <- {:?}", err);
+                    if !matches!(err, Error::StreamClosed) {
+                        error!("err: <- {:?}", err);
+                    }
                     break;
                 }
             }

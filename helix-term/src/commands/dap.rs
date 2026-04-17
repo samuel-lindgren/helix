@@ -2,11 +2,7 @@ use super::{Context, Editor};
 use crate::{
     compositor::{self, Compositor},
     job::{Callback, Jobs},
-    ui::{
-        self,
-        overlay::{corner_overlaid, overlaid},
-        DebugOutputPanel, DebugVariables, Picker, Prompt, PromptEvent,
-    },
+    ui::{self, overlay::overlaid, DebugVariables, Picker, Prompt, PromptEvent},
 };
 use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::config::{DebugConfigCompletion, DebugTemplate};
@@ -19,11 +15,20 @@ use serde_json::{to_value, Value};
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::watch,
+    time::{sleep, Duration},
+};
 
 use helix_view::handlers::dap::{breakpoints_changed, jump_to_stack_frame, select_thread_id};
+
+const DEBUG_OUTPUT_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn thread_picker(
     cx: &mut Context,
@@ -117,6 +122,131 @@ fn dap_callback<T, F>(
     jobs.callback(callback);
 }
 
+fn dap_start_callback(
+    jobs: &mut Jobs,
+    id: dap::registry::DebugAdapterId,
+    request_type: String,
+    call: impl Future<Output = helix_dap::Result<serde_json::Value>> + 'static + Send,
+) {
+    let callback = Box::pin(async move {
+        let result = call.await;
+        let call: Callback = Callback::Editor(Box::new(move |editor: &mut Editor| match result {
+            Ok(_) => {
+                editor.set_status(format!("Debug {} request accepted", request_type));
+            }
+            Err(err) => {
+                editor.stop_debug_output_tails(id);
+                editor.debug_adapters.remove_client(id);
+                if editor
+                    .debug_adapters
+                    .get_active_client()
+                    .map(|client| client.id())
+                    == Some(id)
+                {
+                    editor.debug_adapters.unset_active_client();
+                }
+                editor.set_error(format!("Failed to start debug session: {}", err));
+            }
+        }));
+        Ok(call)
+    });
+
+    jobs.callback(callback);
+}
+
+fn redirected_output_paths(args: &HashMap<&str, Value>) -> Vec<(PathBuf, &'static str, bool)> {
+    let mut paths = Vec::new();
+
+    for (field, prefix, is_stderr) in [
+        ("stdoutTo", "[stdout] [debuggee]", false),
+        ("stderrTo", "[stderr] [debuggee]", true),
+    ] {
+        if let Some(path) = args.get(field).and_then(Value::as_str) {
+            paths.push((PathBuf::from(path), prefix, is_stderr));
+        }
+    }
+
+    paths
+}
+
+fn register_redirected_output_tails(
+    editor: &mut Editor,
+    id: dap::registry::DebugAdapterId,
+    args: &HashMap<&str, Value>,
+) {
+    for (path, prefix, is_stderr) in redirected_output_paths(args) {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        editor.register_debug_output_tail(id, stop_tx);
+        tokio::spawn(tail_redirected_output(path, prefix, is_stderr, stop_rx));
+    }
+}
+
+async fn tail_redirected_output(
+    path: PathBuf,
+    prefix: &'static str,
+    is_stderr: bool,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let mut offset = redirected_output_len(&path).await.unwrap_or(0);
+
+    loop {
+        let should_stop = tokio::select! {
+            changed = stop_rx.changed() => changed.is_err() || *stop_rx.borrow(),
+            _ = sleep(DEBUG_OUTPUT_TAIL_POLL_INTERVAL) => false,
+        };
+
+        match read_redirected_output(&path, &mut offset).await {
+            Ok(Some(output)) if !output.is_empty() => {
+                crate::job::dispatch(move |editor, _compositor| {
+                    editor.push_debug_output(prefix, &output, is_stderr);
+                })
+                .await;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log::warn!("failed to tail debug output from {}: {err}", path.display());
+                break;
+            }
+        }
+
+        if should_stop {
+            break;
+        }
+    }
+}
+
+async fn redirected_output_len(path: &Path) -> Option<u64> {
+    fs::metadata(path).await.ok().map(|metadata| metadata.len())
+}
+
+async fn read_redirected_output(path: &Path, offset: &mut u64) -> io::Result<Option<String>> {
+    let len = match fs::metadata(path).await {
+        Ok(metadata) => metadata.len(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            *offset = 0;
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+
+    if len < *offset {
+        *offset = 0;
+    }
+
+    if len == *offset {
+        return Ok(None);
+    }
+
+    let mut file = fs::File::open(path).await?;
+    file.seek(SeekFrom::Start(*offset)).await?;
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+    *offset += buffer.len() as u64;
+
+    Ok(Some(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
 pub fn dap_start_impl(
     cx: &mut compositor::Context,
     name: Option<&str>,
@@ -131,7 +261,8 @@ pub fn dap_start_impl(
         .clone();
 
     cx.editor.set_status("Starting debug adapter...");
-    cx.editor.debug_output_log.clear();
+    cx.editor.stop_all_debug_output_tails();
+    cx.editor.clear_debug_output();
 
     let id = cx
         .editor
@@ -161,14 +292,13 @@ pub fn dap_start_impl(
             .collect()
     };
 
-    args.insert("cwd", to_value(helix_stdx::env::current_working_dir())?);
+    if !args.contains_key("cwd") {
+        args.insert("cwd", to_value(helix_stdx::env::current_working_dir())?);
+    }
+
+    register_redirected_output_tails(cx.editor, id, &args);
 
     let args = to_value(args).unwrap();
-
-    let request_type = template.request.clone();
-    let callback = move |editor: &mut Editor, _compositor: &mut Compositor, _response: Value| {
-        editor.set_status(format!("Debug {} request accepted", request_type));
-    };
 
     let debugger = match cx.editor.debug_adapters.get_client_mut(id) {
         Some(child) => child,
@@ -180,25 +310,14 @@ pub fn dap_start_impl(
     match &template.request[..] {
         "launch" => {
             let call = debugger.launch(args);
-            dap_callback(cx.jobs, call, callback);
+            dap_start_callback(cx.jobs, id, "launch".to_owned(), call);
         }
         "attach" => {
             let call = debugger.attach(args);
-            dap_callback(cx.jobs, call, callback);
+            dap_start_callback(cx.jobs, id, "attach".to_owned(), call);
         }
         request => bail!("Unsupported request '{}'", request),
     };
-
-    // Open the debug output panel so the user can see startup progress.
-    let open_panel = Box::pin(async {
-        let call: crate::job::Callback =
-            crate::job::Callback::EditorCompositor(Box::new(|_editor, compositor| {
-                compositor.remove(DebugOutputPanel::ID);
-                compositor.push(Box::new(corner_overlaid(DebugOutputPanel::for_startup())));
-            }));
-        Ok(call)
-    });
-    cx.jobs.callback(open_panel);
 
     Ok(())
 }
@@ -1672,6 +1791,36 @@ func TestReal(t *testing.T) {}
         assert_eq!(
             go_test_run_regex(&entry),
             r"^TestFoo$/^simple_add_\(a\.b\)$"
+        );
+    }
+
+    #[test]
+    fn finds_redirected_debuggee_output_paths() {
+        let args = HashMap::from([
+            (
+                "stdoutTo",
+                Value::String("/tmp/debuggee-stdout.log".to_owned()),
+            ),
+            (
+                "stderrTo",
+                Value::String("/tmp/debuggee-stderr.log".to_owned()),
+            ),
+        ]);
+
+        assert_eq!(
+            redirected_output_paths(&args),
+            vec![
+                (
+                    PathBuf::from("/tmp/debuggee-stdout.log"),
+                    "[stdout] [debuggee]",
+                    false,
+                ),
+                (
+                    PathBuf::from("/tmp/debuggee-stderr.log"),
+                    "[stderr] [debuggee]",
+                    true,
+                ),
+            ]
         );
     }
 }

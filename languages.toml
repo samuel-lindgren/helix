@@ -344,7 +344,7 @@ command = "lldb-dap"
 name = "binary"
 request = "launch"
 completion = [ { name = "binary", completion = "filename" } ]
-args = { program = "{0}" }
+args = { console = "internalConsole", program = "{0}" }
 
 [[language.debugger.templates]]
 name = "binary (terminal)"
@@ -356,13 +356,13 @@ args = { program = "{0}", runInTerminal = true }
 name = "attach"
 request = "attach"
 completion = [ "pid" ]
-args = { pid = "{0}" }
+args = { console = "internalConsole", pid = "{0}" }
 
 [[language.debugger.templates]]
 name = "gdbserver attach"
 request = "attach"
 completion = [ { name = "lldb connect url", default = "connect://localhost:3333" }, { name = "file", completion = "filename" }, "pid" ]
-args = { attachCommands = [ "platform select remote-gdb-server", "platform connect {0}", "file {1}", "attach {2}" ] }
+args = { console = "internalConsole", attachCommands = [ "platform select remote-gdb-server", "platform connect {0}", "file {1}", "attach {2}" ] }
 
 [[grammar]]
 name = "rust"
@@ -888,13 +888,13 @@ args = { mode = "exec", program = "{0}", outputMode = "remote" }
 name = "test"
 request = "launch"
 completion = [ { name = "tests", completion = "directory", default = "." } ]
-args = { mode = "test", program = "{0}", outputMode = "remote" }
+args = { mode = "test", program = "{0}", cwd = "{0}", dlvCwd = "{0}", outputMode = "remote" }
 
 [[language.debugger.templates]]
 name = "test-func"
 request = "launch"
 completion = [ { name = "test", completion = "go-test-function" } ]
-args = { mode = "test", program = "{0}", args = ["-test.run", "{1}", "-test.v"], outputMode = "remote" }
+args = { mode = "test", program = "{0}", cwd = "{0}", dlvCwd = "{0}", args = ["-test.run", "{1}", "-test.v"], outputMode = "remote" }
 
 [[language.debugger.templates]]
 name = "attach"

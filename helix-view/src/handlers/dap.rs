@@ -8,7 +8,7 @@ use helix_dap::{
     ThreadId,
 };
 use helix_lsp::block_on;
-use log::{error, warn};
+use log::{error, info, warn};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -204,6 +204,16 @@ pub fn breakpoints_changed(
     Ok(())
 }
 
+fn debug_output_prefix(category: Option<&str>) -> Option<(String, bool)> {
+    match category {
+        Some("telemetry") => None,
+        Some("stderr") => Some(("[stderr] [debuggee]".to_owned(), true)),
+        Some("stdout") => Some(("[stdout] [debuggee]".to_owned(), false)),
+        Some(category) => Some((format!("[{category}]"), false)),
+        None => Some(("[debug]".to_owned(), false)),
+    }
+}
+
 impl Editor {
     pub async fn handle_debugger_message(
         &mut self,
@@ -240,30 +250,30 @@ impl Editor {
                         };
 
                         let all_threads_stopped = all_threads_stopped.unwrap_or_default();
+                        info!(
+                            "DAP stopped: reason={reason}, thread_id={thread_id:?}, all_threads_stopped={all_threads_stopped}"
+                        );
 
                         if let Some(thread_id) = thread_id {
                             debugger.thread_states.insert(thread_id, reason.clone());
                             // TODO: dap uses "type" || "reason" here
                         }
 
-                        if all_threads_stopped {
-                            if let Ok(response) = debugger
+                        let thread_to_select = if let Some(thread_id) = thread_id {
+                            Some(thread_id)
+                        } else if all_threads_stopped {
+                            debugger
                                 .request::<dap::requests::Threads>(Some(ThreadsArguments {}))
                                 .await
-                            {
-                                let mut fallback_thread_id = None;
+                                .ok()
+                                .and_then(|response| {
+                                    response.threads.into_iter().next().map(|thread| thread.id)
+                                })
+                        } else {
+                            None
+                        };
 
-                                for thread in response.threads {
-                                    fallback_thread_id.get_or_insert(thread.id);
-                                    fetch_stack_trace(debugger, thread.id).await;
-                                }
-
-                                if let Some(thread_id) = thread_id.or(fallback_thread_id) {
-                                    select_thread_id(self, thread_id, false).await;
-                                }
-                            }
-                        } else if let Some(thread_id) = thread_id {
-                            fetch_stack_trace(debugger, thread_id).await;
+                        if let Some(thread_id) = thread_to_select {
                             // whichever thread stops is made "current" (if no previously selected thread).
                             select_thread_id(self, thread_id, false).await;
                         }
@@ -385,36 +395,14 @@ impl Editor {
                     Event::Output(events::OutputBody {
                         category, output, ..
                     }) => {
-                        let is_stderr = category.as_deref() == Some("stderr");
-                        let prefix = match category {
-                            Some(category) => {
-                                if &category == "telemetry" {
-                                    return false;
-                                }
-                                format!("[{}]", category)
-                            }
-                            None => "[debug]".to_owned(),
+                        let Some((prefix, is_stderr)) = debug_output_prefix(category.as_deref())
+                        else {
+                            return false;
                         };
 
                         log::info!("{}", output);
 
-                        // Collect output for the debug output panel.
-                        for line in output.lines() {
-                            if !line.trim().is_empty() {
-                                self.debug_output_log
-                                    .push(format!("{} {}", prefix, line));
-                            }
-                        }
-
-                        // Stderr gets sticky error display; stdout is transient.
-                        let trimmed = output.trim();
-                        if !trimmed.is_empty() {
-                            if is_stderr {
-                                self.set_error(format!("Debug: {}", trimmed));
-                            } else {
-                                self.set_status(format!("Debug: {}", trimmed));
-                            }
-                        }
+                        self.push_debug_output(&prefix, &output, is_stderr);
                     }
                     Event::Initialized(_) => {
                         self.set_status("Debugger initialized...");
@@ -447,6 +435,8 @@ impl Editor {
                         self.debug_adapters.set_active_client(id);
                     }
                     Event::Terminated(terminated) => {
+                        self.stop_debug_output_tails(id);
+
                         let debugger = match self.debug_adapters.get_client_mut(id) {
                             Some(debugger) => debugger,
                             None => return false,
@@ -530,6 +520,15 @@ impl Editor {
                         log::warn!("Unhandled event {:?}", ev);
                         return false; // return early to skip render
                     }
+                }
+            }
+            Payload::Stderr { output } => {
+                log::error!("DAP stderr: {}", output.trim_end());
+                self.append_debug_output("[stderr] [adapter]", &output);
+
+                let trimmed = output.trim();
+                if !trimmed.is_empty() {
+                    self.set_error(format!("Debug adapter: {}", trimmed));
                 }
             }
             Payload::Response(_) => unreachable!(),
@@ -746,5 +745,22 @@ mod tests {
         assert_eq!(active_frame, None);
         assert!(!thread_states.contains_key(&thread_id(9)));
         assert!(!stack_frames.contains_key(&thread_id(9)));
+    }
+
+    #[test]
+    fn debuggee_stdio_output_uses_explicit_prefixes() {
+        assert_eq!(
+            debug_output_prefix(Some("stdout")),
+            Some(("[stdout] [debuggee]".to_owned(), false))
+        );
+        assert_eq!(
+            debug_output_prefix(Some("stderr")),
+            Some(("[stderr] [debuggee]".to_owned(), true))
+        );
+    }
+
+    #[test]
+    fn telemetry_output_is_ignored() {
+        assert_eq!(debug_output_prefix(Some("telemetry")), None);
     }
 }

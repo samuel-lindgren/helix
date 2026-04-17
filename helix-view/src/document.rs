@@ -161,6 +161,9 @@ pub struct Document {
     /// correspond to a real file but want a distinctive display name instead of
     /// `[scratch]`.
     virtual_name: Option<String>,
+    /// Optional per-document override for whether visual soft-wrap is enabled.
+    /// Used by synthetic read-mostly buffers such as debugger output panes.
+    soft_wrap_override: Option<bool>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -711,6 +714,7 @@ impl Document {
             path: None,
             relative_path: OnceCell::new(),
             virtual_name: None,
+            soft_wrap_override: None,
             encoding,
             has_bom,
             text,
@@ -2070,6 +2074,10 @@ impl Document {
         self.virtual_name = name;
     }
 
+    pub fn set_soft_wrap_override(&mut self, enable: Option<bool>) {
+        self.soft_wrap_override = enable;
+    }
+
     // transact(Fn) ?
 
     // -- LSP methods
@@ -2312,9 +2320,13 @@ impl Document {
             .language
             .as_ref()
             .and_then(|config| config.soft_wrap.as_ref());
-        let enable_soft_wrap = language_soft_wrap
-            .and_then(|soft_wrap| soft_wrap.enable)
-            .or(editor_soft_wrap.enable)
+        let enable_soft_wrap = self
+            .soft_wrap_override
+            .or_else(|| {
+                language_soft_wrap
+                    .and_then(|soft_wrap| soft_wrap.enable)
+                    .or(editor_soft_wrap.enable)
+            })
             .unwrap_or(false);
         let max_wrap = language_soft_wrap
             .and_then(|soft_wrap| soft_wrap.max_wrap)
@@ -2584,6 +2596,21 @@ mod test {
             .to_string(),
             helix_core::NATIVE_LINE_ENDING.as_str()
         );
+    }
+
+    #[test]
+    fn soft_wrap_override_enables_visual_wrapping() {
+        let config = Arc::new(ArcSwap::new(Arc::new(Config::default())));
+        let mut doc = Document::default(
+            config,
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+
+        assert!(!doc.text_format(80, None).soft_wrap);
+
+        doc.set_soft_wrap_override(Some(true));
+
+        assert!(doc.text_format(80, None).soft_wrap);
     }
 
     macro_rules! decode {

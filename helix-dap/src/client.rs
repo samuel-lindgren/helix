@@ -218,6 +218,11 @@ impl Client {
                         .send((id, Payload::Request(req)))
                         .expect("Failed to send");
                 }
+                Payload::Stderr { output } => {
+                    client_tx
+                        .send((id, Payload::Stderr { output }))
+                        .expect("Failed to send");
+                }
             }
         }
     }
