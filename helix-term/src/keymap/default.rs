@@ -300,6 +300,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "/" => global_search,
             "k" => hover,
             "K" => diff_peek,
+            "L" => git_blame_line,
             "r" => rename_symbol,
             "v" => reset_branch_change,
             "h" => select_references_to_symbol_under_cursor,

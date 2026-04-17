@@ -12,6 +12,9 @@ use std::{
 #[cfg(feature = "git")]
 mod git;
 
+#[cfg(feature = "git")]
+pub use git::BlameLine;
+
 mod diff;
 
 pub use diff::{DiffHandle, Hunk};
@@ -94,6 +97,24 @@ impl DiffProviderRegistry {
                 f(Err(anyhow!("no diff provider returns success")));
             }
         });
+    }
+
+    /// Return the commit that last modified `line` (0-based, HEAD-side) of
+    /// `file`. Returns `None` if the file is untracked, binary, outside any
+    /// supported repo, or the line has no blame entry. Runs on the current
+    /// thread and may block on disk I/O — call from `spawn_blocking`.
+    #[cfg(feature = "git")]
+    pub fn blame_line(&self, file: &Path, line: u32) -> Option<BlameLine> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.blame_line(file, line) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!("failed to blame {} line {line}", file.display());
+                    None
+                }
+            })
     }
 
     /// Fire-and-forget branch-diff iteration: emits files that differ between
@@ -186,6 +207,14 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::for_each_branch_changed_file(cwd, f),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    #[cfg(feature = "git")]
+    fn blame_line(&self, file: &Path, line: u32) -> Result<BlameLine> {
+        match self {
+            Self::Git => git::blame_line(file, line),
             Self::None => bail!("No diff support compiled in"),
         }
     }

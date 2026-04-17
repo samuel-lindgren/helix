@@ -535,6 +535,7 @@ checksum = "c66adef5e4d836ad08bf424dce5e3eb18f51544eee702860419295120dd48811"
 dependencies = [
  "gix-actor",
  "gix-attributes",
+ "gix-blame",
  "gix-command",
  "gix-commitgraph",
  "gix-config",
@@ -612,6 +613,26 @@ version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d982fc7ef0608e669851d0d2a6141dae74c60d5a27e8daa451f2a4857bbf41e2"
 dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "gix-blame"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb54e3236eb8ca862e88f2725039556ea5701d9a82a6d089bbf6258ded862a55"
+dependencies = [
+ "gix-commitgraph",
+ "gix-date",
+ "gix-diff",
+ "gix-error",
+ "gix-hash",
+ "gix-object",
+ "gix-revwalk",
+ "gix-trace",
+ "gix-traverse",
+ "gix-worktree",
+ "smallvec",
  "thiserror",
 ]
 
@@ -717,6 +738,7 @@ dependencies = [
  "gix-traverse",
  "gix-worktree",
  "imara-diff 0.1.8",
+ "imara-diff 0.2.0",
  "thiserror",
 ]
 

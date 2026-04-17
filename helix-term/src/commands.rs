@@ -10,7 +10,7 @@ use helix_stdx::{
     path::{self, find_paths},
     rope::{self, RopeSliceExt},
 };
-use helix_vcs::{DiffHandle, FileChange, Hunk};
+use helix_vcs::{BlameLine, DiffHandle, FileChange, Hunk};
 pub use lsp::*;
 pub use syntax::*;
 use tui::{
@@ -468,6 +468,7 @@ impl MappableCommand {
         goto_first_branch_change, "Goto first branch change (vs main/master)",
         goto_last_branch_change, "Goto last branch change (vs main/master)",
         diff_peek, "Peek removed content of the hunk at cursor (HEAD and branch diff)",
+        git_blame_line, "Show git blame popup for line at cursor",
         reset_branch_change, "Reset branch diff hunk at cursor to merge-base content",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
@@ -4354,6 +4355,88 @@ fn diff_peek(cx: &mut Context) {
         let popup = Popup::new("diff-peek", contents).auto_close(true);
         compositor.replace_or_push("diff-peek", popup);
     }));
+}
+
+/// Show a popup with `git blame` info for the line under the cursor.
+///
+/// Blame runs against HEAD, so buffer-line numbers are first translated back
+/// to HEAD-side line numbers via the working-tree [`DiffHandle`]: a line that
+/// sits inside an unsaved/uncommitted hunk has no HEAD counterpart and is
+/// reported as "uncommitted". The blame query itself can be slow on large
+/// histories, so we hop onto `spawn_blocking` and paint the popup from the
+/// returned callback — identical to the LSP hover flow.
+fn git_blame_line(cx: &mut Context) {
+    use crate::ui::Markdown;
+
+    let (view, doc) = current_ref!(cx.editor);
+    let Some(path) = doc.path().cloned() else {
+        cx.editor.set_status("Buffer has no path; cannot blame");
+        return;
+    };
+    let text = doc.text().slice(..);
+    let buffer_line = doc.selection(view.id).primary().cursor_line(text) as u32;
+
+    let head_line = match buffer_line_to_head_line(doc.diff_handle(), buffer_line) {
+        Some(line) => line,
+        None => {
+            cx.editor
+                .set_status("Uncommitted change at cursor — commit it to see blame");
+            return;
+        }
+    };
+
+    let providers = cx.editor.diff_providers.clone();
+    cx.jobs.callback(async move {
+        let blame = tokio::task::spawn_blocking(move || providers.blame_line(&path, head_line))
+            .await
+            .ok()
+            .flatten();
+
+        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
+            let Some(b) = blame else {
+                editor
+                    .set_status("No blame available (untracked, binary, or outside repo)");
+                return;
+            };
+            let md = format_blame_markdown(&b);
+            let contents = Markdown::new(md, editor.syn_loader.clone());
+            let popup = Popup::new("git-blame", contents).auto_close(true);
+            compositor.replace_or_push("git-blame", popup);
+        };
+        Ok(job::Callback::EditorCompositor(Box::new(call)))
+    });
+}
+
+/// Map a buffer line to the corresponding line in the HEAD-side content, or
+/// return `None` if the buffer line lives inside a working-tree hunk (i.e. it
+/// has no HEAD counterpart). When there is no diff handle at all (file is not
+/// tracked, or VCS is disabled), the buffer line is assumed to match HEAD.
+fn buffer_line_to_head_line(handle: Option<&DiffHandle>, buffer_line: u32) -> Option<u32> {
+    let Some(handle) = handle else {
+        return Some(buffer_line);
+    };
+    let diff = handle.load();
+    if diff.hunk_at(buffer_line, false).is_some() {
+        return None;
+    }
+    let mut delta: i64 = 0;
+    for idx in 0..diff.len() {
+        let hunk = diff.nth_hunk(idx);
+        if hunk.after.end <= buffer_line {
+            delta += hunk.after.len() as i64 - hunk.before.len() as i64;
+        } else {
+            break;
+        }
+    }
+    Some((buffer_line as i64 - delta).max(0) as u32)
+}
+
+/// TODO: swap for a human-readable "7 days ago" once we decide on a date dep.
+fn format_blame_markdown(b: &BlameLine) -> String {
+    format!(
+        "`{}`  **{}** <{}> · {}\n\n{}",
+        b.commit_id, b.author, b.author_email, b.time_seconds, b.summary,
+    )
 }
 
 /// Toggle the branch-diff gutter overlay. When enabled, each open document

@@ -443,6 +443,79 @@ fn collect_status(repo: &Repository) -> Result<Vec<FileChange>> {
     Ok(out.into_inner())
 }
 
+/// A single-line `git blame` result: who last touched the line and in which
+/// commit. Everything is owned so the caller can move it across threads and
+/// render it after the repo handle is dropped.
+#[derive(Clone, Debug)]
+pub struct BlameLine {
+    /// Short hex commit id (e.g. `abc1234`).
+    pub commit_id: String,
+    pub author: String,
+    pub author_email: String,
+    /// Author time as unix seconds, UTC.
+    pub time_seconds: i64,
+    /// First line of the commit message.
+    pub summary: String,
+}
+
+/// Blame a single `line` (0-based, HEAD-side line number) of `file` and return
+/// the commit that last modified it.
+///
+/// The caller is responsible for translating buffer lines into HEAD-side line
+/// numbers when the working tree differs from HEAD (e.g. by consulting the
+/// [`crate::DiffHandle`]); a line that exists only in the working tree has no
+/// blame and this function will not be called for it.
+pub fn blame_line(file: &Path, line: u32) -> Result<BlameLine> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("repo has no worktree"))?;
+    let rela = file
+        .strip_prefix(work_dir)
+        .context("file is outside the worktree")?;
+    let rela_bstr = gix::path::try_into_bstr(rela)?;
+
+    let head_id = repo.head_id()?.detach();
+    let outcome = repo
+        .blame_file(rela_bstr.as_ref(), head_id, Default::default())
+        .context("gix blame failed")?;
+
+    let entry = outcome
+        .entries
+        .iter()
+        .find(|e| {
+            let end = e.start_in_blamed_file + e.len.get();
+            (e.start_in_blamed_file..end).contains(&line)
+        })
+        .ok_or_else(|| anyhow::anyhow!("line {line} has no blame entry"))?;
+
+    let commit = repo.find_commit(entry.commit_id)?;
+    let short_id = commit.short_id()?.to_string();
+    let commit_ref = commit.decode()?;
+    let sig = commit_ref.author()?;
+    let summary = commit_ref
+        .message()
+        .summary()
+        .to_str_lossy()
+        .into_owned();
+
+    Ok(BlameLine {
+        commit_id: short_id,
+        author: sig.name.to_str_lossy().into_owned(),
+        author_email: sig.email.to_str_lossy().into_owned(),
+        time_seconds: sig.time()?.seconds,
+        summary,
+    })
+}
+
 /// Finds the object that contains the contents of a file at a specific commit.
 fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Result<ObjectId> {
     let repo_dir = repo.workdir().context("repo has no worktree")?;
