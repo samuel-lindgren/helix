@@ -57,10 +57,7 @@ impl DiffProviderRegistry {
                 Ok(res) => Some(res),
                 Err(err) => {
                     log::debug!("{err:#?}");
-                    log::debug!(
-                        "failed to open branch diff base for {}",
-                        file.display()
-                    );
+                    log::debug!("failed to open branch diff base for {}", file.display());
                     None
                 }
             })
