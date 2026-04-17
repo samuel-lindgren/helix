@@ -464,11 +464,22 @@ impl Client {
     }
 
     pub async fn variables(&self, variables_reference: usize) -> Result<Vec<Variable>> {
+        self.variables_with_options(variables_reference, None, None, None)
+            .await
+    }
+
+    pub async fn variables_with_options(
+        &self,
+        variables_reference: usize,
+        filter: Option<String>,
+        start: Option<usize>,
+        count: Option<usize>,
+    ) -> Result<Vec<Variable>> {
         let args = requests::VariablesArguments {
             variables_reference,
-            filter: None,
-            start: None,
-            count: None,
+            filter,
+            start,
+            count,
             format: None,
         };
 

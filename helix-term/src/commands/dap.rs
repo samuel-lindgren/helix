@@ -1,6 +1,7 @@
 use super::{Context, Editor};
 use crate::{
     compositor::{self, Compositor},
+    dap_display::{load_byte_collection, DecodedBytes},
     job::{Callback, Jobs},
     ui::{
         self,
@@ -13,17 +14,32 @@ use helix_core::syntax::config::{DebugConfigCompletion, DebugTemplate};
 use helix_core::{Selection, Transaction};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
-use helix_view::editor::Breakpoint;
+use helix_view::{editor::Breakpoint, DocumentId, ViewId};
 
 use serde_json::{to_value, Value};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
 
 use helix_view::handlers::dap::{breakpoints_changed, jump_to_stack_frame, select_thread_id};
+
+const DAP_EVAL_INPUT_BUFFER_NAME: &str = "[dap-eval-input]";
+const DAP_EVAL_RESULT_BUFFER_NAME: &str = "[dap-eval]";
+const EVAL_VARIABLE_DEPTH_LIMIT: usize = 3;
+const EVAL_VARIABLE_NODE_LIMIT: usize = 512;
+const GO_EVAL_START_MARKER: &str = "/*__hx_dap_expr_start__*/";
+const GO_EVAL_END_MARKER: &str = "/*__hx_dap_expr_end__*/";
+const GO_EVAL_INDENT: &str = "        ";
+
+struct EvalInputSeed {
+    content: String,
+    cursor: usize,
+    language: Option<String>,
+    source_path: Option<PathBuf>,
+}
 
 fn thread_picker(
     cx: &mut Context,
@@ -327,8 +343,7 @@ fn parse_go_test_file(content: &str, file_name: &str, out: &mut Vec<GoTestEntry>
                 .unwrap_or(lines.len());
 
             let mut subtests: Vec<String> = Vec::new();
-            let mut seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for body_line in &lines[(i + 1)..body_end] {
                 if let Some(sub) = extract_go_subtest_name(body_line) {
                     if seen.insert(sub.clone()) {
@@ -501,10 +516,8 @@ fn build_go_test_picker(
         // a prefix (e.g. TestFoo vs TestFooBar) aren't picked up. For
         // subtests we additionally append `/^case_name$` (see
         // `go_test_run_regex`).
-        let params: Vec<std::borrow::Cow<str>> = vec![
-            pkg_dir_str.clone().into(),
-            go_test_run_regex(entry).into(),
-        ];
+        let params: Vec<std::borrow::Cow<str>> =
+            vec![pkg_dir_str.clone().into(), go_test_run_regex(entry).into()];
         if let Err(err) = dap_start_impl(cx, Some(&config_name), None, Some(params)) {
             cx.editor.set_error(err.to_string());
         }
@@ -889,101 +902,32 @@ pub fn dap_terminate(cx: &mut Context) {
 }
 
 pub fn dap_eval_prompt(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
-
-    if debugger.thread_id.is_none() {
-        cx.editor
-            .set_status("Cannot evaluate while target is running.");
-        return;
-    }
-    let (frame, thread_id) = match (debugger.active_frame, debugger.thread_id) {
-        (Some(frame), Some(thread_id)) => (frame, thread_id),
-        _ => {
-            cx.editor
-                .set_status("Cannot find current stack frame to evaluate.");
+    if is_current_eval_input_buffer(cx.editor) {
+        let expression = current_selection_or_buffer(cx.editor);
+        if expression.trim().is_empty() {
+            cx.editor.set_status("No expression to evaluate.");
             return;
         }
-    };
 
-    let frame_id = debugger.stack_frames[&thread_id][frame].id;
+        evaluate_expression(cx.editor, expression, true);
+        return;
+    }
 
-    // Pre-fill with current selection if it spans multiple characters.
-    let (view, doc) = current!(cx.editor);
-    let text = doc.text().slice(..);
-    let primary = doc.selection(view.id).primary();
-    let prefill = if primary.len() > 1 {
-        primary.fragment(text).to_string()
-    } else {
-        String::new()
-    };
-
-    let callback = Box::pin(async move {
-        let call: Callback = Callback::EditorCompositor(Box::new(move |editor, compositor| {
-            let mut prompt = Prompt::new(
-                "eval:".into(),
-                None,
-                ui::completers::none,
-                move |cx, input: &str, event: PromptEvent| {
-                    if event != PromptEvent::Validate {
-                        return;
-                    }
-                    if input.is_empty() {
-                        return;
-                    }
-
-                    let debugger = debugger!(cx.editor);
-                    match block_on(debugger.eval(input.to_string(), Some(frame_id))) {
-                        Ok(resp) => {
-                            let expr = input.to_string();
-                            let text = if resp.result.is_empty() {
-                                format!("{} = (empty)", expr)
-                            } else {
-                                let header = resp
-                                    .ty
-                                    .as_ref()
-                                    .map(|t| format!("{}: {}", expr, t))
-                                    .unwrap_or_else(|| expr.clone());
-                                format!(
-                                    "{}\n\n{}",
-                                    header,
-                                    format_eval_value(&resp.result)
-                                )
-                            };
-                            show_eval_result_in_buffer(cx.editor, text);
-                        }
-                        Err(e) => cx.editor.set_error(format!("Eval failed: {}", e)),
-                    }
-                },
-            );
-            if !prefill.is_empty() {
-                prompt.insert_str(&prefill, editor);
-            }
-            compositor.push(Box::new(prompt));
-        }));
-        Ok(call)
-    });
-    cx.jobs.callback(callback);
+    let seed = current_eval_input_seed(cx.editor);
+    show_eval_input_buffer(
+        cx.editor,
+        &seed.content,
+        seed.cursor,
+        seed.language.as_deref(),
+        seed.source_path.as_deref(),
+    );
+    cx.editor.set_status(
+        "Opened debug expression buffer. Use Space G e here to evaluate selection or buffer.",
+    );
+    super::enter_insert_mode(cx);
 }
 
 pub fn dap_eval_selection(cx: &mut Context) {
-    let debugger = debugger!(cx.editor);
-
-    if debugger.thread_id.is_none() {
-        cx.editor
-            .set_status("Cannot evaluate while target is running.");
-        return;
-    }
-    let (frame, thread_id) = match (debugger.active_frame, debugger.thread_id) {
-        (Some(frame), Some(thread_id)) => (frame, thread_id),
-        _ => {
-            cx.editor
-                .set_status("Cannot find current stack frame to evaluate.");
-            return;
-        }
-    };
-
-    let frame_id = debugger.stack_frames[&thread_id][frame].id;
-
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
     let primary = doc.selection(view.id).primary();
@@ -1002,25 +946,7 @@ pub fn dap_eval_selection(cx: &mut Context) {
         return;
     }
 
-    let debugger = debugger!(cx.editor);
-    match block_on(debugger.eval(expression.clone(), Some(frame_id))) {
-        Ok(resp) => {
-            let text = if resp.result.is_empty() {
-                format!("{} = (empty)", expression)
-            } else {
-                let header = resp
-                    .ty
-                    .as_ref()
-                    .map(|t| format!("{}: {}", expression, t))
-                    .unwrap_or_else(|| expression.clone());
-                format!("{}\n\n{}", header, format_eval_value(&resp.result))
-            };
-            show_eval_result_in_buffer(cx.editor, text);
-        }
-        Err(e) => cx
-            .editor
-            .set_error(format!("Eval '{}': {}", expression, e)),
-    }
+    evaluate_expression(cx.editor, expression, false);
 }
 
 /// Show the evaluation result in a dedicated `[dap-eval]` scratch buffer so
@@ -1034,8 +960,10 @@ pub fn dap_eval_selection(cx: &mut Context) {
 /// * If the buffer still exists but no view shows it (e.g. the user closed the
 ///   split), re-open it in a new vertical split and replace its contents.
 /// * If the buffer was closed entirely, create a fresh one in a vertical split.
-fn show_eval_result_in_buffer(editor: &mut Editor, content: String) {
+fn show_eval_result_in_buffer(editor: &mut Editor, content: String, preserve_focus: bool) {
     use helix_view::editor::Action;
+
+    let origin_view_id = preserve_focus.then(|| view!(editor).id);
 
     // Is there a live eval buffer from a previous invocation?
     let existing_id = match editor.debug_eval_doc_id {
@@ -1053,58 +981,554 @@ fn show_eval_result_in_buffer(editor: &mut Editor, content: String) {
                 .find(|(_, view)| view.doc == id)
                 .map(|(view_id, _)| view_id);
 
-            match visible_view_id {
-                Some(view_id) => editor.focus(view_id),
-                None => editor.switch(id, Action::VerticalSplit),
-            }
+            let target_view_id = match visible_view_id {
+                Some(view_id) => {
+                    if !preserve_focus {
+                        editor.focus(view_id);
+                    }
+                    view_id
+                }
+                None => {
+                    editor.switch(id, Action::VerticalSplit);
+                    view!(editor).id
+                }
+            };
 
-            // Replace the entire buffer contents with the new result.
-            let doc = doc_mut!(editor, &id);
-            let view = view_mut!(editor);
-            let old_len = doc.text().len_chars();
-            let transaction = Transaction::change(
-                doc.text(),
-                std::iter::once((0, old_len, Some(content.into()))),
-            )
-            .with_selection(Selection::point(0));
-            doc.apply(&transaction, view.id);
-            // Commit and mark clean so the statusline doesn't show `[+]` and
-            // `:q` doesn't prompt. `append_changes_to_history` clears pending
-            // `doc.changes`; `reset_modified` then aligns the saved revision.
-            doc.append_changes_to_history(view);
-            doc.reset_modified();
+            replace_eval_result_buffer(editor, id, target_view_id, content);
         }
         None => {
             // First eval this session (or the previous buffer was closed).
             // Open a fresh scratch buffer in a vertical split and remember it.
             let doc_id = editor.new_file(Action::VerticalSplit);
             editor.debug_eval_doc_id = Some(doc_id);
-            let doc = doc_mut!(editor, &doc_id);
-            doc.set_virtual_name(Some("[dap-eval]".to_string()));
-            let view = view_mut!(editor);
-            doc.ensure_view_init(view.id);
-            let transaction = Transaction::insert(
-                doc.text(),
-                doc.selection(view.id),
-                content.into(),
-            )
-            .with_selection(Selection::point(0));
-            doc.apply(&transaction, view.id);
-            doc.append_changes_to_history(view);
-            doc.reset_modified();
+            {
+                let doc = doc_mut!(editor, &doc_id);
+                doc.set_virtual_name(Some(DAP_EVAL_RESULT_BUFFER_NAME.to_string()));
+            }
+            replace_eval_result_buffer(editor, doc_id, view!(editor).id, content);
         }
+    }
+
+    if let Some(view_id) = origin_view_id {
+        editor.focus(view_id);
     }
 }
 
-/// Format a DAP eval result for display: break struct fields onto separate lines.
+fn replace_eval_result_buffer(
+    editor: &mut Editor,
+    doc_id: DocumentId,
+    view_id: ViewId,
+    content: String,
+) {
+    let view = editor.tree.get_mut(view_id);
+    let doc = doc_mut!(editor, &doc_id);
+    doc.set_soft_wrap_override(Some(true));
+    doc.ensure_view_init(view.id);
+
+    let old_len = doc.text().len_chars();
+    let transaction = Transaction::change(
+        doc.text(),
+        std::iter::once((0, old_len, Some(content.into()))),
+    )
+    .with_selection(Selection::point(0));
+    doc.apply(&transaction, view.id);
+    // Commit and mark clean so the statusline doesn't show `[+]` and
+    // `:q` doesn't prompt. `append_changes_to_history` clears pending
+    // `doc.changes`; `reset_modified` then aligns the saved revision.
+    doc.append_changes_to_history(view);
+    doc.reset_modified();
+}
+
+fn show_eval_input_buffer(
+    editor: &mut Editor,
+    content: &str,
+    cursor: usize,
+    language: Option<&str>,
+    source_path: Option<&Path>,
+) {
+    use helix_view::editor::Action;
+
+    let doc_id = match editor.debug_eval_input_doc_id {
+        Some(id) if editor.documents.contains_key(&id) => {
+            let visible_view_id = editor
+                .tree
+                .traverse()
+                .find(|(_, view)| view.doc == id)
+                .map(|(view_id, _)| view_id);
+
+            match visible_view_id {
+                Some(view_id) => editor.focus(view_id),
+                None => editor.switch(id, Action::VerticalSplit),
+            }
+
+            id
+        }
+        _ => {
+            let doc_id = editor.new_file(Action::VerticalSplit);
+            editor.debug_eval_input_doc_id = Some(doc_id);
+            doc_id
+        }
+    };
+
+    let should_set_path = {
+        let doc = doc!(editor, &doc_id);
+        doc.path().is_none()
+    };
+
+    if should_set_path {
+        if let Some(path) = source_path
+            .map(|path| synthetic_eval_input_path(path, doc_id))
+            .filter(|path| {
+                !editor
+                    .documents
+                    .values()
+                    .any(|doc| doc.path() == Some(path))
+            })
+        {
+            editor.set_doc_path(doc_id, &path);
+        }
+    }
+
+    let should_seed = {
+        let doc = doc!(editor, &doc_id);
+        !content.is_empty() && doc.text().len_chars() == 0 && !doc.is_modified()
+    };
+
+    let loader = editor.syn_loader.load();
+    let view = view_mut!(editor);
+    let doc = doc_mut!(editor, &doc_id);
+    doc.set_virtual_name(Some(DAP_EVAL_INPUT_BUFFER_NAME.to_string()));
+    doc.ensure_view_init(view.id);
+
+    if let Some(language) = language {
+        let _ = doc.set_language_by_language_id(language, &loader);
+    }
+
+    if should_seed {
+        let transaction = Transaction::change(
+            doc.text(),
+            std::iter::once((0, doc.text().len_chars(), Some(content.into()))),
+        )
+        .with_selection(Selection::point(cursor));
+        doc.apply(&transaction, view.id);
+        doc.append_changes_to_history(view);
+        doc.reset_modified();
+    }
+}
+
+fn synthetic_eval_input_path(source_path: &Path, doc_id: DocumentId) -> PathBuf {
+    let parent = source_path.parent().unwrap_or_else(|| Path::new("."));
+    let extension = source_path
+        .extension()
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        .unwrap_or_default();
+
+    parent.join(format!("hx-dap-eval-input-{doc_id}{extension}"))
+}
+
+fn is_current_eval_input_buffer(editor: &mut Editor) -> bool {
+    let Some(doc_id) = editor.debug_eval_input_doc_id else {
+        return false;
+    };
+    if !editor.documents.contains_key(&doc_id) {
+        return false;
+    }
+
+    let (_, doc) = current!(editor);
+    doc.id() == doc_id
+}
+
+fn current_eval_input_seed(editor: &mut Editor) -> EvalInputSeed {
+    let (view, doc) = current!(editor);
+    let text = doc.text().slice(..);
+    let primary = doc.selection(view.id).primary();
+    let prefill = if primary.len() > 1 {
+        primary.fragment(text).to_string()
+    } else {
+        String::new()
+    };
+    let language = doc.language_name().map(str::to_owned);
+    let source_path = doc.path().cloned();
+
+    match language.as_deref() {
+        Some("go") => build_go_eval_input_seed(&text.to_string(), prefill, source_path),
+        _ => EvalInputSeed {
+            cursor: prefill.chars().count(),
+            content: prefill,
+            language,
+            source_path,
+        },
+    }
+}
+
+fn current_selection_or_buffer(editor: &mut Editor) -> String {
+    let (view, doc) = current!(editor);
+    let text = doc.text().slice(..);
+    let primary = doc.selection(view.id).primary();
+
+    if primary.len() > 1 {
+        primary.fragment(text).to_string()
+    } else if doc.language_name() == Some("go") {
+        extract_go_eval_expression(&text.to_string()).unwrap_or_else(|| text.to_string())
+    } else {
+        text.to_string()
+    }
+}
+
+fn build_go_eval_input_seed(
+    source_text: &str,
+    expression: String,
+    source_path: Option<PathBuf>,
+) -> EvalInputSeed {
+    let package = detect_go_package_name(source_text).unwrap_or("main");
+    let import_block = extract_go_import_block(source_text);
+
+    let mut content = format!("package {package}\n");
+    if let Some(import_block) = import_block {
+        content.push('\n');
+        content.push_str(&import_block);
+        content.push('\n');
+    }
+    content.push_str("\nfunc __hx_dap_eval__() any {\n    return (\n");
+    content.push_str(GO_EVAL_INDENT);
+    content.push_str(GO_EVAL_START_MARKER);
+    content.push('\n');
+
+    if expression.is_empty() {
+        content.push_str(GO_EVAL_INDENT);
+        content.push('\n');
+    } else {
+        for line in expression.lines() {
+            content.push_str(GO_EVAL_INDENT);
+            content.push_str(line);
+            content.push('\n');
+        }
+    }
+
+    content.push_str(GO_EVAL_INDENT);
+    content.push_str(GO_EVAL_END_MARKER);
+    content.push_str("\n    )\n}\n");
+
+    let cursor = go_eval_expression_region(&content)
+        .map(|(_, end)| content[..end].chars().count())
+        .unwrap_or_else(|| content.chars().count());
+
+    EvalInputSeed {
+        content,
+        cursor,
+        language: Some("go".to_string()),
+        source_path,
+    }
+}
+
+fn detect_go_package_name(source: &str) -> Option<&str> {
+    source.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("package ")
+            .and_then(|rest| rest.split_whitespace().next())
+    })
+}
+
+fn extract_go_import_block(source: &str) -> Option<String> {
+    let lines: Vec<_> = source.lines().collect();
+    let package_index = lines
+        .iter()
+        .position(|line| line.trim().starts_with("package "))?;
+
+    let mut index = package_index + 1;
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            index += 1;
+            continue;
+        }
+
+        if trimmed.starts_with("import ") {
+            if trimmed == "import (" || trimmed.starts_with("import (") {
+                let start = index;
+                index += 1;
+                while index < lines.len() && lines[index].trim() != ")" {
+                    index += 1;
+                }
+                if index < lines.len() {
+                    index += 1;
+                }
+                return Some(lines[start..index].join("\n"));
+            }
+
+            let start = index;
+            index += 1;
+            while index < lines.len() && lines[index].trim().starts_with("import ") {
+                index += 1;
+            }
+            return Some(lines[start..index].join("\n"));
+        }
+
+        return None;
+    }
+
+    None
+}
+
+fn go_eval_expression_region(text: &str) -> Option<(usize, usize)> {
+    let start_marker = text.find(GO_EVAL_START_MARKER)? + GO_EVAL_START_MARKER.len();
+    let end_marker = text[start_marker..].find(GO_EVAL_END_MARKER)? + start_marker;
+
+    let mut start = start_marker;
+    let mut end = end_marker;
+
+    if text[start..end].starts_with('\n') {
+        start += 1;
+    }
+    if start < end && text[start..end].ends_with('\n') {
+        end -= 1;
+    }
+
+    Some((start, end))
+}
+
+fn extract_go_eval_expression(text: &str) -> Option<String> {
+    let (start, end) = go_eval_expression_region(text)?;
+    let inner = &text[start..end];
+    let dedented = inner
+        .lines()
+        .map(|line| line.strip_prefix(GO_EVAL_INDENT).unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(dedented.trim_end().to_string())
+}
+
+fn current_stack_frame_id(editor: &Editor) -> Result<usize, &'static str> {
+    let Some(debugger) = editor.debug_adapters.get_active_client() else {
+        return Err("No active debug session.");
+    };
+
+    if debugger.thread_id.is_none() {
+        return Err("Cannot evaluate while target is running.");
+    }
+
+    let (frame, thread_id) = match (debugger.active_frame, debugger.thread_id) {
+        (Some(frame), Some(thread_id)) => (frame, thread_id),
+        _ => return Err("Cannot find current stack frame to evaluate."),
+    };
+
+    Ok(debugger.stack_frames[&thread_id][frame].id)
+}
+
+fn evaluate_expression(editor: &mut Editor, expression: String, preserve_focus: bool) {
+    let frame_id = match current_stack_frame_id(editor) {
+        Ok(frame_id) => frame_id,
+        Err(message) => {
+            editor.set_status(message);
+            return;
+        }
+    };
+
+    let response = {
+        let debugger = debugger!(editor);
+        block_on(debugger.eval(expression.clone(), Some(frame_id)))
+    };
+
+    match response {
+        Ok(resp) => {
+            let text = {
+                let debugger = debugger!(editor);
+                format_eval_response(debugger, &expression, &resp)
+            };
+            show_eval_result_in_buffer(editor, text, preserve_focus);
+        }
+        Err(e) => editor.set_error(format!("Eval '{}': {}", expression, e)),
+    }
+}
+
+fn format_eval_response(
+    debugger: &dap::Client,
+    expression: &str,
+    resp: &dap::requests::EvaluateResponse,
+) -> String {
+    let header = resp
+        .ty
+        .as_ref()
+        .map(|t| format!("{expression}: {t}"))
+        .unwrap_or_else(|| expression.to_owned());
+
+    if let Some(children) =
+        format_eval_children(debugger, resp.variables_reference, resp.indexed_variables)
+    {
+        return format!("{header}\n\n{children}");
+    }
+
+    let summary = if resp.result.is_empty() {
+        "(empty)".to_string()
+    } else {
+        format_eval_value(&resp.result)
+    };
+
+    format!("{header}\n\n{summary}")
+}
+
+fn format_eval_children(
+    debugger: &dap::Client,
+    variables_reference: usize,
+    indexed_variables: Option<usize>,
+) -> Option<String> {
+    if variables_reference == 0 {
+        return None;
+    }
+
+    if let Some(decoded) = load_byte_collection(debugger, variables_reference, indexed_variables) {
+        return Some(decoded.pretty);
+    }
+
+    let response = block_on(debugger.variables(variables_reference)).ok()?;
+
+    let mut visited = HashSet::new();
+    let mut lines = Vec::new();
+    let mut remaining = EVAL_VARIABLE_NODE_LIMIT;
+
+    match render_variable_children_from_response(
+        debugger,
+        response,
+        0,
+        &mut remaining,
+        &mut visited,
+        &mut lines,
+    ) {
+        Ok(()) => {}
+        Err(err) => lines.push(format!("<failed to expand children: {err}>")),
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("children:\n{}", lines.join("\n")))
+    }
+}
+
+fn render_variable_children_from_response(
+    debugger: &dap::Client,
+    variables: Vec<dap::Variable>,
+    depth: usize,
+    remaining: &mut usize,
+    visited: &mut HashSet<usize>,
+    lines: &mut Vec<String>,
+) -> helix_dap::Result<()> {
+    for variable in variables {
+        if *remaining == 0 {
+            lines.push(format!("{}...", "  ".repeat(depth)));
+            break;
+        }
+
+        *remaining -= 1;
+
+        if variable.variables_reference != 0
+            && depth < EVAL_VARIABLE_DEPTH_LIMIT
+            && visited.insert(variable.variables_reference)
+        {
+            if let Some(decoded) = load_byte_collection(
+                debugger,
+                variable.variables_reference,
+                variable.indexed_variables,
+            ) {
+                push_decoded_variable_lines(lines, &variable, depth, decoded);
+                continue;
+            }
+
+            let children = block_on(debugger.variables(variable.variables_reference))?;
+
+            push_variable_lines(lines, &variable, depth);
+            render_variable_children_from_response(
+                debugger,
+                children,
+                depth + 1,
+                remaining,
+                visited,
+                lines,
+            )?;
+        } else {
+            push_variable_lines(lines, &variable, depth);
+        }
+    }
+
+    Ok(())
+}
+
+fn push_variable_lines(lines: &mut Vec<String>, variable: &dap::Variable, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let ty = variable
+        .ty
+        .as_ref()
+        .map(|ty| format!(": {ty}"))
+        .unwrap_or_default();
+    let formatted = format_eval_value(&variable.value);
+
+    if formatted.contains('\n') {
+        lines.push(format!("{indent}{}{ty} =", variable.name));
+        push_indented_block(lines, &formatted, depth + 1);
+    } else {
+        lines.push(format!("{indent}{}{ty} = {formatted}", variable.name));
+    }
+}
+
+fn push_decoded_variable_lines(
+    lines: &mut Vec<String>,
+    variable: &dap::Variable,
+    depth: usize,
+    decoded: DecodedBytes,
+) {
+    let indent = "  ".repeat(depth);
+    let ty = variable
+        .ty
+        .as_ref()
+        .map(|ty| format!(": {ty}"))
+        .unwrap_or_default();
+
+    if decoded.pretty.contains('\n') {
+        lines.push(format!("{indent}{}{ty} =", variable.name));
+        push_indented_block(lines, &decoded.pretty, depth + 1);
+    } else {
+        lines.push(format!(
+            "{indent}{}{ty} = {}",
+            variable.name, decoded.pretty
+        ));
+    }
+}
+
+fn push_indented_block(lines: &mut Vec<String>, text: &str, depth: usize) {
+    let indent = "  ".repeat(depth);
+    lines.extend(text.lines().map(|line| format!("{indent}{line}")));
+}
+
+/// Format a DAP eval result for display: break composite values onto separate lines.
 fn format_eval_value(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
-    let mut depth: i32 = 0;
+    let mut depth = 0usize;
     let mut chars = value.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
 
     while let Some(ch) = chars.next() {
+        if in_string {
+            result.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
         match ch {
-            '{' => {
+            '"' => {
+                in_string = true;
+                result.push(ch);
+            }
+            '{' | '[' => {
                 depth += 1;
                 result.push(ch);
                 result.push('\n');
@@ -1112,8 +1536,8 @@ fn format_eval_value(value: &str) -> String {
                     result.push_str("  ");
                 }
             }
-            '}' => {
-                depth -= 1;
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
                 result.push('\n');
                 for _ in 0..depth {
                     result.push_str("  ");
@@ -1122,7 +1546,6 @@ fn format_eval_value(value: &str) -> String {
             }
             ',' => {
                 result.push(ch);
-                // Newline after comma at struct level, but not inside strings.
                 if depth > 0 {
                     result.push('\n');
                     for _ in 0..depth {
@@ -1430,12 +1853,7 @@ pub fn dap_breakpoint_picker(cx: &mut Context) {
         let pos = doc.text().line_to_char(line);
         doc.set_selection(view.id, Selection::point(pos));
     })
-    .with_preview(|_editor, item| {
-        Some((
-            item.path.as_path().into(),
-            Some((item.line, item.line)),
-        ))
-    });
+    .with_preview(|_editor, item| Some((item.path.as_path().into(), Some((item.line, item.line)))));
     cx.push_layer(Box::new(picker))
 }
 
@@ -1473,11 +1891,9 @@ pub fn dap_add_watch(cx: &mut Context) {
                     }
                     if !cx.editor.watch_expressions.contains(&expr) {
                         cx.editor.watch_expressions.push(expr.clone());
-                        cx.editor
-                            .set_status(format!("Added watch: {}", expr));
+                        cx.editor.set_status(format!("Added watch: {}", expr));
                     } else {
-                        cx.editor
-                            .set_status(format!("Already watching: {}", expr));
+                        cx.editor.set_status(format!("Already watching: {}", expr));
                     }
                 },
             );
@@ -1503,8 +1919,7 @@ pub fn dap_remove_watch(cx: &mut Context) {
     })];
     let picker = Picker::new(columns, 0, expressions, (), |cx, expr, _action| {
         cx.editor.watch_expressions.retain(|e| e != expr);
-        cx.editor
-            .set_status(format!("Removed watch: {}", expr));
+        cx.editor.set_status(format!("Removed watch: {}", expr));
     });
     cx.push_layer(Box::new(picker));
 }
@@ -1673,5 +2088,49 @@ func TestReal(t *testing.T) {}
             go_test_run_regex(&entry),
             r"^TestFoo$/^simple_add_\(a\.b\)$"
         );
+    }
+
+    #[test]
+    fn builds_eval_input_path_next_to_source_file() {
+        let path =
+            synthetic_eval_input_path(Path::new("/tmp/example/main.go"), DocumentId::default());
+
+        assert_eq!(path, PathBuf::from("/tmp/example/hx-dap-eval-input-1.go"));
+    }
+
+    #[test]
+    fn formats_bracketed_eval_values_across_lines() {
+        assert_eq!(
+            format_eval_value(r#"["a", "b", "c"]"#),
+            "[\n  \"a\",\n  \"b\",\n  \"c\"\n]"
+        );
+    }
+
+    #[test]
+    fn extracts_go_eval_expression_from_wrapper() {
+        let seed = build_go_eval_input_seed(
+            "package foo\n\nimport \"os\"\n",
+            "os.Getenv(\"HOME\")".to_string(),
+            None,
+        );
+
+        assert_eq!(
+            extract_go_eval_expression(&seed.content),
+            Some("os.Getenv(\"HOME\")".to_string())
+        );
+    }
+
+    #[test]
+    fn preserves_go_import_block_in_eval_seed() {
+        let seed = build_go_eval_input_seed(
+            "package foo\n\nimport (\n    \"fmt\"\n    \"os\"\n)\n\nfunc main() {}\n",
+            String::new(),
+            None,
+        );
+
+        assert!(seed
+            .content
+            .contains("import (\n    \"fmt\"\n    \"os\"\n)"));
+        assert!(seed.content.contains("func __hx_dap_eval__() any {"));
     }
 }

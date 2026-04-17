@@ -617,11 +617,12 @@ fn lsp_item_to_transaction(
             .insert_text
             .clone()
             .unwrap_or_else(|| item.label.clone());
-        // check that we are still at the correct savepoint
-        // we can still generate a transaction regardless but if the
-        // document changed (and not just the selection) then we will
-        // likely delete the wrong text (same if we applied an edit sent by the LS)
-        debug_assert!(primary_cursor == trigger_offset);
+        // If the document changed since the completion was triggered the
+        // cursor may no longer match the trigger offset.  Bail out rather
+        // than applying a transaction against the wrong text.
+        if primary_cursor != trigger_offset {
+            return (Transaction::new(doc.text()), None);
+        }
         (None, new_text)
     };
 

@@ -393,9 +393,7 @@ fn branch_status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> R
                     location,
                     ..
                 } => {
-                    let (Ok(from), Ok(to)) =
-                        (source_location.to_path(), location.to_path())
-                    else {
+                    let (Ok(from), Ok(to)) = (source_location.to_path(), location.to_path()) else {
                         return Ok(ControlFlow::Continue(()));
                     };
                     FileChange::Renamed {

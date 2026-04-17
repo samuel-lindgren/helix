@@ -141,8 +141,7 @@ pub fn diff<'doc>(
                 // we need to special case removals here
                 // these technically do not have a range of lines to highlight (`hunk.after.start == hunk.after.end`).
                 // However we still want to display these hunks correctly we must not yet skip to the next hunk here
-                while hunk.after.end < line_u
-                    || !hunk.is_pure_removal() && line_u == hunk.after.end
+                while hunk.after.end < line_u || !hunk.is_pure_removal() && line_u == hunk.after.end
                 {
                     head_i += 1;
                     *hunk = hunks.nth_hunk(head_i);
@@ -167,8 +166,7 @@ pub fn diff<'doc>(
 
             // HEAD didn't claim this line — fall through to the branch overlay.
             if let (Some(hunks), Some(hunk)) = (branch_diff.as_ref(), branch_hunk.as_mut()) {
-                while hunk.after.end < line_u
-                    || !hunk.is_pure_removal() && line_u == hunk.after.end
+                while hunk.after.end < line_u || !hunk.is_pure_removal() && line_u == hunk.after.end
                 {
                     branch_i += 1;
                     *hunk = hunks.nth_hunk(branch_i);

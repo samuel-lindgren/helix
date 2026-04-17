@@ -608,7 +608,7 @@ impl MappableCommand {
         dap_edit_log, "Edit breakpoint log message on current line",
         dap_switch_thread, "Switch current thread",
         dap_switch_stack_frame, "Switch stack frame",
-        dap_eval_prompt, "Evaluate expression in debug context",
+        dap_eval_prompt, "Open or evaluate debug expression buffer",
         dap_eval_selection, "Evaluate word or selection in debug context",
         dap_run_to_cursor, "Run to cursor line",
         dap_breakpoint_picker, "List all breakpoints",
@@ -4277,8 +4277,7 @@ fn reset_branch_change(cx: &mut Context) {
             Some(handle) => {
                 let text = doc.text();
                 let text_slice = text.slice(..);
-                let cursor_line =
-                    doc.selection(view.id).primary().cursor_line(text_slice) as u32;
+                let cursor_line = doc.selection(view.id).primary().cursor_line(text_slice) as u32;
                 let diff = handle.load();
                 match diff.hunk_at(cursor_line, true) {
                     None => Outcome::NoHunk,
@@ -4287,7 +4286,8 @@ fn reset_branch_change(cx: &mut Context) {
                         let base = diff.diff_base();
                         let before_start_char = base.line_to_char(hunk.before.start as usize);
                         let before_end_char = base.line_to_char(hunk.before.end as usize);
-                        let before_text = base.slice(before_start_char..before_end_char).to_string();
+                        let before_text =
+                            base.slice(before_start_char..before_end_char).to_string();
                         let after_start = text.line_to_char(hunk.after.start as usize);
                         let after_end = text.line_to_char(hunk.after.end as usize);
                         Outcome::Ready {
@@ -4344,9 +4344,9 @@ fn diff_peek(cx: &mut Context) {
         }
         (Some(h), None) => format!("```{lang}\n{h}\n```"),
         (None, Some(b)) => format!("```{lang}\n{b}\n```"),
-        (Some(h), Some(b)) => format!(
-            "### HEAD\n```{lang}\n{h}\n```\n\n### Branch\n```{lang}\n{b}\n```"
-        ),
+        (Some(h), Some(b)) => {
+            format!("### HEAD\n```{lang}\n{h}\n```\n\n### Branch\n```{lang}\n{b}\n```")
+        }
     };
 
     let syn_loader = cx.editor.syn_loader.clone();

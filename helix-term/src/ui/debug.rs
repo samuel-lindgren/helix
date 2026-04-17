@@ -1,6 +1,8 @@
 use crate::{
     compositor::{Callback, Component, Compositor, Context, Event, EventResult},
-    ctrl, key,
+    ctrl,
+    dap_display::{decode_byte_collection, load_byte_collection},
+    key,
 };
 use helix_dap::{self as dap, registry::DebugAdapterId};
 use helix_lsp::block_on;
@@ -53,6 +55,7 @@ enum NodeKind {
         value: String,
         ty: Option<String>,
         variables_reference: usize,
+        indexed_variables: Option<usize>,
     },
 }
 
@@ -114,26 +117,51 @@ impl DebugVariables {
         let mut children = Vec::new();
         for expr in &editor.watch_expressions {
             let node = match block_on(debugger.eval(expr.clone(), frame_id)) {
-                Ok(resp) => Node {
-                    kind: NodeKind::Variable {
-                        name: expr.clone(),
-                        value: sanitize_inline(resp.result),
-                        ty: resp.ty.map(sanitize_inline),
-                        variables_reference: resp.variables_reference,
-                    },
-                    children: if resp.variables_reference == 0 {
-                        Children::Loaded(Vec::new())
+                Ok(resp) => {
+                    let (value, children_state) = if resp.variables_reference == 0 {
+                        (sanitize_inline(resp.result), Children::Loaded(Vec::new()))
                     } else {
-                        Children::Unloaded
-                    },
-                    expanded: false,
-                },
+                        match load_byte_collection(
+                            debugger,
+                            resp.variables_reference,
+                            resp.indexed_variables,
+                        ) {
+                            Some(decoded) => (
+                                sanitize_inline(decoded.inline.clone()),
+                                Children::Loaded(vec![Node::from_decoded_bytes(decoded)]),
+                            ),
+                            None => match block_on(debugger.variables(resp.variables_reference)) {
+                                Ok(variables) => match decode_byte_collection(&variables) {
+                                    Some(decoded) => (
+                                        sanitize_inline(decoded.inline.clone()),
+                                        Children::Loaded(vec![Node::from_decoded_bytes(decoded)]),
+                                    ),
+                                    None => (sanitize_inline(resp.result), Children::Unloaded),
+                                },
+                                Err(_) => (sanitize_inline(resp.result), Children::Unloaded),
+                            },
+                        }
+                    };
+
+                    Node {
+                        kind: NodeKind::Variable {
+                            name: expr.clone(),
+                            value,
+                            ty: resp.ty.map(sanitize_inline),
+                            variables_reference: resp.variables_reference,
+                            indexed_variables: resp.indexed_variables,
+                        },
+                        children: children_state,
+                        expanded: false,
+                    }
+                }
                 Err(e) => Node {
                     kind: NodeKind::Variable {
                         name: expr.clone(),
                         value: format!("<{}>", e),
                         ty: None,
                         variables_reference: 0,
+                        indexed_variables: None,
                     },
                     children: Children::Loaded(Vec::new()),
                     expanded: false,
@@ -376,7 +404,13 @@ impl DebugVariables {
         }
 
         let variables_reference = node.variables_reference();
-        match Self::load_children(editor, self.debugger_id, variables_reference) {
+        let indexed_variables = node.indexed_variables();
+        match Self::load_children(
+            editor,
+            self.debugger_id,
+            variables_reference,
+            indexed_variables,
+        ) {
             Ok(children) => {
                 if let Some(node) = self.node_mut(path) {
                     node.children = Children::Loaded(children);
@@ -431,10 +465,17 @@ impl DebugVariables {
         editor: &mut Editor,
         debugger_id: DebugAdapterId,
         variables_reference: usize,
+        indexed_variables: Option<usize>,
     ) -> Result<Vec<Node>, String> {
         let Some(debugger) = editor.debug_adapters.get_client(debugger_id) else {
             return Err("Debugger session ended.".to_string());
         };
+
+        if let Some(decoded) =
+            load_byte_collection(debugger, variables_reference, indexed_variables)
+        {
+            return Ok(vec![Node::from_decoded_bytes(decoded)]);
+        }
 
         let response = block_on(debugger.variables(variables_reference))
             .map_err(|error| format!("Failed to load variables: {error}"))?;
@@ -808,12 +849,28 @@ impl Node {
                 value: sanitize_inline(variable.value),
                 ty: variable.ty.map(sanitize_inline),
                 variables_reference: variable.variables_reference,
+                indexed_variables: variable.indexed_variables,
             },
             children: if variable.variables_reference == 0 {
                 Children::Loaded(Vec::new())
             } else {
                 Children::Unloaded
             },
+            expanded: false,
+        }
+    }
+
+    fn from_decoded_bytes(decoded: crate::dap_display::DecodedBytes) -> Self {
+        let label = decoded.label().to_string();
+        Self {
+            kind: NodeKind::Variable {
+                name: "decoded".to_string(),
+                value: sanitize_inline(decoded.inline),
+                ty: Some(label),
+                variables_reference: 0,
+                indexed_variables: None,
+            },
+            children: Children::Loaded(Vec::new()),
             expanded: false,
         }
     }
@@ -836,6 +893,15 @@ impl Node {
                 variables_reference,
                 ..
             } => *variables_reference,
+        }
+    }
+
+    fn indexed_variables(&self) -> Option<usize> {
+        match &self.kind {
+            NodeKind::Variable {
+                indexed_variables, ..
+            } => *indexed_variables,
+            NodeKind::Scope { .. } => None,
         }
     }
 
@@ -938,6 +1004,7 @@ mod tests {
                         value: "42".into(),
                         ty: Some("i32".into()),
                         variables_reference: 0,
+                        indexed_variables: None,
                     },
                     expanded: false,
                     children: Children::Loaded(Vec::new()),
@@ -1097,13 +1164,7 @@ impl Component for DebugOutputPanel {
                 } else {
                     text_style
                 };
-                surface.set_stringn(
-                    list_area.left(),
-                    y,
-                    line,
-                    list_area.width as usize,
-                    style,
-                );
+                surface.set_stringn(list_area.left(), y, line, list_area.width as usize, style);
             }
         }
 

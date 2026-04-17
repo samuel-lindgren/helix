@@ -1214,6 +1214,8 @@ pub struct Editor {
     pub watch_expressions: Vec<String>,
     /// Collected debug adapter output for review via `:debug-log`.
     pub debug_output_log: Vec<String>,
+    /// DocumentId of the editable DAP eval input buffer, if one is open.
+    pub debug_eval_input_doc_id: Option<DocumentId>,
     /// DocumentId of the dedicated DAP eval result buffer, if one is open.
     /// Used to reuse a single buffer across `dap_eval_prompt`/`dap_eval_selection`
     /// invocations so the result acts like a dedicated "watch window".
@@ -1366,6 +1368,7 @@ impl Editor {
             breakpoints: HashMap::new(),
             watch_expressions: Vec::new(),
             debug_output_log: Vec::new(),
+            debug_eval_input_doc_id: None,
             debug_eval_doc_id: None,
             syn_loader,
             theme_loader,
@@ -1945,9 +1948,7 @@ impl Editor {
                 doc.set_diff_base(diff_base);
             }
             if self.branch_diff_enabled {
-                if let Some(branch_diff_base) =
-                    self.diff_providers.get_branch_diff_base(&path)
-                {
+                if let Some(branch_diff_base) = self.diff_providers.get_branch_diff_base(&path) {
                     doc.set_branch_diff_base(branch_diff_base);
                 }
             }
