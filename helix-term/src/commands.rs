@@ -595,6 +595,7 @@ impl MappableCommand {
         goto_next_paragraph, "Goto next paragraph",
         goto_prev_paragraph, "Goto previous paragraph",
         dap_launch, "Launch debug target",
+        dap_rerun_last, "Rerun last debug target",
         dap_restart, "Restart debugging session",
         dap_toggle_breakpoint, "Toggle breakpoint",
         dap_continue, "Continue program execution",
@@ -4394,8 +4395,7 @@ fn git_blame_line(cx: &mut Context) {
 
         let call = move |editor: &mut Editor, compositor: &mut Compositor| {
             let Some(b) = blame else {
-                editor
-                    .set_status("No blame available (untracked, binary, or outside repo)");
+                editor.set_status("No blame available (untracked, binary, or outside repo)");
                 return;
             };
             let md = format_blame_markdown(&b);

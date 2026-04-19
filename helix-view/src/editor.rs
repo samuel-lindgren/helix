@@ -28,6 +28,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, stdin},
+    net::SocketAddr,
     num::{NonZeroU8, NonZeroUsize},
     path::{Path, PathBuf},
     pin::Pin,
@@ -50,7 +51,10 @@ use helix_core::{
     diagnostic::DiagnosticProvider,
     syntax::{
         self,
-        config::{AutoPairConfig, IndentationHeuristic, LanguageServerFeature, SoftWrap},
+        config::{
+            AutoPairConfig, DebugAdapterConfig, IndentationHeuristic, LanguageServerFeature,
+            SoftWrap,
+        },
     },
     Change, LineEnding, Position, Range, Selection, Uri, NATIVE_LINE_ENDING,
 };
@@ -1180,6 +1184,15 @@ pub struct Breakpoint {
     pub temporary: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct LastDebugLaunch {
+    pub config: DebugAdapterConfig,
+    pub template_name: String,
+    pub request_type: String,
+    pub socket: Option<SocketAddr>,
+    pub args: serde_json::Value,
+}
+
 use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
@@ -1213,6 +1226,7 @@ pub struct Editor {
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
+    pub last_debug_launch: Option<LastDebugLaunch>,
     /// Expressions to evaluate on every debug stop (watch window).
     pub watch_expressions: Vec<String>,
     /// Collected debug adapter and debuggee output for review via `:debug-log`.
@@ -1373,6 +1387,7 @@ impl Editor {
             branch_diff_enabled: false,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
+            last_debug_launch: None,
             watch_expressions: Vec::new(),
             debug_output_log: Vec::new(),
             debug_output_doc_id: None,

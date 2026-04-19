@@ -62,6 +62,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "w" => goto_word,
         },
         ":" => command_mode,
+        "F2" => dap_rerun_last,
 
         "i" => insert_mode,
         "I" => insert_at_line_start,
@@ -245,6 +246,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "'" => last_picker,
             "G" => { "Debug (experimental)" sticky=true
                 "l" => dap_launch,
+                "R" => dap_rerun_last,
                 "r" => dap_restart,
                 "b" => dap_toggle_breakpoint,
                 "c" => dap_continue,

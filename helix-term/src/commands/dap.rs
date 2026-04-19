@@ -6,17 +6,21 @@ use crate::{
     ui::{self, overlay::overlaid, DebugVariables, Picker, Prompt, PromptEvent},
 };
 use dap::{StackFrame, Thread, ThreadStates};
-use helix_core::syntax::config::{DebugConfigCompletion, DebugTemplate};
+use helix_core::syntax::config::{DebugAdapterConfig, DebugConfigCompletion, DebugTemplate};
 use helix_core::{Selection, Transaction};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
-use helix_view::{editor::Breakpoint, DocumentId, ViewId};
+use helix_view::{
+    editor::{Breakpoint, LastDebugLaunch},
+    DocumentId, ViewId,
+};
 
 use serde_json::{to_value, Value};
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{self, SeekFrom};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
@@ -44,6 +48,13 @@ struct EvalInputSeed {
     cursor: usize,
     language: Option<String>,
     source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDebugLaunch {
+    template_name: String,
+    request_type: String,
+    args: Value,
 }
 
 fn thread_picker(
@@ -170,8 +181,11 @@ fn dap_start_callback(
     jobs.callback(callback);
 }
 
-fn redirected_output_paths(args: &HashMap<&str, Value>) -> Vec<(PathBuf, &'static str, bool)> {
+fn redirected_output_paths(args: &Value) -> Vec<(PathBuf, &'static str, bool)> {
     let mut paths = Vec::new();
+    let Some(args) = args.as_object() else {
+        return paths;
+    };
 
     for (field, prefix, is_stderr) in [
         ("stdoutTo", "[stdout] [debuggee]", false),
@@ -188,7 +202,7 @@ fn redirected_output_paths(args: &HashMap<&str, Value>) -> Vec<(PathBuf, &'stati
 fn register_redirected_output_tails(
     editor: &mut Editor,
     id: dap::registry::DebugAdapterId,
-    args: &HashMap<&str, Value>,
+    args: &Value,
 ) {
     for (path, prefix, is_stderr) in redirected_output_paths(args) {
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -266,79 +280,121 @@ async fn read_redirected_output(path: &Path, offset: &mut u64) -> io::Result<Opt
 pub fn dap_start_impl(
     cx: &mut compositor::Context,
     name: Option<&str>,
-    socket: Option<std::net::SocketAddr>,
+    socket: Option<SocketAddr>,
     params: Option<Vec<std::borrow::Cow<str>>>,
 ) -> Result<(), anyhow::Error> {
-    let doc = doc!(cx.editor);
-    let config = doc
+    let config = doc!(cx.editor)
         .language_config()
         .and_then(|config| config.debugger.as_ref())
         .ok_or_else(|| anyhow!("No debug adapter available for language"))?
         .clone();
+    let params = params.map(|params| {
+        params
+            .into_iter()
+            .map(|param| param.into_owned())
+            .collect::<Vec<_>>()
+    });
+    let resolved = resolve_debug_launch(&config, name, params.as_deref())?;
 
-    cx.editor.set_status("Starting debug adapter...");
-    cx.editor.stop_all_debug_output_tails();
-    cx.editor.clear_debug_output();
+    start_debug_launch(
+        cx.editor,
+        cx.jobs,
+        LastDebugLaunch {
+            config,
+            template_name: resolved.template_name,
+            request_type: resolved.request_type,
+            socket,
+            args: resolved.args,
+        },
+    )
+}
 
-    let id = cx
-        .editor
-        .debug_adapters
-        .start_client(socket, &config)
-        .map_err(|e| anyhow!("Failed to start debug client: {}", e))?;
-
-    // TODO: avoid refetching all of this... pass a config in
+fn resolve_debug_launch(
+    config: &DebugAdapterConfig,
+    name: Option<&str>,
+    params: Option<&[String]>,
+) -> Result<ResolvedDebugLaunch, anyhow::Error> {
     let template = match name {
         Some(name) => config.templates.iter().find(|t| t.name == name),
         None => config.templates.first(),
     }
     .ok_or_else(|| anyhow!("No debug config with given name"))?;
 
-    let mut args: HashMap<&str, Value> = if let Some(params) = params.as_ref() {
+    let mut args: serde_json::Map<String, Value> = if let Some(params) = params {
         let preprocessed_params = prepare_dap_params(template, params);
         template
             .args
             .iter()
-            .map(|(k, v)| (k.as_str(), map_value(v, &preprocessed_params)))
+            .map(|(k, v)| (k.clone(), map_value(v, &preprocessed_params)))
             .collect()
     } else {
         template
             .args
             .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     };
 
     if !args.contains_key("cwd") {
-        args.insert("cwd", to_value(helix_stdx::env::current_working_dir())?);
+        args.insert(
+            "cwd".to_owned(),
+            to_value(helix_stdx::env::current_working_dir())?,
+        );
     }
 
-    register_redirected_output_tails(cx.editor, id, &args);
+    Ok(ResolvedDebugLaunch {
+        template_name: template.name.clone(),
+        request_type: template.request.clone(),
+        args: Value::Object(args),
+    })
+}
 
-    let args = to_value(args).unwrap();
+fn start_debug_launch(
+    editor: &mut Editor,
+    jobs: &mut Jobs,
+    launch: LastDebugLaunch,
+) -> Result<(), anyhow::Error> {
+    match launch.request_type.as_str() {
+        "launch" | "attach" => {}
+        request => bail!("Unsupported request '{}'", request),
+    }
 
-    let debugger = match cx.editor.debug_adapters.get_client_mut(id) {
+    editor.set_status("Starting debug adapter...");
+    editor.stop_all_debug_output_tails();
+    editor.clear_debug_output();
+    editor.last_debug_launch = Some(launch.clone());
+
+    let id = editor
+        .debug_adapters
+        .start_client(launch.socket, &launch.config)
+        .map_err(|e| anyhow!("Failed to start debug client: {}", e))?;
+
+    register_redirected_output_tails(editor, id, &launch.args);
+
+    let debugger = match editor.debug_adapters.get_client_mut(id) {
         Some(child) => child,
         None => {
             bail!("Failed to get child debugger.");
         }
     };
 
-    match &template.request[..] {
+    let args = launch.args.clone();
+    match launch.request_type.as_str() {
         "launch" => {
             let call = debugger.launch(args);
-            dap_start_callback(cx.jobs, id, "launch".to_owned(), call);
+            dap_start_callback(jobs, id, "launch".to_owned(), call);
         }
         "attach" => {
             let call = debugger.attach(args);
-            dap_start_callback(cx.jobs, id, "attach".to_owned(), call);
+            dap_start_callback(jobs, id, "attach".to_owned(), call);
         }
-        request => bail!("Unsupported request '{}'", request),
+        _ => unreachable!("validated request type"),
     };
 
     Ok(())
 }
 
-fn prepare_dap_params(template: &DebugTemplate, params: &[std::borrow::Cow<str>]) -> Vec<String> {
+fn prepare_dap_params(template: &DebugTemplate, params: &[String]) -> Vec<String> {
     params
         .iter()
         .enumerate()
@@ -346,7 +402,7 @@ fn prepare_dap_params(template: &DebugTemplate, params: &[std::borrow::Cow<str>]
             let mut param = x.to_string();
             if let Some(DebugConfigCompletion::Advanced(cfg)) = template.completion.get(i) {
                 if matches!(cfg.completion.as_deref(), Some("filename" | "directory")) {
-                    param = std::fs::canonicalize(x.as_ref())
+                    param = std::fs::canonicalize(x)
                         .ok()
                         .and_then(|pb| pb.into_os_string().into_string().ok())
                         .unwrap_or_else(|| x.to_string());
@@ -758,6 +814,26 @@ pub fn dap_restart(cx: &mut Context) {
         debugger.restart(),
         |editor, _compositor, _resp: ()| editor.set_status("Debugging session restarted"),
     );
+}
+
+pub(crate) fn rerun_last_debug_launch(editor: &mut Editor, jobs: &mut Jobs) {
+    if editor.debug_adapters.get_active_client().is_some() {
+        editor.set_error("Debugger is already running");
+        return;
+    }
+
+    let Some(launch) = editor.last_debug_launch.clone() else {
+        editor.set_error("No previous debug launch to rerun");
+        return;
+    };
+
+    if let Err(err) = start_debug_launch(editor, jobs, launch) {
+        editor.set_error(err.to_string());
+    }
+}
+
+pub fn dap_rerun_last(cx: &mut Context) {
+    rerun_last_debug_launch(cx.editor, cx.jobs);
 }
 
 fn debug_parameter_prompt(
@@ -2211,16 +2287,10 @@ func TestReal(t *testing.T) {}
 
     #[test]
     fn finds_redirected_debuggee_output_paths() {
-        let args = HashMap::from([
-            (
-                "stdoutTo",
-                Value::String("/tmp/debuggee-stdout.log".to_owned()),
-            ),
-            (
-                "stderrTo",
-                Value::String("/tmp/debuggee-stderr.log".to_owned()),
-            ),
-        ]);
+        let args = serde_json::json!({
+            "stdoutTo": "/tmp/debuggee-stdout.log",
+            "stderrTo": "/tmp/debuggee-stderr.log",
+        });
 
         assert_eq!(
             redirected_output_paths(&args),
@@ -2236,6 +2306,41 @@ func TestReal(t *testing.T) {}
                     true,
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn resolves_debug_launch_with_template_args() {
+        let config = DebugAdapterConfig {
+            name: "go".into(),
+            transport: "stdio".into(),
+            command: "dlv".into(),
+            args: Vec::new(),
+            port_arg: None,
+            quirks: Default::default(),
+            templates: vec![DebugTemplate {
+                name: "go-test".into(),
+                request: "launch".into(),
+                completion: vec![DebugConfigCompletion::Named("package".into())],
+                args: HashMap::from([
+                    ("mode".into(), Value::String("test".into())),
+                    ("program".into(), Value::String("{0}".into())),
+                    ("cwd".into(), Value::String("/tmp/work".into())),
+                ]),
+            }],
+        };
+
+        let resolved = resolve_debug_launch(&config, None, Some(&["./pkg".to_owned()])).unwrap();
+
+        assert_eq!(resolved.template_name, "go-test");
+        assert_eq!(resolved.request_type, "launch");
+        assert_eq!(
+            resolved.args,
+            serde_json::json!({
+                "mode": "test",
+                "program": "./pkg",
+                "cwd": "/tmp/work",
+            })
         );
     }
 

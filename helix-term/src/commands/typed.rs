@@ -1983,6 +1983,20 @@ fn debug_log(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> a
     Ok(())
 }
 
+fn debug_rerun_last(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    rerun_last_debug_launch(cx.editor, cx.jobs);
+
+    Ok(())
+}
+
 fn debug_start(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -3537,6 +3551,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: debug_log,
         completer: CommandCompleter::none(),
         signature: Signature::DEFAULT,
+    },
+    TypableCommand {
+        name: "debug-rerun-last",
+        aliases: &["dbg-last"],
+        doc: "Rerun the last debug launch with its resolved arguments.",
+        fun: debug_rerun_last,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "vsplit",
