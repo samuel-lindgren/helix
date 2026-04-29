@@ -499,11 +499,7 @@ pub fn blame_line(file: &Path, line: u32) -> Result<BlameLine> {
     let short_id = commit.short_id()?.to_string();
     let commit_ref = commit.decode()?;
     let sig = commit_ref.author()?;
-    let summary = commit_ref
-        .message()
-        .summary()
-        .to_str_lossy()
-        .into_owned();
+    let summary = commit_ref.message().summary().to_str_lossy().into_owned();
 
     Ok(BlameLine {
         commit_id: short_id,

@@ -227,6 +227,7 @@ Jumps to various locations.
 | `c`   | Go to the middle of the screen                   | `goto_window_center`       |
 | `b`   | Go to the bottom of the screen                   | `goto_window_bottom`       |
 | `d`   | Go to definition (**LSP**)                       | `goto_definition`          |
+| `T`   | Go to corresponding Go test                      | `goto_corresponding_test`  |
 | `y`   | Go to type definition (**LSP**)                  | `goto_type_definition`     |
 | `r`   | Go to references (**LSP**)                       | `goto_reference`           |
 | `i`   | Go to implementation (**LSP**)                   | `goto_implementation`      |

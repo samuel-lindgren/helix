@@ -62,6 +62,8 @@
 | `:debug-start`, `:dbg` | Start a debug session from a given template with given parameters. |
 | `:debug-remote`, `:dbg-tcp` | Connect to a debug adapter by TCP address and start a debugging session from a given template with given parameters. |
 | `:debug-eval` | Evaluate expression in current debug context. |
+| `:debug-log`, `:dbg-log` | Show debug adapter output log. |
+| `:debug-rerun-last`, `:dbg-last` | Rerun the last debug launch with its resolved arguments. |
 | `:vsplit`, `:vs` | Open the file in a vertical split. |
 | `:vsplit-new`, `:vnew` | Open a scratch buffer in a vertical split. |
 | `:hsplit`, `:hs`, `:sp` | Open the file in a horizontal split. |

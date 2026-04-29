@@ -46,6 +46,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "s" => goto_first_nonwhitespace,
             "d" => goto_definition,
             "D" => goto_declaration,
+            "T" => goto_corresponding_test,
             "y" => goto_type_definition,
             "r" => goto_reference,
             "i" => goto_implementation,
@@ -246,6 +247,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "'" => last_picker,
             "G" => { "Debug (experimental)" sticky=true
                 "l" => dap_launch,
+                "F2" => dap_rerun_last,
                 "R" => dap_rerun_last,
                 "r" => dap_restart,
                 "b" => dap_toggle_breakpoint,

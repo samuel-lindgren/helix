@@ -110,6 +110,11 @@
 | `syntax_symbol_picker` | Open symbol picker from syntax information |  |
 | `lsp_or_syntax_symbol_picker` | Open symbol picker from LSP or syntax information | normal: `` <space>s ``, select: `` <space>s `` |
 | `changed_file_picker` | Open changed file picker | normal: `` <space>g ``, select: `` <space>g `` |
+| `branch_changed_file_picker` | Open changed file picker for current branch vs main/master | normal: `` <space>B ``, select: `` <space>B `` |
+| `toggle_branch_diff` | Toggle branch diff gutter overlay (current branch vs main/master) | normal: `` <space>T ``, select: `` <space>T `` |
+| `recent_files_picker` | Open recent files picker | normal: `` <space>o ``, select: `` <space>o `` |
+| `goto_next_breakpoint` | Goto next breakpoint | normal: `` ]b ``, select: `` ]b `` |
+| `goto_prev_breakpoint` | Goto previous breakpoint | normal: `` [b ``, select: `` [b `` |
 | `select_references_to_symbol_under_cursor` | Select symbol references | normal: `` <space>h ``, select: `` <space>h `` |
 | `workspace_symbol_picker` | Open workspace symbol picker |  |
 | `syntax_workspace_symbol_picker` | Open workspace symbol picker from syntax information |  |
@@ -126,6 +131,7 @@
 | `exit_select_mode` | Exit selection mode | select: `` <esc> `` |
 | `goto_definition` | Goto definition | normal: `` gd ``, select: `` gd `` |
 | `goto_declaration` | Goto declaration | normal: `` gD ``, select: `` gD `` |
+| `goto_corresponding_test` | Goto corresponding Go test | normal: `` gT ``, select: `` gT `` |
 | `add_newline_above` | Add newline above | normal: `` [<space> ``, select: `` [<space> `` |
 | `add_newline_below` | Add newline below | normal: `` ]<space> ``, select: `` ]<space> `` |
 | `goto_type_definition` | Goto type definition | normal: `` gy ``, select: `` gy `` |
@@ -155,6 +161,13 @@
 | `goto_prev_change` | Goto previous change | normal: `` [g ``, select: `` [g `` |
 | `goto_first_change` | Goto first change | normal: `` [G ``, select: `` [G `` |
 | `goto_last_change` | Goto last change | normal: `` ]G ``, select: `` ]G `` |
+| `goto_next_branch_change` | Goto next branch change (vs main/master) | normal: `` ]B ``, select: `` ]B `` |
+| `goto_prev_branch_change` | Goto previous branch change (vs main/master) | normal: `` [B ``, select: `` [B `` |
+| `goto_first_branch_change` | Goto first branch change (vs main/master) |  |
+| `goto_last_branch_change` | Goto last branch change (vs main/master) |  |
+| `diff_peek` | Peek removed content of the hunk at cursor (HEAD and branch diff) | normal: `` <space>K ``, select: `` <space>K `` |
+| `git_blame_line` | Show git blame popup for line at cursor | normal: `` <space>L ``, select: `` <space>L `` |
+| `reset_branch_change` | Reset branch diff hunk at cursor to merge-base content | normal: `` <space>v ``, select: `` <space>v `` |
 | `goto_line_start` | Goto line start | normal: `` gh ``, `` <home> ``, select: `` gh ``, insert: `` <home> `` |
 | `goto_line_end` | Goto line end | normal: `` gl ``, `` <end> ``, select: `` gl `` |
 | `goto_column` | Goto column | normal: `` g\| `` |
@@ -280,6 +293,7 @@
 | `goto_next_paragraph` | Goto next paragraph | normal: `` ]p ``, select: `` ]p `` |
 | `goto_prev_paragraph` | Goto previous paragraph | normal: `` [p ``, select: `` [p `` |
 | `dap_launch` | Launch debug target | normal: `` <space>Gl ``, select: `` <space>Gl `` |
+| `dap_rerun_last` | Rerun last debug target | normal: `` <F2> ``, `` <space>GR ``, `` <space>G<F2> ``, select: `` <F2> ``, `` <space>GR ``, `` <space>G<F2> `` |
 | `dap_restart` | Restart debugging session | normal: `` <space>Gr ``, select: `` <space>Gr `` |
 | `dap_toggle_breakpoint` | Toggle breakpoint | normal: `` <space>Gb ``, select: `` <space>Gb `` |
 | `dap_continue` | Continue program execution | normal: `` <space>Gc ``, select: `` <space>Gc `` |
@@ -287,13 +301,19 @@
 | `dap_step_in` | Step in | normal: `` <space>Gi ``, select: `` <space>Gi `` |
 | `dap_step_out` | Step out | normal: `` <space>Go ``, select: `` <space>Go `` |
 | `dap_next` | Step to next | normal: `` <space>Gn ``, select: `` <space>Gn `` |
-| `dap_variables` | List variables | normal: `` <space>Gv ``, select: `` <space>Gv `` |
+| `dap_variables` | Open debug variables browser | normal: `` <space>Gv ``, select: `` <space>Gv `` |
 | `dap_terminate` | End debug session | normal: `` <space>Gt ``, select: `` <space>Gt `` |
 | `dap_edit_condition` | Edit breakpoint condition on current line | normal: `` <space>G<C-c> ``, select: `` <space>G<C-c> `` |
 | `dap_edit_log` | Edit breakpoint log message on current line | normal: `` <space>G<C-l> ``, select: `` <space>G<C-l> `` |
 | `dap_switch_thread` | Switch current thread | normal: `` <space>Gst ``, select: `` <space>Gst `` |
 | `dap_switch_stack_frame` | Switch stack frame | normal: `` <space>Gsf ``, select: `` <space>Gsf `` |
-| `dap_enable_exceptions` | Enable exception breakpoints | normal: `` <space>Ge ``, select: `` <space>Ge `` |
+| `dap_eval_prompt` | Open or evaluate debug expression buffer | normal: `` <space>Ge ``, select: `` <space>Ge `` |
+| `dap_eval_selection` | Evaluate word or selection in debug context | normal: `` <space>Gw ``, select: `` <space>Gw `` |
+| `dap_run_to_cursor` | Run to cursor line | normal: `` <space>Gg ``, select: `` <space>Gg `` |
+| `dap_breakpoint_picker` | List all breakpoints | normal: `` <space>GB ``, select: `` <space>GB `` |
+| `dap_add_watch` | Add watch expression | normal: `` <space>Ga ``, select: `` <space>Ga `` |
+| `dap_remove_watch` | Remove watch expression | normal: `` <space>GA ``, select: `` <space>GA `` |
+| `dap_enable_exceptions` | Enable exception breakpoints | normal: `` <space>G<C-e> ``, select: `` <space>G<C-e> `` |
 | `dap_disable_exceptions` | Disable exception breakpoints | normal: `` <space>GE ``, select: `` <space>GE `` |
 | `shell_pipe` | Pipe selections through shell command | normal: `` \| ``, select: `` \| `` |
 | `shell_pipe_to` | Pipe selections into shell command ignoring output | normal: `` <A-\|> ``, select: `` <A-\|> `` |

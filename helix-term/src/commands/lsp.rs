@@ -5,17 +5,18 @@ use helix_lsp::{
         self, CodeAction, CodeActionOrCommand, CodeActionTriggerKind, DiagnosticSeverity,
         NumberOrString,
     },
-    util::{diagnostic_to_lsp_diagnostic, lsp_range_to_range, range_to_lsp_range},
+    util::{diagnostic_to_lsp_diagnostic, lsp_range_to_range, pos_to_lsp_pos, range_to_lsp_range},
     Client, LanguageServerId, OffsetEncoding,
 };
+use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tui::{text::Span, widgets::Row};
 
 use super::{align_view, push_jump, Align, Context, Editor};
 
 use helix_core::{
-    diagnostic::DiagnosticProvider, syntax::config::LanguageServerFeature,
-    text_annotations::InlineAnnotation, Selection, Uri,
+    diagnostic::DiagnosticProvider, regex, syntax::config::LanguageServerFeature,
+    text_annotations::InlineAnnotation, Rope, Selection, Uri,
 };
 use helix_stdx::path;
 use helix_view::{
@@ -32,7 +33,7 @@ use crate::{
     ui::{self, overlay::overlaid, FileLocation, Picker, Popup, PromptEvent},
 };
 
-use std::{cmp::Ordering, collections::HashSet, fmt::Display, future::Future, path::Path};
+use std::{cmp::Ordering, collections::HashSet, fmt::Display, fs, future::Future, path::Path};
 
 /// Gets the first language server that is attached to a document which supports a specific feature.
 /// If there is no configured language server that supports the feature, this displays a status message.
@@ -98,6 +99,42 @@ struct DiagnosticStyles {
 struct PickerDiagnostic {
     location: Location,
     diag: lsp::Diagnostic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoSymbolTarget {
+    symbol_name: String,
+    expected_test_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoplsPackagesResult {
+    #[serde(rename = "Packages", default)]
+    packages: Vec<GoplsPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoplsPackage {
+    #[serde(rename = "Path")]
+    path: String,
+    #[serde(rename = "ForTest", default)]
+    for_test: String,
+    #[serde(rename = "TestFiles", default)]
+    test_files: Vec<GoplsTestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoplsTestFile {
+    #[serde(rename = "Tests", default)]
+    tests: Vec<GoplsTestCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoplsTestCase {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Loc")]
+    loc: lsp::Location,
 }
 
 fn location_to_file_location(location: &Location) -> Option<FileLocation<'_>> {
@@ -884,6 +921,237 @@ fn goto_impl(editor: &mut Editor, compositor: &mut Compositor, locations: Vec<Lo
     }
 }
 
+fn is_gopls_packages_command_supported(language_server: &Client) -> bool {
+    language_server.name() == "gopls"
+        && language_server
+            .capabilities()
+            .execute_command_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                provider
+                    .commands
+                    .iter()
+                    .any(|command| command == "gopls.packages")
+            })
+}
+
+fn gopls_packages_command(current_dir: lsp::Url) -> lsp::Command {
+    lsp::Command {
+        title: "gopls.packages".into(),
+        command: "gopls.packages".into(),
+        arguments: Some(vec![serde_json::json!({
+            "Files": [current_dir],
+            "Mode": 1u64,
+        })]),
+    }
+}
+
+fn parse_go_package_name(text: &str) -> Option<String> {
+    let package = regex::Regex::new(r"(?m)^\s*package\s+([[:word:]]+)\s*$").ok()?;
+    package
+        .captures(text)?
+        .get(1)
+        .map(|capture| capture.as_str().to_string())
+}
+
+fn is_go_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+
+fn is_go_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn is_go_exported(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn parse_go_identifier_at(text: &str, byte_idx: usize) -> Option<String> {
+    let mut chars = text.get(byte_idx..)?.char_indices();
+    let (_, first) = chars.next()?;
+    if !is_go_identifier_start(first) {
+        return None;
+    }
+
+    let mut end = byte_idx + first.len_utf8();
+    for (offset, ch) in chars {
+        if !is_go_identifier_continue(ch) {
+            break;
+        }
+        end = byte_idx + offset + ch.len_utf8();
+    }
+
+    Some(text.get(byte_idx..end)?.to_string())
+}
+
+fn find_go_func_keyword(prefix: &str) -> Option<usize> {
+    let mut search_end = prefix.len();
+    while let Some(idx) = prefix[..search_end].rfind("func") {
+        let before = prefix[..idx].chars().next_back();
+        let after = prefix[idx + "func".len()..].chars().next();
+        let boundary_ok = before.is_none_or(|ch| !is_go_identifier_continue(ch))
+            && after.is_some_and(|ch| ch.is_whitespace() || ch == '(');
+        if boundary_ok {
+            return Some(idx);
+        }
+        search_end = idx;
+    }
+    None
+}
+
+fn parse_go_receiver_type(receiver: &str) -> Option<String> {
+    let receiver = receiver.trim();
+    let type_part = receiver.split_whitespace().last()?.trim_start_matches('*');
+    let type_part = type_part.split('[').next().unwrap_or(type_part);
+    let type_part = type_part.rsplit('.').next().unwrap_or(type_part);
+    if type_part.is_empty() {
+        None
+    } else {
+        Some(type_part.to_string())
+    }
+}
+
+fn parse_go_symbol_target_from_name_char(
+    text: &str,
+    name_char_idx: usize,
+) -> Option<GoSymbolTarget> {
+    let rope = Rope::from(text);
+    let name_byte_idx = rope.char_to_byte(name_char_idx);
+    let symbol_name = parse_go_identifier_at(text, name_byte_idx)?;
+    if symbol_name == "init" || symbol_name == "_" {
+        return None;
+    }
+
+    let declaration_prefix = text.get(..name_byte_idx)?;
+    let func_idx = find_go_func_keyword(declaration_prefix)?;
+    let between = declaration_prefix.get(func_idx + "func".len()..)?.trim();
+
+    let expected_test_name = if between.is_empty() {
+        let mut test_name = String::from("Test");
+        if !is_go_exported(&symbol_name) {
+            test_name.push('_');
+        }
+        test_name.push_str(&symbol_name);
+        test_name
+    } else if between.starts_with('(') && between.ends_with(')') {
+        let receiver = parse_go_receiver_type(&between[1..between.len() - 1])?;
+        let mut test_name = String::from("Test");
+        if !is_go_exported(&receiver) {
+            test_name.push('_');
+        }
+        test_name.push_str(&receiver);
+        test_name.push('_');
+        test_name.push_str(&symbol_name);
+        test_name
+    } else {
+        return None;
+    };
+
+    Some(GoSymbolTarget {
+        symbol_name,
+        expected_test_name,
+    })
+}
+
+fn parse_go_symbol_target_from_location(
+    location: &lsp::Location,
+    current_doc_path: &Path,
+    current_doc_text: &str,
+    offset_encoding: OffsetEncoding,
+) -> Option<GoSymbolTarget> {
+    let path = location.uri.to_file_path().ok()?;
+    let text = if path == current_doc_path {
+        current_doc_text.to_owned()
+    } else {
+        fs::read_to_string(&path).ok()?
+    };
+    let rope = Rope::from(text.as_str());
+    let range = lsp_range_to_range(&rope, location.range, offset_encoding)?;
+    parse_go_symbol_target_from_name_char(&text, range.from())
+}
+
+fn go_package_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn find_matching_tests_in_packages(
+    packages_result: &GoplsPackagesResult,
+    package_name: Option<&str>,
+    target: &GoSymbolTarget,
+    offset_encoding: OffsetEncoding,
+) -> Vec<Location> {
+    packages_result
+        .packages
+        .iter()
+        .filter(|package| {
+            package_name.is_none_or(|package_name| {
+                go_package_basename(&package.path) == package_name
+                    || (!package.for_test.is_empty()
+                        && go_package_basename(&package.for_test) == package_name)
+            })
+        })
+        .flat_map(|package| package.test_files.iter())
+        .flat_map(|file| file.tests.iter())
+        .filter(|test| test.name == target.expected_test_name)
+        .filter_map(|test| lsp_location_to_location(test.loc.clone(), offset_encoding))
+        .collect()
+}
+
+fn find_test_function_in_file(
+    path: &Path,
+    test_name: &str,
+    offset_encoding: OffsetEncoding,
+) -> Option<Location> {
+    let text = fs::read_to_string(path).ok()?;
+    let pattern = format!(
+        r"(?m)^\s*func\s+(?P<name>{})\s*(?:\[[^\n]*\]\s*)?\(",
+        regex::escape(test_name)
+    );
+    let matcher = regex::Regex::new(&pattern).ok()?;
+    let captures = matcher.captures(&text)?;
+    let name_match = captures.name("name")?;
+
+    let rope = Rope::from(text.as_str());
+    let start = rope.byte_to_char(name_match.start());
+    let end = rope.byte_to_char(name_match.end());
+    let start = pos_to_lsp_pos(&rope, start, offset_encoding);
+    let end = pos_to_lsp_pos(&rope, end, offset_encoding);
+
+    Some(Location {
+        uri: lsp::Url::from_file_path(path).ok()?.try_into().ok()?,
+        range: lsp::Range::new(start, end),
+        offset_encoding,
+    })
+}
+
+fn find_matching_tests_in_directory(
+    dir: &Path,
+    target: &GoSymbolTarget,
+    offset_encoding: OffsetEncoding,
+) -> Vec<Location> {
+    let mut test_files = fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "go"))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_test.go"))
+        })
+        .collect::<Vec<_>>();
+    test_files.sort();
+
+    test_files
+        .into_iter()
+        .filter_map(|path| {
+            find_test_function_in_file(&path, &target.expected_test_name, offset_encoding)
+        })
+        .collect()
+}
+
 fn goto_single_impl<P, F>(cx: &mut Context, feature: LanguageServerFeature, request_provider: P)
 where
     P: Fn(&Client, lsp::Position, lsp::TextDocumentIdentifier) -> Option<F>,
@@ -982,6 +1250,121 @@ pub fn goto_implementation(cx: &mut Context) {
     );
 }
 
+pub fn goto_corresponding_test(cx: &mut Context) {
+    let (view, doc) = current_ref!(cx.editor);
+
+    if doc.language_id() != Some("go") {
+        cx.editor
+            .set_error("Go to corresponding test is only available for Go files");
+        return;
+    }
+
+    let Some(current_path) = doc.path().cloned() else {
+        cx.editor
+            .set_error("Go to corresponding test requires a file-backed buffer");
+        return;
+    };
+    let Some(current_dir) = current_path.parent() else {
+        cx.editor
+            .set_error("Go to corresponding test requires a file in a directory");
+        return;
+    };
+    let current_dir = current_dir.to_path_buf();
+    let Ok(current_dir_url) = lsp::Url::from_directory_path(&current_dir) else {
+        cx.editor
+            .set_error("Go to corresponding test could not resolve the current directory");
+        return;
+    };
+
+    let Some(language_server) = doc
+        .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
+        .find(|language_server| is_gopls_packages_command_supported(language_server))
+    else {
+        cx.editor
+            .set_error("Go to corresponding test requires gopls workspace commands");
+        return;
+    };
+
+    let offset_encoding = language_server.offset_encoding();
+    let position = doc.position(view.id, offset_encoding);
+    let current_doc_text = doc.text().to_string();
+    let current_cursor = doc
+        .selection(view.id)
+        .primary()
+        .cursor(doc.text().slice(..));
+    let current_package_name = parse_go_package_name(&current_doc_text);
+
+    let definition_request = language_server.goto_definition(doc.identifier(), position, None);
+    let packages_request = language_server.command(gopls_packages_command(current_dir_url));
+
+    cx.jobs.callback(async move {
+        let definition_locations = match definition_request {
+            Some(request) => match request.await {
+                Ok(Some(lsp::GotoDefinitionResponse::Scalar(location))) => vec![location],
+                Ok(Some(lsp::GotoDefinitionResponse::Array(locations))) => locations,
+                Ok(Some(lsp::GotoDefinitionResponse::Link(locations))) => locations
+                    .into_iter()
+                    .map(|location| {
+                        lsp::Location::new(location.target_uri, location.target_selection_range)
+                    })
+                    .collect(),
+                Ok(None) | Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+
+        let packages_result = match packages_request {
+            Some(request) => match request.await {
+                Ok(Some(value)) => serde_json::from_value::<GoplsPackagesResult>(value).ok(),
+                Ok(None) | Err(_) => None,
+            },
+            None => None,
+        };
+
+        let target = definition_locations
+            .iter()
+            .find_map(|location| {
+                parse_go_symbol_target_from_location(
+                    location,
+                    &current_path,
+                    &current_doc_text,
+                    offset_encoding,
+                )
+            })
+            .or_else(|| parse_go_symbol_target_from_name_char(&current_doc_text, current_cursor));
+
+        let mut locations = Vec::new();
+        if let Some(target) = target.as_ref() {
+            if let Some(packages_result) = packages_result.as_ref() {
+                locations = find_matching_tests_in_packages(
+                    packages_result,
+                    current_package_name.as_deref(),
+                    target,
+                    offset_encoding,
+                );
+            }
+
+            if locations.is_empty() {
+                locations = find_matching_tests_in_directory(&current_dir, target, offset_encoding);
+            }
+        }
+
+        let target = target;
+        let call = move |editor: &mut Editor, compositor: &mut Compositor| match target {
+            None => editor.set_error("No Go function or method found."),
+            Some(target) if locations.is_empty() => {
+                editor.set_error(format!(
+                    "No corresponding test found for {}.",
+                    target.symbol_name
+                ));
+            }
+            Some(_) => goto_impl(editor, compositor, locations),
+        };
+
+        Ok(Callback::EditorCompositor(Box::new(call)))
+    });
+}
+
 pub fn goto_reference(cx: &mut Context) {
     let config = cx.editor.config();
     let (view, doc) = current_ref!(cx.editor);
@@ -1025,6 +1408,130 @@ pub fn goto_reference(cx: &mut Context) {
         };
         Ok(Callback::EditorCompositor(Box::new(call)))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_go_package_name_from_source() {
+        let source = r#"
+            // comment
+            package widgets
+
+            func Build() {}
+        "#;
+
+        assert_eq!(parse_go_package_name(source).as_deref(), Some("widgets"));
+    }
+
+    #[test]
+    fn parse_go_symbol_target_for_exported_function() {
+        let source = "package widgets\n\nfunc Build() {}\n";
+        let char_idx = source.find("Build").unwrap();
+
+        assert_eq!(
+            parse_go_symbol_target_from_name_char(source, char_idx),
+            Some(GoSymbolTarget {
+                symbol_name: "Build".into(),
+                expected_test_name: "TestBuild".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_go_symbol_target_for_unexported_function() {
+        let source = "package widgets\n\nfunc build() {}\n";
+        let char_idx = source.find("build").unwrap();
+
+        assert_eq!(
+            parse_go_symbol_target_from_name_char(source, char_idx),
+            Some(GoSymbolTarget {
+                symbol_name: "build".into(),
+                expected_test_name: "Test_build".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_go_symbol_target_for_exported_method() {
+        let source = "package widgets\n\nfunc (s Service) Build() {}\n";
+        let char_idx = source.find("Build").unwrap();
+
+        assert_eq!(
+            parse_go_symbol_target_from_name_char(source, char_idx),
+            Some(GoSymbolTarget {
+                symbol_name: "Build".into(),
+                expected_test_name: "TestService_Build".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_go_symbol_target_for_unexported_receiver_method() {
+        let source = "package widgets\n\nfunc (s *service[T]) Build() {}\n";
+        let char_idx = source.find("Build").unwrap();
+
+        assert_eq!(
+            parse_go_symbol_target_from_name_char(source, char_idx),
+            Some(GoSymbolTarget {
+                symbol_name: "Build".into(),
+                expected_test_name: "Test_service_Build".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn find_matching_tests_in_packages_uses_package_name_filter() {
+        let packages = GoplsPackagesResult {
+            packages: vec![
+                GoplsPackage {
+                    path: "example/widgets".into(),
+                    for_test: String::new(),
+                    test_files: vec![GoplsTestFile {
+                        tests: vec![GoplsTestCase {
+                            name: "TestBuild".into(),
+                            loc: lsp::Location::new(
+                                lsp::Url::parse("file:///tmp/widgets_test.go").unwrap(),
+                                lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 9)),
+                            ),
+                        }],
+                    }],
+                },
+                GoplsPackage {
+                    path: "other".into(),
+                    for_test: String::new(),
+                    test_files: vec![GoplsTestFile {
+                        tests: vec![GoplsTestCase {
+                            name: "TestBuild".into(),
+                            loc: lsp::Location::new(
+                                lsp::Url::parse("file:///tmp/other_test.go").unwrap(),
+                                lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 9)),
+                            ),
+                        }],
+                    }],
+                },
+            ],
+        };
+        let target = GoSymbolTarget {
+            symbol_name: "Build".into(),
+            expected_test_name: "TestBuild".into(),
+        };
+
+        let locations = find_matching_tests_in_packages(
+            &packages,
+            Some("widgets"),
+            &target,
+            OffsetEncoding::Utf8,
+        );
+
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            locations[0].uri.as_path().unwrap(),
+            Path::new("/tmp/widgets_test.go")
+        );
+    }
 }
 
 pub fn signature_help(cx: &mut Context) {

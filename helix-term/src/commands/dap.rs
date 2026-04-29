@@ -17,7 +17,7 @@ use helix_view::{
 
 use serde_json::{to_value, Value};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::net::SocketAddr;
@@ -673,10 +673,17 @@ fn regex_escape(s: &str) -> String {
 /// The picker lists each top-level test once, followed by any statically
 /// detected subtests from that test (see [`find_go_tests_in_dir`]). The
 /// user can select the parent to run everything or pick a specific case.
+///
+/// If the template defines additional completion entries after the initial
+/// `go-test-function` slot, selection instead chains into
+/// `debug_parameter_prompt` with `[pkg_dir, test_regex]` as the initial
+/// params, so the remaining fields (e.g. godog tags) can be typed before
+/// launch.
 fn build_go_test_picker(
     config_name: String,
     pkg_dir: PathBuf,
     tests: Vec<GoTestEntry>,
+    completions: Vec<DebugConfigCompletion>,
 ) -> Picker<GoTestEntry, ()> {
     let columns = [
         ui::PickerColumn::new("test", |item: &GoTestEntry, _| item.name.as_str().into()),
@@ -691,10 +698,28 @@ fn build_go_test_picker(
         // a prefix (e.g. TestFoo vs TestFooBar) aren't picked up. For
         // subtests we additionally append `/^case_name$` (see
         // `go_test_run_regex`).
-        let params: Vec<std::borrow::Cow<str>> =
-            vec![pkg_dir_str.clone().into(), go_test_run_regex(entry).into()];
-        if let Err(err) = dap_start_impl(cx, Some(&config_name), None, Some(params)) {
-            cx.editor.set_error(err.to_string());
+        let pkg = pkg_dir_str.clone();
+        let test_regex = go_test_run_regex(entry);
+
+        if completions.len() > 1 {
+            let completions = completions.clone();
+            let config_name = config_name.clone();
+            let initial_params = vec![pkg, test_regex];
+            let callback = Box::pin(async move {
+                let call: Callback =
+                    Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                        let prompt =
+                            debug_parameter_prompt(completions, config_name, initial_params);
+                        compositor.push(Box::new(prompt));
+                    }));
+                Ok(call)
+            });
+            cx.jobs.callback(callback);
+        } else {
+            let params: Vec<std::borrow::Cow<str>> = vec![pkg.into(), test_regex.into()];
+            if let Err(err) = dap_start_impl(cx, Some(&config_name), None, Some(params)) {
+                cx.editor.set_error(err.to_string());
+            }
         }
     })
 }
@@ -741,6 +766,7 @@ pub fn dap_launch(cx: &mut Context) {
             });
             if first_completion_kind == Some("go-test-function") {
                 let name = template.name.clone();
+                let completions = template.completion.clone();
                 let callback = Box::pin(async move {
                     let call: Callback =
                         Callback::EditorCompositor(Box::new(move |editor, compositor| {
@@ -756,7 +782,7 @@ pub fn dap_launch(cx: &mut Context) {
                                 ));
                                 return;
                             }
-                            let picker = build_go_test_picker(name, pkg_dir, tests);
+                            let picker = build_go_test_picker(name, pkg_dir, tests, completions);
                             compositor.push(Box::new(overlaid(picker)));
                         }));
                     Ok(call)
@@ -2122,6 +2148,7 @@ pub fn dap_remove_watch(cx: &mut Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// Collect only (name, subtest) from parse results so assertions don't
     /// also have to track the file name.
