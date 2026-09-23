@@ -59,6 +59,13 @@
 | `:tree-sitter-scopes` | Display tree sitter scopes, primarily for theming and development. |
 | `:tree-sitter-highlight-name` | Display name of tree-sitter highlight scope under the cursor. |
 | `:tree-sitter-layers` | Display language names of tree-sitter injection layers under the cursor. |
+| `:go-test` | Select and run a saved Go test without debugging. |
+| `:go-test-package` | Run all tests in the current Go file's package, including external package tests. |
+| `:go-test-nearest` | Run the saved Go test or static subtest at the cursor without debugging. |
+| `:go-test-last` | Rerun the last started Go test selection in its original package. |
+| `:go-test-results` | Show retained output from the most recent Go test run. |
+| `:go-test-locations` | Pick a source location reported by the most recent Go test run. |
+| `:go-test-cancel` | Cancel the running Go test. |
 | `:debug-start`, `:dbg` | Start a debug session from a given template with given parameters. |
 | `:debug-remote`, `:dbg-tcp` | Connect to a debug adapter by TCP address and start a debugging session from a given template with given parameters. |
 | `:debug-eval` | Evaluate expression in current debug context. |

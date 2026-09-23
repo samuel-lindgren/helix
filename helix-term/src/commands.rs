@@ -599,6 +599,7 @@ impl MappableCommand {
         goto_prev_paragraph, "Goto previous paragraph",
         go_test_last, "Rerun the last started Go test selection",
         go_test_nearest, "Run the Go test at the cursor without debugging",
+        go_test_package, "Run all tests in the current Go package without debugging",
         go_test_picker, "Select and run a Go test without debugging",
         go_test_results, "Show retained Go test output",
         go_test_locations, "Jump to a source location in Go test output",

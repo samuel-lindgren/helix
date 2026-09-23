@@ -1198,10 +1198,10 @@ pub struct LastDebugLaunch {
 pub struct GoTestRun {
     pub directory: PathBuf,
     pub workspace: PathBuf,
-    /// Fully qualified name expected in Go's JSON test events.
+    /// Fully qualified test name, or a display label for a package run.
     pub name: String,
-    /// Exact anchored filter, including any selected subtest.
-    pub run_pattern: String,
+    /// Exact anchored filter, including any selected subtest. None runs the package.
+    pub run_pattern: Option<String>,
     pub selection_note: Option<String>,
 }
 
