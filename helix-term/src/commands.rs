@@ -1,10 +1,12 @@
 pub(crate) mod dap;
+pub(crate) mod go_test;
 pub(crate) mod lsp;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 
 pub use dap::*;
 use futures_util::FutureExt;
+pub use go_test::*;
 use helix_event::status;
 use helix_stdx::{
     path::{self, find_paths},
@@ -595,6 +597,10 @@ impl MappableCommand {
         goto_prev_entry, "Goto previous pairing",
         goto_next_paragraph, "Goto next paragraph",
         goto_prev_paragraph, "Goto previous paragraph",
+        go_test_picker, "Select and run a Go test without debugging",
+        go_test_results, "Show retained Go test output",
+        go_test_locations, "Jump to a source location in Go test output",
+        go_test_cancel, "Cancel the running Go test",
         dap_launch, "Launch debug target",
         dap_rerun_last, "Rerun last debug target",
         dap_restart, "Restart debugging session",

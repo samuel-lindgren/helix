@@ -3512,6 +3512,70 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "go-test",
+        aliases: &[],
+        doc: "Select and run a saved Go test without debugging.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                super::go_test::pick(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "go-test-results",
+        aliases: &[],
+        doc: "Show retained output from the most recent Go test run.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                super::go_test::show_results(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "go-test-locations",
+        aliases: &[],
+        doc: "Pick a source location reported by the most recent Go test run.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                super::go_test::show_locations(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "go-test-cancel",
+        aliases: &[],
+        doc: "Cancel the running Go test.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                super::go_test::cancel(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "debug-start",
         aliases: &["dbg"],
         doc: "Start a debug session from a given template with given parameters.",
