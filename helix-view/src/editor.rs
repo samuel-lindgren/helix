@@ -1193,6 +1193,18 @@ pub struct LastDebugLaunch {
     pub args: serde_json::Value,
 }
 
+/// A Go test selection admitted to the runner. Kept only for this editor session.
+#[derive(Debug, Clone)]
+pub struct GoTestRun {
+    pub directory: PathBuf,
+    pub workspace: PathBuf,
+    /// Fully qualified name expected in Go's JSON test events.
+    pub name: String,
+    /// Exact anchored filter, including any selected subtest.
+    pub run_pattern: String,
+    pub selection_note: Option<String>,
+}
+
 use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
@@ -1228,6 +1240,8 @@ pub struct Editor {
     pub go_test_doc_id: Option<DocumentId>,
     /// Present until the running test job has finished, including cancellation.
     pub go_test_cancel: Option<watch::Sender<bool>>,
+    /// Latest selection for which the Go process started, even if it failed.
+    pub go_test_last_run: Option<GoTestRun>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1392,6 +1406,7 @@ impl Editor {
             branch_diff_enabled: false,
             go_test_doc_id: None,
             go_test_cancel: None,
+            go_test_last_run: None,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             last_debug_launch: None,

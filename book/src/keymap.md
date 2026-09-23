@@ -330,12 +330,14 @@ Save modified files in the Go module/workspace first.
 | Key | Description | Command |
 | --- | --- | --- |
 | `t` | Select and run a Go test | `go_test_picker` |
+| `n` | Run the test at the cursor | `go_test_nearest` |
+| `l` | Rerun the last started test selection | `go_test_last` |
 | `r` | Show retained test output | `go_test_results` |
 | `f` | Pick a reported source location, with preview | `go_test_locations` |
 | `c` | Cancel the current run | `go_test_cancel` |
 
-The corresponding typed commands are `:go-test`, `:go-test-results`,
-`:go-test-locations`, and `:go-test-cancel`. The `[go-test]` buffer opens in a
+The corresponding typed commands are `:go-test`, `:go-test-nearest`, `:go-test-last`,
+`:go-test-results`, `:go-test-locations`, and `:go-test-cancel`. The `[go-test]` buffer opens in a
 split while the source keeps focus. It shows the selected test, package, command,
 result and test/build output after completion. Its contents remain available
 until the next run or until you close the buffer. The location picker supports
@@ -348,8 +350,33 @@ per stream and marked when truncated. Only one run is allowed at a time.
 Cancellation and editor exit stop the process group on Unix; other platforms
 stop the `go` process but may leave its children running.
 
-Discovery is intentionally limited to the existing debug picker's Go test and
-simple subtest patterns. Dynamic/nested names may require selecting the parent.
+The picker uses the existing debug picker's Go test and simple subtest patterns.
+Dynamic/nested names may require selecting the parent.
+
+From a saved `*_test.go` file, `Space t n` (or `:go-test-nearest`) runs the
+`Test` function containing the primary cursor. It requires the Go syntax grammar
+and does not search for a nearby test when the cursor is outside a test function.
+On a direct `t.Run("name", ...)` call or in its callback, it selects that subtest
+when sibling names are unique, simple literals. Raw string names and testing
+import/parameter aliases are supported. The function declaration runs the whole test.
+
+Table rows and shared loop bodies, dynamic/escaped names, duplicate names and
+receiver rebinding fall back to the whole test; the result buffer explains that
+all its subtests will run. Inside nested subtests, the outer statically identified
+subtest runs with all its children, with an explicit notice. Indirect calls and
+runtime-generated names are not resolved. Use the picker when you want to choose
+a different case explicitly.
+
+`Space t l` (or `:go-test-last`) reruns the last started selection from the
+picker or cursor command, with its original package and exact test filter.
+It works after moving the cursor, switching files/workspaces, or opening the
+result buffer. A parent selection still runs that parent and its children;
+a failed test can be rerun too. Save modified buffers in the original workspace
+first. Picker cancellation, blocked starts and process startup failures keep the
+previous selection. Closing the result buffer does not clear it. This history
+lasts only for the current editor session; without a previous run, the command
+reports that there is no selection to rerun.
+
 A test excluded by build tags or an unmatched subtest is reported as not run,
 and skipped tests are reported separately from passing tests.
 
