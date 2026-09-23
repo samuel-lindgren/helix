@@ -294,6 +294,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `b`     | Open buffer picker                                                      | `buffer_picker`                            |
 | `j`     | Open jumplist picker                                                    | `jumplist_picker`                          |
 | `g`     | Open changed file picker                                                | `changed_file_picker`                      |
+| `t`     | Enter [Go test mode](#go-test-mode)                                      | N/A                                        |
 | `G`     | Debug (experimental)                                                    | N/A                                        |
 | `k`     | Show documentation for item under cursor in a [popup](#popup) (**LSP**) | `hover`                                    |
 | `s`     | Open document symbol picker (**LSP** or **TS**)                         | `lsp_or_syntax_symbol_picker`              |
@@ -317,6 +318,40 @@ This layer is a kludge of mappings, mostly pickers.
 | `?`     | Open command palette                                                    | `command_palette`                          |
 
 > 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file.
+
+##### Go test mode
+
+From any saved Go file, press `Space t t` (or `:go-test`) and choose a test
+or a statically discovered subtest in the current package. Selecting a parent
+runs all of its subtests. This uses the same discovery as the Go debug picker,
+but runs `go test` asynchronously without a debugger. Go must be on `PATH`.
+Save modified files in the Go module/workspace first.
+
+| Key | Description | Command |
+| --- | --- | --- |
+| `t` | Select and run a Go test | `go_test_picker` |
+| `r` | Show retained test output | `go_test_results` |
+| `f` | Pick a reported source location, with preview | `go_test_locations` |
+| `c` | Cancel the current run | `go_test_cancel` |
+
+The corresponding typed commands are `:go-test`, `:go-test-results`,
+`:go-test-locations`, and `:go-test-cancel`. The `[go-test]` buffer opens in a
+split while the source keeps focus. It shows the selected test, package, command,
+result and test/build output after completion. Its contents remain available
+until the next run or until you close the buffer. The location picker supports
+normal picker split actions and `Space '` to reopen it. Reported line numbers
+refer to the tested files on disk; save and rerun after further edits.
+
+Runs bypass Go's test cache. Tests time out after two minutes; the whole command,
+including compilation, is limited to three minutes. Output is capped at 2 MiB
+per stream and marked when truncated. Only one run is allowed at a time.
+Cancellation and editor exit stop the process group on Unix; other platforms
+stop the `go` process but may leave its children running.
+
+Discovery is intentionally limited to the existing debug picker's Go test and
+simple subtest patterns. Dynamic/nested names may require selecting the parent.
+A test excluded by build tags or an unmatched subtest is reported as not run,
+and skipped tests are reported separately from passing tests.
 
 ##### Popup
 

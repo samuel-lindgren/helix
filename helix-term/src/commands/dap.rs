@@ -446,15 +446,15 @@ fn map_value(value: &Value, params: &[String]) -> Value {
 /// Delve runs every subtest under it) or a specific case within such a
 /// function (`subtest = Some("…")` — Delve runs only that one).
 #[derive(Clone)]
-struct GoTestEntry {
+pub(super) struct GoTestEntry {
     /// Bare function name, e.g. `TestDownloadArtifacts`.
-    name: String,
+    pub(super) name: String,
     /// The specific subtest case, in source form (spaces preserved for
     /// display). `None` means "the whole test function".
-    subtest: Option<String>,
+    pub(super) subtest: Option<String>,
     /// The `_test.go` file the function is declared in (basename only,
     /// for display in the picker).
-    file: String,
+    pub(super) file: String,
 }
 
 /// Scan `*_test.go` files in `dir` (non-recursive) for top-level
@@ -472,7 +472,7 @@ struct GoTestEntry {
 /// Dynamic names (`t.Run(tc.name, …)` without a matching `name:` field,
 /// `fmt.Sprintf(…)` etc.) are not enumerated; the parent entry still lets
 /// the user run all subtests under the function.
-fn find_go_tests_in_dir(dir: &Path) -> Vec<GoTestEntry> {
+pub(super) fn find_go_tests_in_dir(dir: &Path) -> Vec<GoTestEntry> {
     let mut tests = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return tests;
@@ -618,7 +618,7 @@ fn take_simple_go_string(s: &str) -> Option<String> {
 /// with the subtest name rewritten the way Go's test runner does it
 /// (ASCII whitespace → `_`) and then regex-escaped so punctuation inside
 /// the name matches literally.
-fn go_test_run_regex(entry: &GoTestEntry) -> String {
+pub(super) fn go_test_run_regex(entry: &GoTestEntry) -> String {
     let root = format!("^{}$", entry.name);
     match &entry.subtest {
         None => root,

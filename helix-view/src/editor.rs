@@ -1224,6 +1224,11 @@ pub struct Editor {
     /// working-tree diff. Toggled at runtime via `toggle_branch_diff`.
     pub branch_diff_enabled: bool,
 
+    /// Retained output of the most recent plain Go test run.
+    pub go_test_doc_id: Option<DocumentId>,
+    /// Present until the running test job has finished, including cancellation.
+    pub go_test_cancel: Option<watch::Sender<bool>>,
+
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
     pub last_debug_launch: Option<LastDebugLaunch>,
@@ -1385,6 +1390,8 @@ impl Editor {
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
             branch_diff_enabled: false,
+            go_test_doc_id: None,
+            go_test_cancel: None,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             last_debug_launch: None,
@@ -1947,6 +1954,8 @@ impl Editor {
                 let remove_empty_scratch = !doc.is_modified()
                     // If the buffer has no path and is not modified, it is an empty scratch buffer.
                     && doc.path().is_none()
+                    // Keep test output available after navigating back to source.
+                    && self.go_test_doc_id != Some(doc.id())
                     // If the buffer we are changing to is not this buffer
                     && id != doc.id
                     // Ensure the buffer is not displayed in any other splits.
