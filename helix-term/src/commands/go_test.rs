@@ -43,6 +43,27 @@ pub fn go_test_picker(cx: &mut Context) {
     });
 }
 
+pub fn go_test_package(cx: &mut Context) {
+    package(&mut compositor::Context {
+        editor: cx.editor,
+        jobs: cx.jobs,
+        scroll: None,
+    });
+}
+
+pub(super) fn package(cx: &mut compositor::Context) {
+    let Some(path) = doc!(cx.editor)
+        .path()
+        .filter(|p| p.extension().is_some_and(|e| e == "go"))
+    else {
+        cx.editor
+            .set_error("Open a saved Go file to run its package tests");
+        return;
+    };
+    let dir = path.parent().unwrap().to_owned();
+    start_run(cx, package_selection(&dir));
+}
+
 pub fn go_test_nearest(cx: &mut Context) {
     nearest(&mut compositor::Context {
         editor: cx.editor,
@@ -215,8 +236,18 @@ fn selection(dir: &Path, entry: &GoTestEntry, note: Option<String>) -> GoTestRun
         directory: dir.to_owned(),
         workspace: workspace_root(dir),
         name: test_name(entry),
-        run_pattern: go_test_run_regex(entry),
+        run_pattern: Some(go_test_run_regex(entry)),
         selection_note: note,
+    }
+}
+
+fn package_selection(dir: &Path) -> GoTestRun {
+    GoTestRun {
+        directory: dir.to_owned(),
+        workspace: workspace_root(dir),
+        name: "All tests in package".into(),
+        run_pattern: None,
+        selection_note: None,
     }
 }
 
@@ -242,13 +273,17 @@ fn start_run(cx: &mut compositor::Context, target: GoTestRun) {
         .as_ref()
         .map(|note| format!("Original selection: {note}\n"))
         .unwrap_or_default();
+    let filter = target
+        .run_pattern
+        .as_ref()
+        .map(|pattern| format!("-run {pattern:?} "))
+        .unwrap_or_default();
     let header = format!(
-        "Go test: {}\nPackage: {}\nCommand: go test -json -count=1 -timeout=2m -run {:?} .\n\
+        "Go test: {}\nPackage: {}\nCommand: go test -json -count=1 -timeout=2m {filter}.\n\
          Tests read saved files from disk. Save and rerun after edits.\n\
          Space t f: source locations | Space t r: results | Space t c: cancel\n{notice}\n",
         target.name,
         target.directory.display(),
-        target.run_pattern
     );
     replace_output(cx.editor, id, format!("{header}RUNNING\n"));
     cx.editor.focus(origin);
@@ -411,16 +446,12 @@ async fn run(
 ) -> RunResult {
     let dir = &target.directory;
     let mut command = Command::new(program);
+    command.args(["test", "-json", "-count=1", "-timeout=2m"]);
+    if let Some(pattern) = &target.run_pattern {
+        command.args(["-run", pattern]);
+    }
     command
-        .args([
-            "test",
-            "-json",
-            "-count=1",
-            "-timeout=2m",
-            "-run",
-            &target.run_pattern,
-            ".",
-        ])
+        .arg(".")
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -459,7 +490,8 @@ async fn run(
     if result.is_err() {
         let _ = child.kill().await;
     }
-    let parsed = parse_output(&out, &target.name, dir);
+    let selected = target.run_pattern.as_ref().map(|_| target.name.as_str());
+    let parsed = parse_output(&out, selected, dir);
     let mut output = parsed.output;
     if !err.is_empty() {
         output.push_str("\n--- stderr / build diagnostics ---\n");
@@ -473,6 +505,17 @@ async fn run(
         Ok((exit, _, _)) => {
             if !exit.success() {
                 format!("FAILED ({exit})")
+            } else if selected.is_none() {
+                if !parsed.ran {
+                    "NOT RUN: no package tests were observed (check build tags or truncated output)"
+                        .into()
+                } else if !parsed.package_passed {
+                    "INCOMPLETE: no passing result observed for the package".into()
+                } else if parsed.skipped && !parsed.passed {
+                    "SKIPPED: all observed package tests were skipped".into()
+                } else {
+                    "PASSED".into()
+                }
             } else if !parsed.ran {
                 "NOT RUN: selected test was not observed (check build tags, names, or truncated output)".into()
             } else if parsed.skipped {
@@ -508,17 +551,19 @@ struct ParsedOutput {
     ran: bool,
     skipped: bool,
     passed: bool,
+    package_passed: bool,
 }
 
-fn parse_output(bytes: &[u8], target: &str, dir: &Path) -> ParsedOutput {
+fn parse_output(bytes: &[u8], target: Option<&str>, dir: &Path) -> ParsedOutput {
     let mut parsed = ParsedOutput::default();
     for line in String::from_utf8_lossy(bytes).split_inclusive('\n') {
         if let Ok(event) = serde_json::from_str::<TestEvent>(line) {
-            if event.test == target {
+            if target.map_or(!event.test.is_empty(), |target| event.test == target) {
                 parsed.ran |= event.action == "run";
                 parsed.skipped |= event.action == "skip";
                 parsed.passed |= event.action == "pass";
             }
+            parsed.package_passed |= event.test.is_empty() && event.action == "pass";
             parsed
                 .output
                 .push_str(&resolve_locations(&event.output, dir));
@@ -670,16 +715,37 @@ mod tests {
 {"Action":"output","Test":"TestFoo/other","Output":"    sample_test.go:12: expected 42, got 0\n"}
 {"Action":"pass","Test":"TestFoo"}
 "#;
-        let missing = parse_output(data, "TestFoo/chosen", &dir);
+        let missing = parse_output(data, Some("TestFoo/chosen"), &dir);
         assert!(!missing.ran && !missing.passed);
-        let actual = parse_output(data, "TestFoo/other", &dir);
+        let actual = parse_output(data, Some("TestFoo/other"), &dir);
         assert!(actual.ran && actual.passed && !actual.skipped);
         assert!(actual.output.contains("expected 42, got 0"));
         assert!(actual
             .output
             .contains(&dir.join("sample_test.go").to_string_lossy().to_string()));
-        let skipped = parse_output(br#"{"Action":"skip","Test":"TestFoo"}"#, "TestFoo", &dir);
+        let skipped = parse_output(
+            br#"{"Action":"skip","Test":"TestFoo"}"#,
+            Some("TestFoo"),
+            &dir,
+        );
         assert!(skipped.skipped && !skipped.passed);
+    }
+
+    #[test]
+    fn package_json_distinguishes_test_results_from_package_completion() {
+        let dir = std::env::temp_dir();
+        let data = br#"{"Action":"run","Test":"TestInternal"}
+{"Action":"pass","Test":"TestInternal"}
+{"Action":"run","Test":"TestExternal"}
+{"Action":"skip","Test":"TestExternal"}
+"#;
+        let partial = parse_output(data, None, &dir);
+        assert!(partial.ran && partial.passed && partial.skipped);
+        assert!(!partial.package_passed);
+        let complete = [data.as_slice(), b"{\"Action\":\"pass\"}\n"].concat();
+        assert!(parse_output(&complete, None, &dir).package_passed);
+        let empty = parse_output(br#"{"Action":"skip"}"#, None, &dir);
+        assert!(!empty.ran && !empty.passed && !empty.skipped);
     }
 
     #[test]
@@ -790,6 +856,88 @@ func TestSlow(t *testing.T) {
             RUN_TIMEOUT,
         )
         .await
+    }
+
+    pub(super) fn package_fixture() -> tempfile::TempDir {
+        let fixture = tempfile::Builder::new()
+            .prefix("helix Go package ")
+            .tempdir()
+            .unwrap();
+        for dir in ["nested/child", "sibling"] {
+            std::fs::create_dir_all(fixture.path().join(dir)).unwrap();
+        }
+        for (file, contents) in [
+            ("go.mod", "module example.com/package-tests\n\ngo 1.20\n"),
+            ("nested/sample.go", "package sample\nfunc Value() int { return 42 }\n"),
+            ("nested/sample_test.go", r#"package sample
+import "testing"
+func TestInternal(t *testing.T) {
+    for _, name := range []string{"first", "second"} {
+        t.Run(name, func(t *testing.T) { t.Log("INTERNAL CASE", name) })
+    }
+}
+func TestSkipped(t *testing.T) { t.Skip("optional test") }
+"#),
+            ("nested/external_test.go", r#"package sample_test
+import ("testing"; "example.com/package-tests/nested")
+func TestExternal(t *testing.T) {
+    if sample.Value() != 42 { t.Fatal("wrong value") }
+    t.Log("EXTERNAL TEST")
+}
+"#),
+            ("nested/child/child_test.go", "package child\nimport \"testing\"\nfunc TestChild(t *testing.T) { t.Fatal(\"WRONG CHILD PACKAGE\") }\n"),
+            ("sibling/sibling_test.go", "package sibling\nimport \"testing\"\nfunc TestSibling(t *testing.T) { t.Fatal(\"WRONG SIBLING PACKAGE\") }\n"),
+        ] {
+            std::fs::write(fixture.path().join(file), contents).unwrap();
+        }
+        fixture
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Go on PATH; checks package failure, skip and empty results"]
+    async fn real_go_package_results() {
+        let fixture = package_fixture();
+        let dir = fixture.path().join("nested");
+        let target = package_selection(&dir);
+        for (external, internal, expected) in [
+            ("t.Fatal(\"EXTERNAL FAILURE\")", "t.Log(\"pass\")", "FAILED"),
+            ("t.Skip(\"skip\")", "t.Skip(\"skip\")", "SKIPPED"),
+        ] {
+            for (file, package, body) in [
+                ("external_test.go", "sample_test", external),
+                ("sample_test.go", "sample", internal),
+            ] {
+                std::fs::write(dir.join(file), format!("package {package}\nimport \"testing\"\nfunc TestResult(t *testing.T) {{ {body} }}\n")).unwrap();
+            }
+            let (_tx, rx) = watch::channel(false);
+            let result = run(Path::new("go"), &target, rx, RUN_TIMEOUT).await;
+            assert!(
+                result.status.starts_with(expected),
+                "{}\n{}",
+                result.status,
+                result.output
+            );
+            assert!(!result.success);
+            if expected == "FAILED" {
+                assert!(
+                    result.output.contains("EXTERNAL FAILURE"),
+                    "{}",
+                    result.output
+                );
+                assert!(result
+                    .output
+                    .lines()
+                    .filter_map(|l| source_location(l, &dir))
+                    .any(|l| l.path == dir.join("external_test.go")));
+            }
+        }
+        for file in ["sample_test.go", "external_test.go"] {
+            std::fs::remove_file(dir.join(file)).unwrap();
+        }
+        let (_tx, rx) = watch::channel(false);
+        let result = run(Path::new("go"), &target, rx, RUN_TIMEOUT).await;
+        assert!(result.status.starts_with("NOT RUN"), "{}", result.status);
+        assert!(!result.success);
     }
 
     #[tokio::test]
@@ -1061,6 +1209,73 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         .unwrap();
         let id = app.editor.go_test_doc_id.unwrap();
         app.editor.documents[&id].text().to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn package_command_rejects_unsaved_and_non_go_buffers() {
+        let fixture = tests::package_fixture();
+        let mut app = test_app(&fixture.path().join("go.mod"));
+        keys(&mut app, ":go-test-package<ret>").await;
+        assert!(app
+            .editor
+            .get_status()
+            .unwrap()
+            .0
+            .contains("Open a saved Go file"));
+        assert!(app.editor.go_test_doc_id.is_none());
+        app.editor
+            .open(&fixture.path().join("nested/sample.go"), Action::Replace)
+            .unwrap();
+        keys(&mut app, "i// unsaved<esc><space>tp").await;
+        assert!(app
+            .editor
+            .get_status()
+            .unwrap()
+            .0
+            .contains("Save modified files"));
+        assert!(app.editor.go_test_doc_id.is_none());
+        assert!(app.editor.go_test_last_run.is_none());
+        assert!(app.close().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Go; checks package commands, external tests, scope and reruns"]
+    async fn package_commands_include_external_tests_and_rerun_original_package() {
+        let fixture = tests::package_fixture();
+        let dir = fixture.path().join("nested");
+        let mut app = test_app(&dir.join("sample.go"));
+        for (file, command) in [
+            (dir.join("sample.go"), "<space>tp"),
+            (dir.join("sample_test.go"), ":go-test-package<ret>"),
+            (dir.join("external_test.go"), ":go-test-package<ret>"),
+            (fixture.path().join("sibling/sibling_test.go"), "<space>tl"),
+        ] {
+            app.editor.open(&file, Action::Replace).unwrap();
+            keys(&mut app, command).await;
+            let output = finished_output(&mut app).await;
+            assert!(
+                output.starts_with("Go test: All tests in package\n"),
+                "{output}"
+            );
+            assert!(
+                output.contains("Command: go test -json -count=1 -timeout=2m .\n"),
+                "{output}"
+            );
+            assert!(output.contains("\nPASSED\n"), "{output}");
+            for expected in [
+                "INTERNAL CASE first",
+                "INTERNAL CASE second",
+                "EXTERNAL TEST",
+            ] {
+                assert!(output.contains(expected), "{output}");
+            }
+            assert!(!output.contains("WRONG"), "{output}");
+            let target = app.editor.go_test_last_run.as_ref().unwrap();
+            assert_eq!(target.directory, dir);
+            assert!(target.run_pattern.is_none());
+            assert_eq!(doc!(app.editor).path(), Some(&file));
+        }
+        assert!(app.close().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

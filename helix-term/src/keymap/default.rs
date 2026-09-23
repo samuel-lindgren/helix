@@ -248,6 +248,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "t" => { "Tests (Go)"
                 "t" => go_test_picker,
                 "n" => go_test_nearest,
+                "p" => go_test_package,
                 "l" => go_test_last,
                 "r" => go_test_results,
                 "f" => go_test_locations,

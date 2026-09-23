@@ -331,12 +331,13 @@ Save modified files in the Go module/workspace first.
 | --- | --- | --- |
 | `t` | Select and run a Go test | `go_test_picker` |
 | `n` | Run the test at the cursor | `go_test_nearest` |
+| `p` | Run all tests in the current package | `go_test_package` |
 | `l` | Rerun the last started test selection | `go_test_last` |
 | `r` | Show retained test output | `go_test_results` |
 | `f` | Pick a reported source location, with preview | `go_test_locations` |
 | `c` | Cancel the current run | `go_test_cancel` |
 
-The corresponding typed commands are `:go-test`, `:go-test-nearest`, `:go-test-last`,
+The corresponding typed commands are `:go-test`, `:go-test-nearest`, `:go-test-package`, `:go-test-last`,
 `:go-test-results`, `:go-test-locations`, and `:go-test-cancel`. The `[go-test]` buffer opens in a
 split while the source keeps focus. It shows the selected test, package, command,
 result and test/build output after completion. Its contents remain available
@@ -353,6 +354,14 @@ stop the `go` process but may leave its children running.
 The picker uses the existing debug picker's Go test and simple subtest patterns.
 Dynamic/nested names may require selecting the parent.
 
+From any saved Go source or test file, `Space t p` (or `:go-test-package`)
+runs all tests in that file's directory, including tests declared in the external
+`<package>_test` package and dynamically generated subtests. It runs
+`go test -json -count=1 -timeout=2m .` in that directory without a test-name
+filter or static discovery. Sibling packages and subdirectories are excluded.
+Normal Go build constraints apply. A package with no runnable tests is reported
+as not run; if all observed tests skip, the result is reported as skipped.
+
 From a saved `*_test.go` file, `Space t n` (or `:go-test-nearest`) runs the
 `Test` function containing the primary cursor. It requires the Go syntax grammar
 and does not search for a nearby test when the cursor is outside a test function.
@@ -368,7 +377,7 @@ runtime-generated names are not resolved. Use the picker when you want to choose
 a different case explicitly.
 
 `Space t l` (or `:go-test-last`) reruns the last started selection from the
-picker or cursor command, with its original package and exact test filter.
+picker, cursor or package command, with its original package and test scope.
 It works after moving the cursor, switching files/workspaces, or opening the
 result buffer. A parent selection still runs that parent and its children;
 a failed test can be rerun too. Save modified buffers in the original workspace
