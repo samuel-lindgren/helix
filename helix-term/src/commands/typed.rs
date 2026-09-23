@@ -3528,6 +3528,22 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "go-test-nearest",
+        aliases: &[],
+        doc: "Run the saved Go test or static subtest at the cursor without debugging.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                super::go_test::nearest(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "go-test-results",
         aliases: &[],
         doc: "Show retained output from the most recent Go test run.",

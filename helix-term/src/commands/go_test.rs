@@ -27,6 +27,8 @@ use crate::{
     ui::{overlay::overlaid, Picker, PickerColumn},
 };
 
+mod cursor;
+
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024; // per stream; keep draining after the cap
 const RUN_TIMEOUT: Duration = Duration::from_secs(180); // includes compilation
 
@@ -36,6 +38,58 @@ pub fn go_test_picker(cx: &mut Context) {
         jobs: cx.jobs,
         scroll: None,
     });
+}
+
+pub fn go_test_nearest(cx: &mut Context) {
+    nearest(&mut compositor::Context {
+        editor: cx.editor,
+        jobs: cx.jobs,
+        scroll: None,
+    });
+}
+
+pub(super) fn nearest(cx: &mut compositor::Context) {
+    if cx.editor.go_test_cancel.is_some() {
+        cx.editor
+            .set_error("A Go test is already running (Space t c to cancel)");
+        return;
+    }
+    let target = (|| -> anyhow::Result<_> {
+        let (view, doc) = current_ref!(cx.editor);
+        let path = doc
+            .path()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_test.go"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("Open a saved Go test file (*_test.go)"))?;
+        let dir = path.parent().unwrap().to_owned();
+        check_saved(cx.editor, &dir)?;
+        anyhow::ensure!(
+            doc.language_name() == Some("go"),
+            "Set the document language to Go first"
+        );
+        let syntax = doc.syntax().ok_or_else(|| {
+            anyhow::anyhow!("Go syntax is unavailable; install the Go grammar or use Space t t")
+        })?;
+        let byte = doc.text().char_to_byte(
+            doc.selection(view.id)
+                .primary()
+                .cursor(doc.text().slice(..)),
+        );
+        let target = cursor::at_cursor(
+            syntax.tree().root_node(),
+            &doc.text().to_string(),
+            byte,
+            path.file_name().unwrap().to_str().unwrap(),
+        )?;
+        Ok((dir, target))
+    })();
+    match target {
+        Ok((dir, target)) => start(cx, dir, target.entry, target.note),
+        Err(err) => cx.editor.set_error(err.to_string()),
+    }
 }
 
 pub fn go_test_results(cx: &mut Context) {
@@ -118,7 +172,7 @@ pub(super) fn pick(cx: &mut compositor::Context) {
                     0,
                     tests,
                     (),
-                    move |cx, entry, _| start(cx, dir.clone(), entry.clone()),
+                    move |cx, entry, _| start(cx, dir.clone(), entry.clone(), None),
                 );
                 compositor.push(Box::new(overlaid(picker)));
             },
@@ -126,7 +180,7 @@ pub(super) fn pick(cx: &mut compositor::Context) {
     });
 }
 
-fn start(cx: &mut compositor::Context, dir: PathBuf, entry: GoTestEntry) {
+fn start(cx: &mut compositor::Context, dir: PathBuf, entry: GoTestEntry, note: Option<String>) {
     // Pickers can be reopened with last_picker; recheck at the point of launch.
     if cx.editor.go_test_cancel.is_some() {
         cx.editor
@@ -139,10 +193,13 @@ fn start(cx: &mut compositor::Context, dir: PathBuf, entry: GoTestEntry) {
     }
     let origin = view!(cx.editor).id;
     let id = result_buffer(cx.editor);
+    let notice = note
+        .map(|note| format!("Selection: {note}\n"))
+        .unwrap_or_default();
     let header = format!(
         "Go test: {}\nPackage: {}\nCommand: go test -json -count=1 -timeout=2m -run {:?} .\n\
          Tests read saved files from disk. Save and rerun after edits.\n\
-         Space t f: source locations | Space t r: results | Space t c: cancel\n\n",
+         Space t f: source locations | Space t r: results | Space t c: cancel\n{notice}\n",
         test_name(&entry),
         dir.display(),
         go_test_run_regex(&entry)
@@ -883,6 +940,101 @@ mod editor_tests {
         )
         .await
         .unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Go on PATH and the Go grammar; runs tests at the primary cursor"]
+    async fn cursor_command_runs_only_selected_test_and_checks_unsaved_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("sample_test.go");
+        std::fs::write(
+            fixture.path().join("go.mod"),
+            "module example.com/nearest\ngo 1.20\n",
+        )
+        .unwrap();
+        let source = r#"package sample
+import "testing"
+// Multibyte text before the cursor: åäö
+func TestPick(t *testing.T) {
+    t.Run("chosen [case]+", func(t *testing.T) { t.Log("SELECTED CASE") })
+    t.Run("other", func(t *testing.T) { t.Fatal("UNSELECTED CASE") })
+}
+func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
+"#;
+        std::fs::write(&path, source).unwrap();
+        let mut args = Args::default();
+        args.files
+            .insert(path.clone(), vec![helix_core::Position::new(0, 0)]);
+        let mut config = Config::default();
+        config.editor.lsp.enable = false;
+        let syntax = helix_core::syntax::Loader::new(
+            helix_loader::config::default_lang_config()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut app = Application::new(args, config, syntax).unwrap();
+        keys(&mut app, ":go-test-nearest<ret>").await;
+        assert!(app.editor.go_test_doc_id.is_none());
+        assert!(app
+            .editor
+            .get_status()
+            .unwrap()
+            .0
+            .contains("not inside a Go test"));
+
+        for (needle, command, expected_name, expected_status) in [
+            (
+                "t.Log(\"SELECTED CASE\")",
+                "<space>tn",
+                "TestPick/chosen [case]+",
+                "PASSED",
+            ),
+            (
+                "func TestPick(",
+                ":go-test-nearest<ret>",
+                "TestPick",
+                "FAILED",
+            ),
+        ] {
+            let (view, doc) = current!(app.editor);
+            let position = doc.text().byte_to_char(source.find(needle).unwrap());
+            doc.set_selection(view.id, Selection::point(position));
+            keys(&mut app, command).await;
+            let result_id = app.editor.go_test_doc_id.unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while app.editor.go_test_cancel.is_some() {
+                    keys(&mut app, "").await;
+                }
+            })
+            .await
+            .unwrap();
+            let output = app.editor.documents[&result_id].text().to_string();
+            // Displayed names normalize spaces just like Go's test events.
+            assert!(
+                output.starts_with(&format!("Go test: {}\n", expected_name.replace(' ', "_"))),
+                "{output}"
+            );
+            assert!(output.contains(expected_status), "{output}");
+            assert!(!output.contains("UNSELECTED TEST"), "{output}");
+            if expected_status == "PASSED" {
+                assert!(!output.contains("UNSELECTED CASE"), "{output}");
+            } else {
+                assert!(output.contains("UNSELECTED CASE"), "{output}");
+                assert!(output.contains("running all of TestPick"), "{output}");
+            }
+            assert_eq!(doc!(app.editor).path(), Some(&path));
+            assert!(app.editor.debug_adapters.get_active_client().is_none());
+        }
+        keys(&mut app, "i// unsaved<esc><space>tn").await;
+        assert!(app.editor.go_test_cancel.is_none());
+        assert!(app
+            .editor
+            .get_status()
+            .unwrap()
+            .0
+            .contains("Save modified files"));
+        assert!(app.close().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
