@@ -86,14 +86,50 @@ fn context_at(path: &Path) -> Option<Context> {
     })
 }
 
-fn current_context(editor: &Editor) -> Option<Context> {
-    let path = doc!(editor)
+/// Explain why `context_at` found no reviewable branch at `path`.
+fn missing_context(path: &Path) -> String {
+    let Some(root) = path.ancestors().find(|dir| dir.join(".git").exists()) else {
+        return format!(
+            "Reviews: {} is not inside a Git repository",
+            helix_stdx::path::fold_home_dir(path).display()
+        );
+    };
+    let git = root.join(".git");
+    let head = if git.is_dir() {
+        read_small(&git.join("HEAD"))
+    } else {
+        read_small(&git)
+            .and_then(|s| String::from_utf8(s).ok())
+            .and_then(|s| Some(root.join(s.trim().strip_prefix("gitdir: ")?).join("HEAD")))
+            .and_then(|head| read_small(&head))
+    }
+    .and_then(|s| String::from_utf8(s).ok());
+    match head.as_deref().map(str::trim) {
+        Some(head) if head.starts_with("ref: refs/heads/") => format!(
+            "Reviews: cannot read branch {} (no commits yet or unsupported ref storage)",
+            safe_text(head.trim_start_matches("ref: refs/heads/"))
+        ),
+        Some(head) if !head.starts_with("ref: ") => {
+            "Reviews: detached HEAD; check out the PR branch to show its discussions".into()
+        }
+        _ => format!(
+            "Reviews: no readable Git HEAD in {}",
+            helix_stdx::path::fold_home_dir(&git).display()
+        ),
+    }
+}
+
+fn current_path(editor: &Editor) -> PathBuf {
+    doc!(editor)
         .path()
         .and_then(|p| p.parent())
         .map(Path::to_owned)
         .or_else(|| editor.review.context.as_ref().map(|c| c.root.clone()))
-        .unwrap_or_else(helix_stdx::env::current_working_dir);
-    context_at(&path)
+        .unwrap_or_else(helix_stdx::env::current_working_dir)
+}
+
+fn current_context(editor: &Editor) -> Option<Context> {
+    context_at(&current_path(editor))
 }
 
 fn clear_documents(editor: &mut Editor) {
@@ -115,8 +151,7 @@ pub(crate) fn synchronize(editor: &mut Editor) {
         editor.review.status.clear();
     }
     let Some(context) = context else {
-        editor.review.status =
-            "Reviews: no Git branch (detached HEAD is not associated automatically)".into();
+        editor.review.status = missing_context(&current_path(editor));
         return;
     };
     if editor.review.review.is_none() && !editor.review.loading && editor.review.status.is_empty() {
@@ -186,19 +221,19 @@ fn attach_documents(editor: &mut Editor) {
         };
         // Resolve symlinks before comparing paths. Never bind an outside file via
         // a symlink, or a nested repository's buffer to the outer repository.
-        if context_at(path.parent().unwrap_or(&path))
+        // The buffer may be opened through a symlinked directory (for example a
+        // symlinked checkout); only its resolved location decides membership.
+        let Ok(real) = canonical(&path) else {
+            continue;
+        };
+        if context_at(real.parent().unwrap_or(&real))
             .as_ref()
             .map(|c| &c.root)
             != Some(&context.root)
         {
             continue;
         }
-        if !canonical(&path)
-            .is_ok_and(|canonical| canonical == path && canonical.starts_with(&context.root))
-        {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(&context.root) else {
+        let Ok(relative) = real.strip_prefix(&context.root) else {
             continue;
         };
         let Some(relative) = relative_key(relative).filter(|p| review.sources.contains_key(p))
@@ -225,7 +260,7 @@ fn attach_documents(editor: &mut Editor) {
             job::dispatch(move |editor, _| {
                 if !editor.review.accepts(generation, &context)
                     || current_context(editor).as_ref() != Some(&context)
-                    || !canonical(&path).is_ok_and(|p| p == path)
+                    || !canonical(&path).is_ok_and(|p| p == real)
                 {
                     return;
                 }
@@ -316,11 +351,17 @@ pub(crate) fn toggle(cx: &mut compositor::Context) {
     cx.editor.review.status.clear();
     clear_documents(cx.editor);
     synchronize(cx.editor);
-    cx.editor.set_status(if cx.editor.review.enabled {
-        "GitHub review comments enabled"
+    if !cx.editor.review.enabled {
+        cx.editor.set_status("GitHub review comments hidden");
+    } else if cx.editor.review.context.is_none() {
+        // Never hide why nothing will be shown behind a generic confirmation.
+        cx.editor.set_error(cx.editor.review.status.clone());
     } else {
-        "GitHub review comments hidden"
-    });
+        cx.editor.set_status(format!(
+            "GitHub review comments enabled · {}",
+            cx.editor.review.status
+        ));
+    }
 }
 pub(crate) fn refresh(cx: &mut compositor::Context, selection: Option<String>) {
     cx.editor.review.enabled = true;
@@ -335,7 +376,11 @@ pub(crate) fn refresh(cx: &mut compositor::Context, selection: Option<String>) {
     cx.editor.review.status.clear();
     clear_documents(cx.editor);
     synchronize(cx.editor);
-    cx.editor.set_status(cx.editor.review.status.clone());
+    if cx.editor.review.context.is_none() {
+        cx.editor.set_error(cx.editor.review.status.clone());
+    } else {
+        cx.editor.set_status(cx.editor.review.status.clone());
+    }
 }
 
 fn under_cursor(editor: &Editor) -> Option<usize> {
@@ -421,7 +466,7 @@ fn select(editor: &mut Editor, index: usize) {
         // Remote paths are never opened without canonical containment checks.
         if canonical(&path).is_ok_and(|p| p.starts_with(&context.root) && p == path)
             && path.is_file()
-            && editor.open(&path, Action::Replace).is_ok()
+            && open_document(editor, &path)
         {
             attach_documents(editor);
             let (view, doc) = current_ref!(editor);
@@ -444,6 +489,25 @@ fn select(editor: &mut Editor, index: usize) {
         }
     }
     open_thread(editor, index);
+}
+
+/// Open `path` (already canonical), reusing a buffer that was opened through a
+/// symlinked directory instead of creating a duplicate of the same file.
+fn open_document(editor: &mut Editor, path: &Path) -> bool {
+    let existing = editor
+        .documents()
+        .find(|doc| {
+            doc.path()
+                .is_some_and(|p| canonical(p).is_ok_and(|p| p == path))
+        })
+        .map(|doc| doc.id());
+    match existing {
+        Some(id) => {
+            editor.switch(id, Action::Replace);
+            true
+        }
+        None => editor.open(path, Action::Replace).is_ok(),
+    }
 }
 
 fn finish_selection(editor: &mut Editor, index: usize) {
@@ -602,6 +666,22 @@ mod tests {
         fs::write(git.join("HEAD"), "detached\n").unwrap();
         assert!(context_at(&root).is_none());
     }
+
+    #[test]
+    fn missing_context_is_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        // Stray ancestor .git directories (e.g. /tmp/.git) change the answer.
+        if !dir.path().ancestors().any(|d| d.join(".git").exists()) {
+            assert!(missing_context(dir.path()).contains("not inside a Git repository"));
+        }
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/unborn\n").unwrap();
+        assert!(context_at(&root).is_none());
+        assert!(missing_context(&root).contains("cannot read branch unborn"));
+        fs::write(root.join(".git/HEAD"), "0123abcd\n").unwrap();
+        assert!(missing_context(&root.join("sub")).contains("detached HEAD"));
+    }
 }
 
 #[cfg(all(test, feature = "integration"))]
@@ -623,6 +703,73 @@ mod editor_tests {
                     .unwrap();
             jobs.handle_callback(editor, &mut compositor, Ok(Some(callback)));
         }
+    }
+
+    fn fixture_editor() -> Editor {
+        let config = Arc::new(arc_swap::ArcSwap::from_pointee(Config::default()));
+        let handlers = crate::handlers::setup(config.clone());
+        Editor::new(
+            helix_view::graphics::Rect::new(0, 0, 120, 40),
+            Arc::new(helix_view::theme::Loader::new(&[])),
+            Arc::new(arc_swap::ArcSwap::from_pointee(syntax::Loader::default())),
+            Arc::new(arc_swap::access::Map::new(config, |c: &Config| &c.editor)),
+            handlers,
+        )
+    }
+
+    /// A checkout reached through a symlinked directory must still show its
+    /// discussions, and navigation must reuse that buffer instead of opening a
+    /// duplicate under the resolved path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkout_opened_through_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path()).unwrap().join("repo");
+        fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        fs::write(root.join(".git/refs/heads/topic"), "aaa\n").unwrap();
+        let source = "one\ntwo\nthree\nfour\nfive\n";
+        fs::write(root.join("a.txt"), source).unwrap();
+        let link = canonical(dir.path()).unwrap().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let mut editor_value = fixture_editor();
+        let mut jobs = job::Jobs::new();
+        let editor = &mut editor_value;
+        editor
+            .open(&link.join("a.txt"), Action::VerticalSplit)
+            .unwrap();
+        assert_eq!(doc!(editor).path(), Some(&link.join("a.txt")));
+        editor.review.enabled = true;
+        editor.review.context = current_context(editor);
+        assert_eq!(editor.review.context.as_ref().unwrap().root, root);
+        editor.review.status = "fixture".into();
+        editor.review.review = Some(Arc::new(Review {
+            label: "fixture#1".into(),
+            threads: vec![Arc::new(Thread {
+                id: "t".into(),
+                path: "a.txt".into(),
+                lines: Some(2..3),
+                location: "a.txt:2".into(),
+                resolved: false,
+                comments: vec![Comment {
+                    author: "reviewer".into(),
+                    body: "body".into(),
+                }],
+                diff: String::new(),
+                url: String::new(),
+            })],
+            sources: HashMap::from([("a.txt".into(), source.into())]),
+        }));
+        attach_documents(editor);
+        settle(editor, &mut jobs).await;
+        assert_eq!(doc!(editor).review.blocks.len(), 1);
+        let linked = doc!(editor).id();
+        let documents = editor.documents().count();
+        select(editor, 0);
+        settle(editor, &mut jobs).await;
+        assert_eq!(doc!(editor).id(), linked);
+        assert_eq!(editor.documents().count(), documents);
+        assert_eq!(under_cursor(editor), Some(0));
     }
 
     #[tokio::test(flavor = "multi_thread")]
