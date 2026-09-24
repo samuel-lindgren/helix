@@ -187,13 +187,19 @@ const DISCOVER: &str = r#"query($owner:String!,$repo:String!,$branch:String!,$af
 
 /// Push identity matters in triangular forks: a feature may fetch upstream/main
 /// while pushing origin/feature. Never substitute its fetch-upstream branch.
+///
+/// Returns the head repository and the branch names to try, in order. When Git
+/// cannot resolve `@{push}` (for example `push.default=simple` with a local name
+/// that differs from its upstream), the upstream branch name is tried after the
+/// local name, but only if the upstream lives in the head repository itself.
 fn head_target(
     repos: &HashMap<String, String>,
     branch: &str,
     tracking: Option<&str>,
+    merge: Option<&str>,
     push_remote: Option<&str>,
     push_ref: Option<&str>,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<(String, Vec<String>)> {
     if let Some(reference) = push_ref.and_then(|r| r.strip_prefix("refs/remotes/")) {
         let mut candidates: Vec<_> = repos
             .iter()
@@ -205,74 +211,54 @@ fn head_target(
             .collect();
         candidates.sort_by_key(|(remote, _, _)| std::cmp::Reverse(remote.len()));
         if let Some((_, repo, branch)) = candidates.first() {
-            return Ok(((*repo).clone(), (*branch).to_owned()));
+            return Ok(((*repo).clone(), vec![(*branch).to_owned()]));
         }
     }
-    let repo = if let Some(remote) = push_remote {
-        repos
-            .get(remote)
-            .ok_or_else(|| anyhow!("Configured push remote is not a supported GitHub repository"))?
+    let (remote, repo) = if let Some(remote) = push_remote {
+        let repo = repos.get(remote).ok_or_else(|| {
+            anyhow!("Configured push remote is not a supported GitHub repository")
+        })?;
+        (remote, repo)
     } else {
-        repos
-            .get("origin")
-            .or_else(|| tracking.and_then(|r| repos.get(r)))
-            .or_else(|| (repos.len() == 1).then(|| repos.values().next().unwrap()))
+        ["origin"]
+            .into_iter()
+            .chain(tracking)
+            .find_map(|remote| repos.get_key_value(remote))
+            .map(|(remote, repo)| (remote.as_str(), repo))
+            .or_else(|| {
+                (repos.len() == 1)
+                    .then(|| repos.iter().next().map(|(r, repo)| (r.as_str(), repo)))
+                    .flatten()
+            })
             .ok_or_else(|| {
                 anyhow!(
                     "Cannot identify GitHub head repository; use :review-select owner/repo#number"
                 )
             })?
     };
-    Ok((repo.clone(), branch.to_owned()))
-}
-
-async fn discover(transport: &Transport<'_>) -> anyhow::Result<Option<Pull>> {
-    let context = transport.context;
-    let remotes = git(context, &["remote"]).await?;
-    let mut repos = HashMap::new();
-    let mut bases = HashSet::new();
-    for remote in remotes.lines() {
-        // get-url applies Git's insteadOf/pushInsteadOf and pushurl configuration.
-        let fetch_urls = git(context, &["remote", "get-url", "--all", remote]).await?;
-        bases.extend(fetch_urls.lines().filter_map(repository));
-        let push_urls = git(context, &["remote", "get-url", "--push", "--all", remote]).await?;
-        let pushes: HashSet<_> = push_urls.lines().filter_map(repository).collect();
-        ensure!(pushes.len() <= 1, "Remote {remote} has multiple GitHub push destinations; use :review-select owner/repo#number");
-        if let Some(repo) = pushes.into_iter().next() {
-            bases.insert(repo.clone());
-            repos.insert(remote.to_owned(), repo);
+    let mut branches = vec![branch.to_owned()];
+    if tracking == Some(remote) {
+        if let Some(upstream) = merge
+            .and_then(|m| m.strip_prefix("refs/heads/"))
+            .filter(|b| !b.is_empty() && *b != branch)
+        {
+            branches.push(upstream.to_owned());
         }
     }
-    let remote_key = format!("branch.{}.remote", context.branch);
-    let tracking = git(context, &["config", "--get", &remote_key]).await.ok();
-    let push_key = format!("branch.{}.pushRemote", context.branch);
-    let push_remote = match git(context, &["config", "--get", &push_key]).await.ok() {
-        Some(remote) => Some(remote),
-        None => git(context, &["config", "--get", "remote.pushDefault"])
-            .await
-            .ok(),
-    };
-    let push_ref = git(context, &["rev-parse", "--symbolic-full-name", "@{push}"])
-        .await
-        .ok();
-    let (head_repo, branch) = head_target(
-        &repos,
-        &context.branch,
-        tracking.as_deref(),
-        push_remote.as_deref(),
-        push_ref.as_deref(),
-    )?;
-    let (owner, name) = names(&head_repo)?;
-    let parent = api(transport, "query($owner:String!,$repo:String!) { repository(owner:$owner,name:$repo) { parent { nameWithOwner } } }", json!({"owner":owner,"repo":name})).await?;
-    if let Some(parent) = parent["repository"]["parent"]["nameWithOwner"].as_str() {
-        bases.insert(parent.to_owned());
-    }
+    Ok((repo.clone(), branches))
+}
+
+async fn find_pulls(
+    transport: &Transport<'_>,
+    bases: &HashSet<String>,
+    head_repo: &str,
+    branch: &str,
+) -> anyhow::Result<Vec<Pull>> {
     // Own fork and its parent can both have a PR for the same branch. Never pick
     // the first match. Discovery must finish in every candidate base repository.
-    let head_repo = format!("{owner}/{name}");
     let mut pulls = Vec::new();
     for base in bases {
-        let (owner, repo) = names(&base)?;
+        let (owner, repo) = names(base)?;
         let mut after: Option<String> = None;
         for page in 0..MAX_PAGES {
             let data = api(
@@ -285,7 +271,7 @@ async fn discover(transport: &Transport<'_>) -> anyhow::Result<Option<Pull>> {
             for pr in nodes(connection)? {
                 if pr["headRepository"]["nameWithOwner"]
                     .as_str()
-                    .is_some_and(|r| r.eq_ignore_ascii_case(&head_repo))
+                    .is_some_and(|r| r.eq_ignore_ascii_case(head_repo))
                     && pr["headRefName"] == branch
                 {
                     pulls.push(Pull {
@@ -307,7 +293,60 @@ async fn discover(transport: &Transport<'_>) -> anyhow::Result<Option<Pull>> {
             );
         }
     }
-    unique_pull(pulls)
+    Ok(pulls)
+}
+
+async fn discover(transport: &Transport<'_>) -> anyhow::Result<Option<Pull>> {
+    let context = transport.context;
+    let remotes = git(context, &["remote"]).await?;
+    let mut repos = HashMap::new();
+    let mut bases = HashSet::new();
+    for remote in remotes.lines() {
+        // get-url applies Git's insteadOf/pushInsteadOf and pushurl configuration.
+        let fetch_urls = git(context, &["remote", "get-url", "--all", remote]).await?;
+        bases.extend(fetch_urls.lines().filter_map(repository));
+        let push_urls = git(context, &["remote", "get-url", "--push", "--all", remote]).await?;
+        let pushes: HashSet<_> = push_urls.lines().filter_map(repository).collect();
+        ensure!(pushes.len() <= 1, "Remote {remote} has multiple GitHub push destinations; use :review-select owner/repo#number");
+        if let Some(repo) = pushes.into_iter().next() {
+            bases.insert(repo.clone());
+            repos.insert(remote.to_owned(), repo);
+        }
+    }
+    ensure!(
+        !repos.is_empty(),
+        "No github.com remote found; use :review-select owner/repo#number"
+    );
+    let config = |key: String| async move { git(context, &["config", "--get", &key]).await.ok() };
+    let tracking = config(format!("branch.{}.remote", context.branch)).await;
+    let merge = config(format!("branch.{}.merge", context.branch)).await;
+    let push_remote = match config(format!("branch.{}.pushRemote", context.branch)).await {
+        Some(remote) => Some(remote),
+        None => config("remote.pushDefault".into()).await,
+    };
+    let push_ref = git(context, &["rev-parse", "--symbolic-full-name", "@{push}"])
+        .await
+        .ok();
+    let (head_repo, branches) = head_target(
+        &repos,
+        &context.branch,
+        tracking.as_deref(),
+        merge.as_deref(),
+        push_remote.as_deref(),
+        push_ref.as_deref(),
+    )?;
+    let (owner, name) = names(&head_repo)?;
+    let parent = api(transport, "query($owner:String!,$repo:String!) { repository(owner:$owner,name:$repo) { parent { nameWithOwner } } }", json!({"owner":owner,"repo":name})).await?;
+    if let Some(parent) = parent["repository"]["parent"]["nameWithOwner"].as_str() {
+        bases.insert(parent.to_owned());
+    }
+    for branch in &branches {
+        let pulls = find_pulls(transport, &bases, &head_repo, branch).await?;
+        if !pulls.is_empty() {
+            return unique_pull(pulls);
+        }
+    }
+    Ok(None)
 }
 
 fn unique_pull(mut pulls: Vec<Pull>) -> anyhow::Result<Option<Pull>> {
@@ -354,16 +393,19 @@ fn parse_thread(value: &Value, comments: Vec<Value>) -> anyhow::Result<Thread> {
     } else {
         "PR head"
     };
+    let span = |start: &Value, end: &Value| match (start.as_u64(), end.as_u64()) {
+        (Some(start), Some(end)) if start != end => format!("{start}–{end}"),
+        (_, Some(end)) => end.to_string(),
+        _ => "?".into(),
+    };
+    let current = span(&json!(start), &json!(line));
+    let original = span(&value["originalStartLine"], &value["originalLine"]);
+    let commit = first["originalCommit"]["oid"].as_str().unwrap_or("unknown");
     let location = format!(
-        "{}:{}–{} ({}, {}, original {}–{}, commit {})",
+        "{}:{current} ({status}, {}, original {original}, commit {})",
         safe_text(path),
-        start.map_or("?".into(), |n| n.to_string()),
-        line.map_or("?".into(), |n| n.to_string()),
-        status,
         safe_text(value["diffSide"].as_str().unwrap_or("?")),
-        value["originalStartLine"],
-        value["originalLine"],
-        safe_text(first["originalCommit"]["oid"].as_str().unwrap_or("unknown"))
+        safe_text(&commit[..commit.len().min(12)])
     );
     Ok(Thread {
         id: string(value, "id")?.to_owned(),
@@ -570,26 +612,104 @@ mod tests {
             ("origin".into(), "me/fork".into()),
             ("upstream".into(), "org/repo".into()),
         ]);
+        let target = |branch, tracking, merge, push_remote, push_ref| {
+            head_target(&repos, branch, tracking, merge, push_remote, push_ref)
+        };
+        let expect = |repo: &str, branches: &[&str]| {
+            (
+                repo.to_owned(),
+                branches.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
+            )
+        };
         assert_eq!(
-            head_target(&repos, "feature", Some("upstream"), Some("origin"), None).unwrap(),
-            ("me/fork".into(), "feature".into())
+            target(
+                "feature",
+                Some("upstream"),
+                Some("refs/heads/main"),
+                Some("origin"),
+                None
+            )
+            .unwrap(),
+            expect("me/fork", &["feature"])
         );
         assert_eq!(
-            head_target(&repos, "feature", Some("upstream"), None, None).unwrap(),
-            ("me/fork".into(), "feature".into())
+            target(
+                "feature",
+                Some("upstream"),
+                Some("refs/heads/main"),
+                None,
+                None
+            )
+            .unwrap(),
+            expect("me/fork", &["feature"])
         );
+        assert_eq!(
+            target(
+                "local-alias",
+                Some("origin"),
+                Some("refs/heads/topic"),
+                None,
+                Some("refs/remotes/origin/topic")
+            )
+            .unwrap(),
+            expect("me/fork", &["topic"])
+        );
+        assert!(target("feature", None, None, Some("unsupported"), None).is_err());
+    }
+
+    /// push.default=simple cannot resolve @{push} when the local name differs
+    /// from its upstream. The upstream name is a fallback within the same remote.
+    #[test]
+    fn renamed_local_branch_falls_back_to_upstream_name() {
+        let repos = HashMap::from([
+            ("origin".into(), "me/fork".into()),
+            ("upstream".into(), "org/repo".into()),
+        ]);
         assert_eq!(
             head_target(
                 &repos,
                 "local-alias",
                 Some("origin"),
+                Some("refs/heads/topic"),
                 None,
-                Some("refs/remotes/origin/topic")
+                None
             )
             .unwrap(),
-            ("me/fork".into(), "topic".into())
+            (
+                "me/fork".to_owned(),
+                vec!["local-alias".to_owned(), "topic".to_owned()]
+            )
         );
-        assert!(head_target(&repos, "feature", None, Some("unsupported"), None).is_err());
+        // Tracking another repository's branch never changes the head branch.
+        assert_eq!(
+            head_target(
+                &repos,
+                "feature",
+                Some("upstream"),
+                Some("refs/heads/main"),
+                None,
+                None
+            )
+            .unwrap()
+            .1,
+            vec!["feature".to_owned()]
+        );
+        let single = HashMap::from([("github".into(), "o/r".into())]);
+        assert_eq!(
+            head_target(
+                &single,
+                "mine",
+                Some("github"),
+                Some("refs/heads/SS-1-topic"),
+                None,
+                None
+            )
+            .unwrap(),
+            (
+                "o/r".to_owned(),
+                vec!["mine".to_owned(), "SS-1-topic".to_owned()]
+            )
+        );
     }
 
     #[test]
@@ -724,6 +844,39 @@ mod transport_tests {
                 _ => assert!(result.unwrap_err().to_string().contains("Ambiguous")),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn fake_discovery_finds_pr_for_renamed_local_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context {
+            root: dir.path().into(),
+            git_dir: dir.path().join(".git"),
+            branch: "local-alias".into(),
+            head: "abc123".into(),
+            config: vec![],
+        };
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=local-alias"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        // No refs exist, so @{push} cannot resolve, as with push.default=simple.
+        fs::write(dir.path().join(".git/config"), "[core]\nrepositoryformatversion = 0\n[remote \"origin\"]\nurl = git@github.com:org/repo.git\nfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"local-alias\"]\nremote = origin\nmerge = refs/heads/feature\n").unwrap();
+        let gh = dir.path().join("fake-gh");
+        let pull = json!({"number":7,"url":"https://github.com/org/repo/pull/7","headRefName":"feature","headRepository":{"nameWithOwner":"org/repo"}});
+        let response =
+            |items| output(json!({"repository":{"pullRequests":connection(items,None)}}));
+        let script = format!("#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n*'\"branch\":\"feature\"'*) {};;\n*pullRequests*) {};;\n*) {};;\nesac\n", response(vec![pull]), response(vec![]), output(json!({"repository":{"parent":null}})));
+        fs::write(&gh, script).unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+        let transport = Transport {
+            context: &context,
+            gh: gh.to_str().unwrap(),
+        };
+        let pull = discover(&transport).await.unwrap().unwrap();
+        assert_eq!((pull.repo.as_str(), pull.number), ("org/repo", 7));
     }
 
     #[tokio::test]

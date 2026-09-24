@@ -70,7 +70,9 @@ Old-side/deleted-code, outdated, and file-level discussions remain accessible
 through navigation and `:review-list`; they open with their original location,
 commit, diff side, diff hunk and conversation. They are not placed on current code.
 Navigation opens a matching file only if its path is safely inside the repository;
-paths through symlinks are deliberately not followed.
+symlinks inside the repository are deliberately not followed. A checkout opened
+through a symlinked directory is matched by its resolved location, and navigation
+reuses that buffer.
 
 The focused file selects the repository. All matching open buffers show that
 repository's discussions. Local branch, HEAD and repository changes clear the
@@ -82,10 +84,14 @@ An explicit PR selection lasts until the context changes or display is toggled.
 
 Discovery uses the configured push destination where available, searches the
 configured GitHub remotes and the head repository's parent, and verifies the
-PR's head repository and branch. Multiple matches produce an explicit ambiguity
+PR's head repository and branch. If Git cannot resolve the push branch (for
+example `push.default=simple` with a local branch named differently from its
+upstream), the upstream branch name on the same remote is tried after the local
+name. Multiple matches produce an explicit ambiguity
 message; use `:review-select` to choose. That command is an intentional explicit
 override and can inspect another PR in the current working tree. No PR, detached
-HEAD, unavailable credentials, and API failures produce a status/error message;
+HEAD, a buffer outside any Git repository, unavailable credentials, and API
+failures produce a status/error message (also when enabling with `:review-toggle`);
 retry with `:review-refresh` after correcting the condition.
 
 The initial transport supports `github.com`, ordinary Git repositories and Git
