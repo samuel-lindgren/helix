@@ -3512,6 +3512,134 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "review-toggle",
+        aliases: &[],
+        doc: "Show or hide GitHub review comments globally.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::toggle(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-refresh",
+        aliases: &[],
+        doc: "Refresh reviews for the current branch.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::refresh(cx, None);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-next",
+        aliases: &[],
+        doc: "Go to the next review discussion.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::navigate(cx, false);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-prev",
+        aliases: &[],
+        doc: "Go to the previous review discussion.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::navigate(cx, true);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-expand",
+        aliases: &[],
+        doc: "Expand or collapse the selected inline discussion.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::expand(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-open",
+        aliases: &[],
+        doc: "Read the full discussion and original diff context.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::open(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-list",
+        aliases: &[],
+        doc: "List the current PR review discussions.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::list(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-select",
+        aliases: &[],
+        doc: "Select an ambiguous PR using owner/repo#number.",
+        fun: |cx, args, event| {
+            if event == PromptEvent::Validate {
+                crate::review::refresh(cx, Some(args[0].to_owned()));
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "go-test",
         aliases: &[],
         doc: "Select and run a saved Go test without debugging.",

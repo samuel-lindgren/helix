@@ -196,6 +196,13 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
+        if !doc.review.blocks.is_empty() {
+            decorations.add_decoration(text_decorations::review::Reviews::new(
+                &doc.review.blocks,
+                width,
+                theme,
+            ));
+        }
         render_document(
             surface,
             inner,

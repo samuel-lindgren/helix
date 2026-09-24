@@ -271,6 +271,7 @@ impl Application {
     }
 
     async fn render(&mut self) {
+        crate::review::synchronize(&mut self.editor);
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
             self.compositor.full_redraw = false;
@@ -320,6 +321,8 @@ impl Application {
     where
         S: Stream<Item = std::io::Result<TerminalEvent>> + Unpin,
     {
+        let mut review_context_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        review_context_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if self.editor.should_close() {
                 return false;
@@ -337,6 +340,11 @@ impl Application {
                 }
                 Some(event) = input_stream.next() => {
                     self.handle_terminal_events(event).await;
+                }
+                _ = review_context_tick.tick(), if self.editor.review.enabled => {
+                    let generation = self.editor.review.generation;
+                    crate::review::synchronize(&mut self.editor);
+                    if generation != self.editor.review.generation { self.render().await; }
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
                     self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));

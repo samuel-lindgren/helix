@@ -9,6 +9,7 @@ use crate::ui::document::{LinePos, TextRenderer};
 pub use diagnostics::InlineDiagnostics;
 
 mod diagnostics;
+pub mod review;
 
 /// Decorations are the primary mechanism for extending the text rendering.
 ///
@@ -22,6 +23,13 @@ mod diagnostics;
 /// To reserve space for virtual text lines (which is then filled by this trait) emit appropriate
 /// [`LineAnnotation`](helix_core::text_annotations::LineAnnotation)s in [`helix_view::View::text_annotations`]
 pub trait Decoration {
+    /// Whether document anchors should also fire on inline virtual text at the
+    /// same position. Line-annotation-backed decorations should return false,
+    /// matching DocumentFormatter's real-document anchor processing.
+    fn decorate_virtual_text(&self) -> bool {
+        true
+    }
+
     /// Called **before** a **visual** line is rendered. A visual line does not
     /// necessarily correspond to a single line in a document as soft wrapping can
     /// spread a single document line across multiple visual lines.
@@ -109,6 +117,9 @@ impl<'a> DecorationManager<'a> {
 
     pub fn decorate_grapheme(&mut self, renderer: &mut TextRenderer, grapheme: &FormattedGrapheme) {
         for (decoration, hook_char_idx) in &mut self.decorations {
+            if grapheme.is_virtual() && !decoration.decorate_virtual_text() {
+                continue;
+            }
             loop {
                 match (*hook_char_idx).cmp(&grapheme.char_idx) {
                     // this grapheme has been concealed or we are at the first grapheme

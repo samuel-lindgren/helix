@@ -6,6 +6,7 @@
   - [Package Managers](./package-managers.md)
   - [Building from source](./building-from-source.md)
 - [Usage](./usage.md)
+  - [GitHub review comments](./github-reviews.md)
   - [Registers](./registers.md)
   - [Surround](./surround.md)
   - [Textobjects](./textobjects.md)
