@@ -156,6 +156,7 @@ The following statusline elements can be configured:
 | `spacer` | Inserts a space between elements (multiple/contiguous spacers may be specified) |
 | `version-control` | The current branch name or detached commit hash of the opened workspace |
 | `register` | The current selected register |
+| `review` | GitHub review state while `:review-toggle` is enabled, e.g. `helix#5 2/3 open` (see [GitHub reviews](./github-reviews.md)) |
 
 ### `[editor.lsp]` Section
 

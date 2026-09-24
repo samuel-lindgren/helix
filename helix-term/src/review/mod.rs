@@ -4,7 +4,11 @@ mod github;
 
 use crate::{
     compositor, job,
-    ui::{overlay::overlaid, Picker, PickerColumn},
+    ui::{
+        overlay::overlaid,
+        picker::{FileLocation, PathOrId},
+        Picker, PickerColumn,
+    },
 };
 use helix_core::{Rope, Selection, Transaction};
 use helix_view::{
@@ -152,6 +156,7 @@ pub(crate) fn synchronize(editor: &mut Editor) {
     }
     let Some(context) = context else {
         editor.review.status = missing_context(&current_path(editor));
+        editor.review.failed = true;
         return;
     };
     if editor.review.review.is_none() && !editor.review.loading && editor.review.status.is_empty() {
@@ -172,19 +177,19 @@ pub(crate) fn synchronize(editor: &mut Editor) {
                 editor.review.task = None;
                 match result {
                     Ok(Some(review)) => {
-                        editor.review.status = format!(
-                            "{}: {} review discussion(s)",
-                            review.label,
-                            review.threads.len()
-                        );
+                        editor.review.status = review.summary();
                         editor.review.review = Some(Arc::new(review));
                         editor.set_status(editor.review.status.clone());
                     }
                     Ok(None) => {
-                        editor.review.status = "No open pull request for this branch".into();
+                        editor.review.status = format!(
+                            "Reviews: no open pull request for branch {}; use :review-select owner/repo#number",
+                            safe_text(&context.branch)
+                        );
                         editor.set_status(editor.review.status.clone());
                     }
                     Err(err) => {
+                        editor.review.failed = true;
                         editor.review.status = safe_text(&format!("Reviews: {err}"));
                         editor.set_error(editor.review.status.clone());
                     }
@@ -600,29 +605,112 @@ pub(crate) fn open(cx: &mut compositor::Context) {
     }
 }
 
+struct ListEntry {
+    index: usize,
+    thread: Arc<review::Thread>,
+    /// Local file for previews, only when safely inside the repository.
+    path: Option<PathBuf>,
+}
+
+fn list_entries(review: &review::Review, root: Option<&Path>) -> Vec<ListEntry> {
+    review
+        .threads
+        .iter()
+        .enumerate()
+        .map(|(index, thread)| ListEntry {
+            index,
+            thread: thread.clone(),
+            path: root
+                .filter(|_| github::valid_path(&thread.path))
+                .map(|root| root.join(&thread.path))
+                .filter(|path| canonical(path).is_ok_and(|p| &p == path) && path.is_file()),
+        })
+        .collect()
+}
+
+/// Preview the mapped range in an open buffer when available, otherwise the
+/// PR-head line numbers in the file on disk.
+fn list_preview<'a>(editor: &'a Editor, entry: &'a ListEntry) -> Option<FileLocation<'a>> {
+    for doc in editor.documents() {
+        if let Some(block) = doc
+            .review
+            .blocks
+            .iter()
+            .find(|b| b.thread.id == entry.thread.id)
+        {
+            let text = doc.text();
+            let start = text.char_to_line(block.range.start);
+            let end = text.char_to_line(block.range.end.saturating_sub(1).max(block.range.start));
+            return Some((PathOrId::Id(doc.id()), Some((start, end))));
+        }
+    }
+    let lines = entry.thread.lines.as_ref()?;
+    Some((
+        entry.path.as_deref()?.into(),
+        Some((lines.start - 1, lines.end - 2)),
+    ))
+}
+
+/// First non-empty line of the opening comment, bounded so the location column
+/// (whose end, `file:line`, matters most) keeps its room in the picker.
+fn first_line(thread: &review::Thread) -> String {
+    const WIDTH: usize = 40;
+    let line = thread
+        .comments
+        .first()
+        .and_then(|c| c.body.lines().find(|l| !l.trim().is_empty()))
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() <= WIDTH {
+        return line.to_owned();
+    }
+    let mut short: String = line.chars().take(WIDTH - 1).collect();
+    short.push('…');
+    short
+}
+
+fn list_location(thread: &review::Thread) -> String {
+    match &thread.lines {
+        Some(lines) if lines.end - lines.start > 1 => {
+            format!("{}:{}-{}", thread.path, lines.start, lines.end - 1)
+        }
+        Some(lines) => format!("{}:{}", thread.path, lines.start),
+        // parse_thread records why a discussion is not placed on current code.
+        None if thread.location.contains("(outdated") => format!("{} (outdated)", thread.path),
+        None => format!("{} (no line)", thread.path),
+    }
+}
+
 pub(crate) fn list(cx: &mut compositor::Context) {
     synchronize(cx.editor);
     let Some(review) = cx.editor.review.review.clone() else {
         cx.editor.set_status(cx.editor.review.status.clone());
         return;
     };
+    if review.threads.is_empty() {
+        cx.editor.set_status(review.summary());
+        return;
+    }
     let generation = cx.editor.review.generation;
     let context = cx.editor.review.context.clone();
-    let entries: Vec<_> = review.threads.iter().cloned().enumerate().collect();
+    let entries = list_entries(&review, context.as_ref().map(|c| c.root.as_path()));
+    let selected = cx.editor.review.selected.unwrap_or(0);
     cx.jobs.callback(async move {
         Ok(job::Callback::EditorCompositor(Box::new(
             move |_, compositor| {
                 let picker = Picker::new(
                     [
-                        PickerColumn::new("location", |entry: &(usize, Arc<review::Thread>), _| {
-                            entry.1.location.clone().into()
+                        PickerColumn::new("comment", |entry: &ListEntry, _| {
+                            first_line(&entry.thread).into()
                         }),
-                        PickerColumn::new(
-                            "discussion",
-                            |entry: &(usize, Arc<review::Thread>), _| entry.1.title().into(),
-                        ),
+                        PickerColumn::new("location", |entry: &ListEntry, _| {
+                            list_location(&entry.thread).into()
+                        }),
+                        PickerColumn::new("discussion", |entry: &ListEntry, _| {
+                            entry.thread.title().into()
+                        }),
                     ],
-                    0,
+                    1,
                     entries,
                     (),
                     move |cx, entry, _| {
@@ -631,13 +719,15 @@ pub(crate) fn list(cx: &mut compositor::Context) {
                             .is_some_and(|c| cx.editor.review.accepts(generation, c))
                             && current_context(cx.editor) == context
                         {
-                            select(cx.editor, entry.0);
+                            select(cx.editor, entry.index);
                         } else {
                             cx.editor
                                 .set_error("Review context changed; reopen :review-list");
                         }
                     },
-                );
+                )
+                .with_initial_cursor(selected as u32)
+                .with_preview(list_preview);
                 compositor.push(Box::new(overlaid(picker)));
             },
         )))
@@ -665,6 +755,60 @@ mod tests {
         assert_ne!(second, context_at(&root));
         fs::write(git.join("HEAD"), "detached\n").unwrap();
         assert!(context_at(&root).is_none());
+    }
+
+    #[test]
+    fn list_rows_and_previews_stay_inside_the_repository() {
+        use helix_view::review::{Comment, Review, Thread};
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path()).unwrap();
+        fs::write(root.join("a.rs"), "x\n").unwrap();
+        let thread = |path: &str, lines| {
+            Arc::new(Thread {
+                id: path.into(),
+                path: path.into(),
+                lines,
+                location: String::new(),
+                resolved: false,
+                comments: vec![Comment {
+                    author: "a".into(),
+                    body: "\n  first line\nsecond".into(),
+                }],
+                diff: String::new(),
+                url: String::new(),
+            })
+        };
+        let review = Review {
+            label: "o/r#1 @ abc".into(),
+            threads: vec![
+                thread("a.rs", Some(1..2)),
+                thread("../a.rs", Some(1..2)),
+                thread("missing.rs", Some(2..5)),
+                thread("a.rs", None),
+            ],
+            sources: Default::default(),
+        };
+        let entries = list_entries(&review, Some(&root));
+        assert_eq!(entries[0].path, Some(root.join("a.rs")));
+        assert!(entries[1].path.is_none());
+        assert!(entries[2].path.is_none());
+        assert_eq!(list_location(&review.threads[0]), "a.rs:1");
+        assert_eq!(list_location(&review.threads[2]), "missing.rs:2-4");
+        assert_eq!(list_location(&review.threads[3]), "a.rs (no line)");
+        let outdated = Thread {
+            location: "a.rs:? (outdated, RIGHT, original 3, commit abc)".into(),
+            ..(*review.threads[3]).clone()
+        };
+        assert_eq!(list_location(&outdated), "a.rs (outdated)");
+        assert_eq!(first_line(&review.threads[0]), "first line");
+        let long = Thread {
+            comments: vec![Comment {
+                author: "a".into(),
+                body: "x".repeat(100),
+            }],
+            ..(*review.threads[0]).clone()
+        };
+        assert_eq!(first_line(&long), format!("{}…", "x".repeat(39)));
     }
 
     #[test]
@@ -770,6 +914,19 @@ mod editor_tests {
         assert_eq!(doc!(editor).id(), linked);
         assert_eq!(editor.documents().count(), documents);
         assert_eq!(under_cursor(editor), Some(0));
+        // :review-list previews the mapped range of the open buffer.
+        let review = editor.review.review.clone().unwrap();
+        let entries = list_entries(&review, Some(&root));
+        assert_eq!(
+            entries[0].path.as_deref(),
+            Some(root.join("a.txt").as_path())
+        );
+        match list_preview(editor, &entries[0]) {
+            Some((PathOrId::Id(id), Some(lines))) => {
+                assert_eq!((id, lines), (linked, (1, 1)));
+            }
+            _ => panic!("expected a document preview"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
