@@ -1,10 +1,11 @@
 # GitHub review comments
 
 This fork can show the current branch's GitHub review discussions as virtual
-blocks below the reviewed code. It uses the installed `gh` CLI and its existing
-authentication. Run `gh auth status` outside Helix if authentication needs checking.
-The feature only reads GitHub; replies, resolution changes and review submission
-are not implemented.
+blocks below the reviewed code, reply to them, and resolve them. It uses the
+installed `gh` CLI and its existing authentication. Run `gh auth status` outside
+Helix if authentication needs checking; replying and resolving need write access
+to the repository (a token with the `repo` scope). Starting new discussions and
+submitting reviews are not implemented.
 
 Open a file on your PR branch and run `:review-toggle`. Helix discovers the open
 PR automatically, including PRs from a fork into its parent. There is no initial
@@ -20,6 +21,12 @@ disabled in each editor session.
 | `:review-open` | Open the complete discussion and original diff in a discussion buffer. |
 | `:review-list` | Pick a discussion (first line, location, author/status/comment count) with a code preview; typing filters by location; `Enter` jumps to it. Includes outdated and file-level discussions. |
 | `:review-select owner/repo#123` | Explicitly select a PR when automatic association is ambiguous. |
+| `:review-reply [text]` | Reply to the discussion at the cursor or selected by navigation. With text, post it at once; without, open a reply draft. |
+| `:review-send` | Post the reply draft in the current buffer. `:write` (`:w`) in a draft does the same. |
+| `:review-fixed [rev]` | Open a reply draft prefilled with `Fixed in <commit>.` (default: the suggested commit, see below). |
+| `:review-insert-commit` | Pick a recent branch commit and insert its full id at the cursors. Works in any buffer. |
+| `:review-yank-commit` | Put the suggested commit id into register `h` and the system clipboard. |
+| `:review-resolve`, `:review-unresolve` | Resolve or reopen the discussion. |
 
 After loading, the status message summarizes the PR, e.g.
 `owner/repo#12: 3 discussion(s), 2 open · 2 inline, 1 outdated/file-level`.
@@ -62,11 +69,83 @@ p = ":review-prev"
 e = ":review-expand"
 o = ":review-open"
 l = ":review-list"
+a = ":review-reply"
+f = ":review-fixed"
+c = ":review-insert-commit"
+y = ":review-yank-commit"
+s = ":review-resolve"
+u = ":review-unresolve"
 ```
 
 With this configuration, press `Space R t` to toggle, `Space R n` to navigate,
-and `Space R e` to expand. Closing the discussion buffer with `:buffer-close`
+`Space R e` to expand and `Space R a` to answer. Closing the discussion buffer with `:buffer-close`
 returns to another buffer; `:buffer-previous` also returns to the previous file.
+
+## Replying with the commit that fixed it
+
+The usual loop is: navigate to a discussion, change the code, commit, push, and
+answer with the commit. For example:
+
+```text
+:review-next                 select the discussion
+(edit, commit, git push)
+:review-reply                open a reply draft for it
+iFixed in <C-r>h, thanks!    type; Ctrl-r h inserts the suggested commit id
+:w                           post the reply; the draft closes
+:review-resolve              optionally resolve the discussion
+```
+
+`:review-reply` opens a Markdown scratch buffer named
+`[review-reply] @reviewer on path:line`. Write the reply at the top. Everything
+from the separator line down (`<!-- review: everything from this line down is
+context and is not sent -->`) is context and is never sent: which discussion the
+draft answers, the suggested commit and the quoted conversation. `:w` or
+`:review-send` posts the text above the separator; `:review-send --resolve`
+also resolves the discussion. A draft is bound to its discussion when it opens,
+so moving the cursor, switching branches or refreshing does not re-target it.
+Closing a draft with typed text is refused like any unsaved buffer; `:bc!`
+discards it. Running `:review-reply` again for the same discussion returns to
+the open draft. After posting, only that discussion is reloaded (or the whole
+review if the PR head moved), so the inline block, `:review-open` and the
+`review` statusline counts show the new reply and state.
+
+The **suggested commit** is the newest commit on the current branch that changed
+the discussed lines since the commit the discussion was written against. Helix
+follows those lines through intermediate edits (line shifts, replacements, and
+insertions directly next to them), so this works for discussions GitHub already
+shows as outdated. If no commit touched the lines, the newest commit touching the
+file is suggested, otherwise `HEAD`. When a draft opens, the suggestion's full id
+is stored in register `h`: paste it with `"hp`, or `Ctrl-r h` in insert mode.
+The status line and the draft's context show its short id and subject.
+
+`:review-insert-commit` opens a picker of the branch's recent commits (up to 50,
+excluding the PR base branch): subject, short id, date, whether the commit is
+already part of the PR head on GitHub (`pushed`/`local`), and whether it
+touched the discussed `lines` or `file` (those are listed first). `Enter`
+inserts the full commit id at every cursor. `:review-yank-commit` copies the
+suggestion for use elsewhere. `:review-fixed [rev]` opens a draft already
+containing `Fixed in <commit>.`; pass any revision (`HEAD~1`, a short id, a
+branch) to choose another commit.
+
+GitHub links commit ids in PR comments (full and abbreviated ids render as a
+short linked id). A commit that is not on GitHub yet cannot be linked, so before
+posting, Helix checks every word in the reply that is a local commit id (7-40 hex
+digits) against the PR head fetched fresh from GitHub. If one is not contained
+in it, posting stops with e.g. `1b5bbb8d77 not on me/helix:topic (PR head
+2dab7b8e61) yet; push first, or send anyway with :w! / --force`. `:w!`,
+`:review-send --force` or `:review-reply --force …` sends anyway. Hex words that
+are not local commits are ignored.
+
+`:review-reply text` posts a one-line reply immediately, for example
+`:review-reply --resolve Fixed in %sh{git rev-parse HEAD}`. The text after the
+first word is taken literally, apart from `%` expansions; flags (`--resolve`,
+`--force`) go before the text. Replies are posted with GitHub's
+`addPullRequestReviewThreadReply`; resolution uses `resolveReviewThread` and
+`unresolveReviewThread`. Helix checks GitHub's `viewerCanReply` and
+`viewerCanResolve` first, and access failures are reported with a hint to check
+write access and `gh auth status`. The reply text is sent as a JSON variable on
+the `gh` process's standard input; it is never part of the query, a shell
+command or a command option.
 
 ## Locations and refresh
 
@@ -92,8 +171,8 @@ The focused file selects the repository. All matching open buffers show that
 repository's discussions. Local branch, HEAD and repository changes clear the
 previous inline context and start discovery again. Helix checks the local context
 before rendering, before accepting results, and once per second while enabled.
-Remote comments are cached until `:review-refresh` or a context change; there is
-no periodic GitHub polling. Delayed results for an earlier context are discarded.
+Remote comments are cached until `:review-refresh`, a context change, or a reply
+or resolution from Helix; there is no periodic GitHub polling. Delayed results for an earlier context are discarded.
 An explicit PR selection lasts until the context changes or display is toggled.
 
 Discovery uses the configured push destination where available, searches the
@@ -113,7 +192,9 @@ worktrees. Source mapping is limited to 2 MiB per file. Fetches have per-process
 30-second timeouts, bounded pagination, a 16 MiB aggregate content budget and a
 2,000-thread limit. Exceeding a limit is reported instead of silently truncating
 the review. GitHub Enterprise hosts, renamed-path inference, rich Markdown,
-mouse interactions and writing reviews are future work.
+mouse interactions, new discussions and review submission are future work.
+Suggested commits do not follow file renames or multi-parent history beyond the
+first parent.
 
 ## Development checks
 
@@ -128,7 +209,11 @@ cargo test -p helix-view review --lib
 Tests exercise actual virtual-row reservation/drawing, scrolling and wrapping,
 multiple same-line threads, unsaved edits, symlink rejection, context invalidation,
 old-side/outdated anchors, terminal controls, fork identity and a fake CLI that
-paginates threads/replies and changes revisions mid-fetch.
+paginates threads/replies and changes revisions mid-fetch. Write-side tests record
+the fake CLI's requests (mutation payloads as JSON variables, thread ids,
+resolve/unresolve, access errors), select suggested commits in temporary Git
+repositories, and drive a reply draft in the editor from suggestion to an
+unpushed-commit refusal, posting, in-place refresh and resolution.
 
 API references: [GitHub CLI authenticated API](https://cli.github.com/manual/gh_api)
 and [GitHub pull request GraphQL objects](https://docs.github.com/en/graphql/reference/pulls).

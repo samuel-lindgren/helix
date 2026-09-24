@@ -67,6 +67,13 @@
 | `:review-open` | Read the full discussion and original diff context. |
 | `:review-list` | List the current PR review discussions. |
 | `:review-select` | Select an ambiguous PR using owner/repo#number. |
+| `:review-reply` | Reply to the selected review discussion: post the given text, or open a reply draft. |
+| `:review-send` | Post the reply draft in the current buffer (also `:write` in a draft). |
+| `:review-fixed` | Open a reply draft prefilled with `Fixed in <commit>.` (default: the last commit touching the discussed lines). |
+| `:review-resolve` | Resolve the selected review discussion. |
+| `:review-unresolve` | Reopen the selected resolved review discussion. |
+| `:review-insert-commit` | Pick a recent branch commit and insert its id at the cursors. |
+| `:review-yank-commit` | Yank the commit suggested for the selected discussion to register h and the clipboard. |
 | `:go-test` | Select and run a saved Go test without debugging. |
 | `:go-test-package` | Run all tests in the current Go file's package, including external package tests. |
 | `:go-test-nearest` | Run the saved Go test or static subtest at the cursor without debugging. |

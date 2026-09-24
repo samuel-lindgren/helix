@@ -487,8 +487,18 @@ pub struct WriteOptions {
     pub auto_format: bool,
 }
 
+/// A GitHub review reply draft has no file; writing it posts the reply.
+fn write_review_reply(cx: &mut compositor::Context, args: &Args, force: bool) -> bool {
+    let reply =
+        args.first().is_none() && crate::review::reply::is_compose(cx.editor, doc!(cx.editor).id());
+    if reply {
+        crate::review::reply::send(cx.editor, force, false);
+    }
+    reply
+}
+
 fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
+    if event != PromptEvent::Validate || write_review_reply(cx, &args, false) {
         return Ok(());
     }
 
@@ -503,7 +513,7 @@ fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
 }
 
 fn force_write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
-    if event != PromptEvent::Validate {
+    if event != PromptEvent::Validate || write_review_reply(cx, &args, true) {
         return Ok(());
     }
 
@@ -2850,6 +2860,20 @@ const WRITE_NO_FORMAT_FLAG: Flag = Flag {
     ..Flag::DEFAULT
 };
 
+const REVIEW_FORCE_FLAG: Flag = Flag {
+    name: "force",
+    alias: Some('f'),
+    doc: "send even if referenced commits are not pushed to the pull request",
+    ..Flag::DEFAULT
+};
+
+const REVIEW_RESOLVE_FLAG: Flag = Flag {
+    name: "resolve",
+    alias: Some('r'),
+    doc: "also resolve the discussion after replying",
+    ..Flag::DEFAULT
+};
+
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "exit",
@@ -3636,6 +3660,130 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-reply",
+        aliases: &[],
+        doc: "Reply to the selected review discussion: post the given text, or open a reply draft.",
+        fun: |cx, args, event| {
+            if event == PromptEvent::Validate {
+                crate::review::reply::reply(
+                    cx.editor,
+                    (!args.is_empty()).then(|| args.join(" ")),
+                    args.has_flag(REVIEW_FORCE_FLAG.name),
+                    args.has_flag(REVIEW_RESOLVE_FLAG.name),
+                );
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(2)),
+            raw_after: Some(1),
+            flags: &[REVIEW_FORCE_FLAG, REVIEW_RESOLVE_FLAG],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-send",
+        aliases: &[],
+        doc: "Post the reply draft in the current buffer (also `:write` in a draft).",
+        fun: |cx, args, event| {
+            if event == PromptEvent::Validate {
+                crate::review::reply::send(
+                    cx.editor,
+                    args.has_flag(REVIEW_FORCE_FLAG.name),
+                    args.has_flag(REVIEW_RESOLVE_FLAG.name),
+                );
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            flags: &[REVIEW_FORCE_FLAG, REVIEW_RESOLVE_FLAG],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-fixed",
+        aliases: &[],
+        doc: "Open a reply draft prefilled with `Fixed in <commit>.` (default: the last commit touching the discussed lines).",
+        fun: |cx, args, event| {
+            if event == PromptEvent::Validate {
+                crate::review::reply::fixed(cx.editor, args.first().map(str::to_owned));
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-resolve",
+        aliases: &[],
+        doc: "Resolve the selected review discussion.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::reply::resolve(cx.editor, true);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-unresolve",
+        aliases: &[],
+        doc: "Reopen the selected resolved review discussion.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::reply::resolve(cx.editor, false);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-insert-commit",
+        aliases: &[],
+        doc: "Pick a recent branch commit and insert its id at the cursors.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::reply::insert_commit(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "review-yank-commit",
+        aliases: &[],
+        doc: "Yank the commit suggested for the selected discussion to register h and the clipboard.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::review::reply::yank_commit(cx.editor);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

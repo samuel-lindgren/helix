@@ -93,6 +93,7 @@ mod tests {
                     body: "reply body".into(),
                 },
             ],
+            ..Default::default()
         });
         let block = Block {
             thread,
