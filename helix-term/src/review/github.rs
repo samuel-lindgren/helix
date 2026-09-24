@@ -1,5 +1,7 @@
-//! GitHub CLI transport. All API operations are queries; authentication belongs
-//! to gh. Never invoke a shell or use remote strings as options or filesystem paths.
+//! GitHub CLI transport. Authentication belongs to gh. Writes are limited to
+//! replying to and (un)resolving an existing review discussion, addressed by its
+//! node id. All user and remote text travels as JSON variables on stdin, never
+//! in the query, a shell or command options.
 use anyhow::{anyhow, bail, ensure, Context as _};
 use helix_view::review::{safe_text, Comment, Context, Review, Thread};
 use serde_json::{json, Value};
@@ -83,7 +85,7 @@ async fn run(
     result
 }
 
-async fn git(context: &Context, args: &[&str]) -> anyhow::Result<String> {
+pub(super) async fn git(context: &Context, args: &[&str]) -> anyhow::Result<String> {
     Ok(run(&context.root, "git", args, None)
         .await?
         .trim()
@@ -105,18 +107,54 @@ async fn api(transport: &Transport<'_>, query: &str, variables: Value) -> anyhow
     )
     .await?;
     let value: Value = serde_json::from_str(&out)?;
-    ensure!(
-        value.get("errors").is_none(),
-        "GitHub query failed: {}",
-        safe_text(&value["errors"].to_string())
-            .chars()
-            .take(500)
-            .collect::<String>()
-    );
+    if let Some(errors) = value.get("errors") {
+        bail!("GitHub query failed: {}", graphql_errors(errors));
+    }
     value
         .get("data")
         .cloned()
         .ok_or_else(|| anyhow!("GitHub returned no data"))
+}
+
+/// Messages only (not the whole error JSON), bounded and terminal-safe.
+fn graphql_errors(errors: &Value) -> String {
+    let messages: Vec<_> = errors
+        .as_array()
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(|e| e["message"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = if messages.is_empty() {
+        errors.to_string()
+    } else {
+        messages.join("; ")
+    };
+    safe_text(&text).chars().take(500).collect()
+}
+
+/// Mutations fail most often for access reasons; say what to check.
+fn write_error(action: &str, err: anyhow::Error) -> anyhow::Error {
+    let text = format!("{err:#}");
+    let lower = text.to_ascii_lowercase();
+    let hint = if [
+        "not accessible",
+        "forbidden",
+        "permission",
+        "scope",
+        "must have",
+        "http 403",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        " (needs write access to the repository and a gh token with the repo scope; check `gh auth status`)"
+    } else {
+        ""
+    };
+    anyhow!("{action} failed: {text}{hint}")
 }
 
 pub(super) fn valid_path(path: &str) -> bool {
@@ -354,11 +392,32 @@ fn unique_pull(mut pulls: Vec<Pull>) -> anyhow::Result<Option<Pull>> {
     Ok(pulls.pop())
 }
 
-const THREADS: &str = r#"query($owner:String!,$repo:String!,$number:Int!,$after:String) {
+macro_rules! thread_fields {
+    () => {
+        " id path line startLine diffSide startDiffSide originalLine originalStartLine isOutdated isResolved
+ viewerCanReply viewerCanResolve viewerCanUnresolve
+ comments(first:100) { nodes { author { login } body diffHunk url originalCommit { oid } } pageInfo { hasNextPage endCursor } } "
+    };
+}
+const THREADS: &str = concat!(
+    "query($owner:String!,$repo:String!,$number:Int!,$after:String) {
  repository(owner:$owner,name:$repo) { pullRequest(number:$number) { headRefOid updatedAt url
- reviewThreads(first:100,after:$after) { nodes { id path line startLine diffSide startDiffSide originalLine originalStartLine isOutdated isResolved
- comments(first:100) { nodes { author { login } body diffHunk url originalCommit { oid } } pageInfo { hasNextPage endCursor } }
- } pageInfo { hasNextPage endCursor } } } } }"#;
+ reviewThreads(first:100,after:$after) { nodes {",
+    thread_fields!(),
+    "} pageInfo { hasNextPage endCursor } } } } }"
+);
+const THREAD: &str = concat!(
+    "query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { pullRequest { headRefOid }",
+    thread_fields!(),
+    "} } }"
+);
+const PULL_HEAD: &str = "query($owner:String!,$repo:String!,$number:Int!) { repository(owner:$owner,name:$repo) {
+ pullRequest(number:$number) { headRefOid headRefName baseRefOid headRepository { nameWithOwner } } } }";
+const REPLY: &str = "mutation($id:ID!,$body:String!) { addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}) { comment { url } } }";
+const RESOLVE: &str =
+    "mutation($id:ID!) { resolveReviewThread(input:{threadId:$id}) { thread { isResolved } } }";
+const UNRESOLVE: &str =
+    "mutation($id:ID!) { unresolveReviewThread(input:{threadId:$id}) { thread { isResolved } } }";
 const COMMENTS: &str = r#"query($id:ID!,$after:String) { node(id:$id) { ... on PullRequestReviewThread {
  comments(first:100,after:$after) { nodes { author { login } body diffHunk url originalCommit { oid } } pageInfo { hasNextPage endCursor } }
  } } }"#;
@@ -407,6 +466,25 @@ fn parse_thread(value: &Value, comments: Vec<Value>) -> anyhow::Result<Thread> {
         safe_text(value["diffSide"].as_str().unwrap_or("?")),
         safe_text(&commit[..commit.len().min(12)])
     );
+    let original_commit = first["originalCommit"]["oid"]
+        .as_str()
+        .filter(|oid| valid_oid(oid))
+        .map(str::to_owned);
+    let original_line = value["originalLine"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok());
+    let original_start = value["originalStartLine"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .or(original_line);
+    let original_lines = if valid_path(path) && right {
+        original_start
+            .zip(original_line)
+            .filter(|(s, e)| *s > 0 && s <= e)
+            .and_then(|(s, e)| e.checked_add(1).map(|end| s..end))
+    } else {
+        None
+    };
     Ok(Thread {
         id: string(value, "id")?.to_owned(),
         path: path.to_owned(),
@@ -426,14 +504,180 @@ fn parse_thread(value: &Value, comments: Vec<Value>) -> anyhow::Result<Thread> {
                 body: safe_text(c["body"].as_str().unwrap_or("")),
             })
             .collect(),
+        commit: original_commit,
+        original_lines,
+        can_reply: value["viewerCanReply"].as_bool().unwrap_or(false),
+        can_resolve: value["viewerCanResolve"].as_bool().unwrap_or(false),
+        can_unresolve: value["viewerCanUnresolve"].as_bool().unwrap_or(false),
     })
+}
+
+pub(super) fn valid_oid(oid: &str) -> bool {
+    (4..=64).contains(&oid.len()) && oid.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Follow a discussion's reply pages, bounded like the review fetch.
+async fn thread_comments(transport: &Transport<'_>, raw: &Value) -> anyhow::Result<Vec<Value>> {
+    let mut comments = nodes(&raw["comments"])?.clone();
+    let mut reply_bytes = serde_json::to_vec(&comments)?.len();
+    let mut after = cursor(&raw["comments"])?;
+    for page in 0..MAX_PAGES {
+        let Some(next) = after else {
+            break;
+        };
+        let data = api(
+            transport,
+            COMMENTS,
+            json!({"id":string(raw,"id")?,"after":next}),
+        )
+        .await?;
+        let connection = &data["node"]["comments"];
+        let page_comments = nodes(connection)?;
+        reply_bytes += serde_json::to_vec(page_comments)?.len();
+        ensure!(
+            reply_bytes <= LIMIT as usize,
+            "Discussion exceeds reply size limit"
+        );
+        comments.extend(page_comments.iter().cloned());
+        after = cursor(connection)?;
+        ensure!(
+            after.is_none() || page + 1 < MAX_PAGES,
+            "Too many replies to load safely"
+        );
+    }
+    Ok(comments)
+}
+
+/// The current PR head, fetched fresh for every write-side check: a push after
+/// the review loaded must count.
+#[derive(Clone, Debug)]
+pub(super) struct PullHead {
+    pub oid: String,
+    /// `owner/repo:branch`, for messages.
+    pub name: String,
+    pub base: Option<String>,
+}
+
+pub(super) async fn pull_head(
+    context: &Context,
+    repo: &str,
+    number: u64,
+) -> anyhow::Result<PullHead> {
+    pull_head_with(&Transport { context, gh: &gh() }, repo, number).await
+}
+
+async fn pull_head_with(
+    transport: &Transport<'_>,
+    repo: &str,
+    number: u64,
+) -> anyhow::Result<PullHead> {
+    let (owner, name) = names(repo)?;
+    let data = api(
+        transport,
+        PULL_HEAD,
+        json!({"owner":owner,"repo":name,"number":number}),
+    )
+    .await?;
+    let pr = &data["repository"]["pullRequest"];
+    let oid = string(pr, "headRefOid")?;
+    ensure!(valid_oid(oid), "Invalid PR revision");
+    Ok(PullHead {
+        oid: oid.to_owned(),
+        name: safe_text(&format!(
+            "{}:{}",
+            pr["headRepository"]["nameWithOwner"]
+                .as_str()
+                .unwrap_or("[deleted]"),
+            pr["headRefName"].as_str().unwrap_or("?")
+        )),
+        base: pr["baseRefOid"]
+            .as_str()
+            .filter(|oid| valid_oid(oid))
+            .map(str::to_owned),
+    })
+}
+
+/// Reload one discussion after a write, with the PR head its lines belong to.
+pub(super) async fn fetch_thread(context: &Context, id: &str) -> anyhow::Result<(Thread, String)> {
+    fetch_thread_with(&Transport { context, gh: &gh() }, id).await
+}
+
+async fn fetch_thread_with(
+    transport: &Transport<'_>,
+    id: &str,
+) -> anyhow::Result<(Thread, String)> {
+    let data = api(transport, THREAD, json!({ "id": id })).await?;
+    let raw = &data["node"];
+    let head = string(&raw["pullRequest"], "headRefOid")?;
+    ensure!(valid_oid(head), "Invalid PR revision");
+    let comments = thread_comments(transport, raw).await?;
+    Ok((parse_thread(raw, comments)?, head.to_owned()))
+}
+
+/// Post `body` as a reply in discussion `id`; returns the new comment's URL.
+pub(super) async fn reply(context: &Context, id: &str, body: &str) -> anyhow::Result<String> {
+    reply_with(&Transport { context, gh: &gh() }, id, body).await
+}
+
+async fn reply_with(transport: &Transport<'_>, id: &str, body: &str) -> anyhow::Result<String> {
+    ensure!(!body.trim().is_empty(), "Reply is empty");
+    ensure!(
+        body.len() <= 65536,
+        "Reply exceeds GitHub's comment size limit"
+    );
+    let data = api(transport, REPLY, json!({"id":id,"body":body}))
+        .await
+        .map_err(|err| write_error("Reply", err))?;
+    let url = data["addPullRequestReviewThreadReply"]["comment"]["url"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Reply failed: GitHub returned no comment"))?;
+    Ok(safe_text(url))
+}
+
+/// Resolve (`true`) or unresolve a discussion; returns the new resolved state.
+pub(super) async fn set_resolved(
+    context: &Context,
+    id: &str,
+    resolved: bool,
+) -> anyhow::Result<bool> {
+    set_resolved_with(&Transport { context, gh: &gh() }, id, resolved).await
+}
+
+async fn set_resolved_with(
+    transport: &Transport<'_>,
+    id: &str,
+    resolved: bool,
+) -> anyhow::Result<bool> {
+    let (query, field, action) = if resolved {
+        (RESOLVE, "resolveReviewThread", "Resolve")
+    } else {
+        (UNRESOLVE, "unresolveReviewThread", "Unresolve")
+    };
+    let data = api(transport, query, json!({ "id": id }))
+        .await
+        .map_err(|err| write_error(action, err))?;
+    data[field]["thread"]["isResolved"]
+        .as_bool()
+        .ok_or_else(|| anyhow!("{action} failed: GitHub returned no thread state"))
+}
+
+/// Unit tests substitute a recording fake for the GitHub CLI program.
+#[cfg(test)]
+pub(super) static TEST_GH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn gh() -> String {
+    #[cfg(test)]
+    if let Some(gh) = TEST_GH.lock().unwrap().clone() {
+        return gh;
+    }
+    "gh".into()
 }
 
 pub(super) async fn fetch(
     context: &Context,
     selection: Option<String>,
 ) -> anyhow::Result<Option<Review>> {
-    fetch_with(&Transport { context, gh: "gh" }, selection).await
+    fetch_with(&Transport { context, gh: &gh() }, selection).await
 }
 
 async fn fetch_with(
@@ -488,33 +732,7 @@ async fn fetch_with(
         updated = Some(stamp);
         let connection = &pr["reviewThreads"];
         for raw in nodes(connection)? {
-            let mut comments = nodes(&raw["comments"])?.clone();
-            let mut reply_bytes = serde_json::to_vec(&comments)?.len();
-            let mut after = cursor(&raw["comments"])?;
-            for page in 0..MAX_PAGES {
-                let Some(next) = after else {
-                    break;
-                };
-                let data = api(
-                    transport,
-                    COMMENTS,
-                    json!({"id":string(raw,"id")?,"after":next}),
-                )
-                .await?;
-                let connection = &data["node"]["comments"];
-                let page_comments = nodes(connection)?;
-                reply_bytes += serde_json::to_vec(page_comments)?.len();
-                ensure!(
-                    reply_bytes <= LIMIT as usize,
-                    "Discussion exceeds reply size limit"
-                );
-                comments.extend(page_comments.iter().cloned());
-                after = cursor(connection)?;
-                ensure!(
-                    after.is_none() || page + 1 < MAX_PAGES,
-                    "Too many replies to load safely"
-                );
-            }
+            let comments = thread_comments(transport, raw).await?;
             let thread = parse_thread(raw, comments)?;
             content_bytes += thread
                 .comments
@@ -583,6 +801,9 @@ async fn fetch_with(
             pull.number,
             &revision[..revision.len().min(12)]
         ),
+        repo: pull.repo,
+        number: pull.number,
+        head: revision,
         threads,
         sources,
     }))
@@ -911,5 +1132,113 @@ mod transport_tests {
             .unwrap_err()
             .to_string()
             .contains("PR changed"));
+    }
+
+    /// Records every request; answers mutations and the single-thread reload.
+    fn write_script(log: &std::path::Path, fail: bool) -> String {
+        let thread = json!({"node":{"pullRequest":{"headRefOid":"abc123"},"id":"T1","path":"a.rs","line":1,"diffSide":"RIGHT","isOutdated":false,"isResolved":true,
+            "viewerCanReply":true,"viewerCanResolve":false,"viewerCanUnresolve":true,
+            "comments":connection(vec![
+                json!({"author":{"login":"alice"},"body":"question","diffHunk":"","url":"u","originalCommit":{"oid":"0123abcd"}}),
+                json!({"author":{"login":"me"},"body":"answer","diffHunk":"","url":"u2"}),
+            ],None)}});
+        let fail = if fail {
+            "*addPullRequestReviewThreadReply*|*resolveReviewThread*) echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1;;\n"
+        } else {
+            ""
+        };
+        format!(
+            "#!/bin/sh\ninput=$(cat)\nprintf '%s\\n' \"$input\" >> '{}'\ncase \"$input\" in\n{fail}*addPullRequestReviewThreadReply*) {};;\n*unresolveReviewThread*) {};;\n*resolveReviewThread*) {};;\n*headRefName*) {};;\n*PullRequestReviewThread*) {};;\n*) exit 3;;\nesac\n",
+            log.display(),
+            output(json!({"addPullRequestReviewThreadReply":{"comment":{"url":"https://github.com/o/r/pull/1#discussion_r2"}}})),
+            output(json!({"unresolveReviewThread":{"thread":{"isResolved":false}}})),
+            output(json!({"resolveReviewThread":{"thread":{"isResolved":true}}})),
+            output(json!({"repository":{"pullRequest":{"headRefOid":"abc123","headRefName":"topic","baseRefOid":"def456","headRepository":{"nameWithOwner":"me/fork"}}}})),
+            output(thread),
+        )
+    }
+
+    #[tokio::test]
+    async fn fake_cli_receives_writes_as_json_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("fake-gh");
+        let log = dir.path().join("requests");
+        let context = Context {
+            root: dir.path().into(),
+            git_dir: dir.path().join(".git"),
+            branch: "topic".into(),
+            head: "abc123".into(),
+            config: vec![],
+        };
+        fs::write(&gh, write_script(&log, false)).unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+        let transport = Transport {
+            context: &context,
+            gh: gh.to_str().unwrap(),
+        };
+        let body = "Fixed in 0123abcd.\n$(touch injected) `x` \"quoted\" 'single' }";
+        let url = reply_with(&transport, "T1", body).await.unwrap();
+        assert_eq!(url, "https://github.com/o/r/pull/1#discussion_r2");
+        assert!(set_resolved_with(&transport, "T1", true).await.unwrap());
+        assert!(!set_resolved_with(&transport, "T1", false).await.unwrap());
+        let (thread, head) = fetch_thread_with(&transport, "T1").await.unwrap();
+        assert_eq!(head, "abc123");
+        assert_eq!(thread.comments.len(), 2);
+        assert!(thread.resolved && thread.can_reply && thread.can_unresolve && !thread.can_resolve);
+        assert_eq!(thread.commit.as_deref(), Some("0123abcd"));
+        let pull = pull_head_with(&transport, "o/r", 1).await.unwrap();
+        assert_eq!(
+            (pull.oid.as_str(), pull.name.as_str(), pull.base.as_deref()),
+            ("abc123", "me/fork:topic", Some("def456"))
+        );
+        assert!(reply_with(&transport, "T1", "  \n").await.is_err());
+
+        let requests: Vec<Value> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 5);
+        let reply = &requests[0];
+        assert!(reply["query"]
+            .as_str()
+            .unwrap()
+            .contains("addPullRequestReviewThreadReply"));
+        assert!(!reply["query"].as_str().unwrap().contains("Fixed"));
+        assert_eq!(reply["variables"], json!({"id":"T1","body":body}));
+        assert!(requests[1]["query"]
+            .as_str()
+            .unwrap()
+            .contains("mutation($id:ID!) { resolveReviewThread"));
+        assert!(requests[2]["query"]
+            .as_str()
+            .unwrap()
+            .contains("unresolveReviewThread"));
+        assert_eq!(requests[2]["variables"], json!({"id":"T1"}));
+        assert!(!dir.path().join("injected").exists());
+
+        // Access failures name the action and what to check.
+        fs::write(&gh, write_script(&log, true)).unwrap();
+        let err = reply_with(&transport, "T1", "hi")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("Reply failed"), "{err}");
+        assert!(err.contains("gh auth status"), "{err}");
+        let err = set_resolved_with(&transport, "T1", true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("Resolve failed") && err.contains("write access"),
+            "{err}"
+        );
+        // GraphQL errors are reduced to their messages.
+        assert_eq!(
+            graphql_errors(
+                &json!([{"type":"FORBIDDEN","message":"no\u{001b}[31m"},{"message":"two"}])
+            ),
+            "no[31m; two"
+        );
     }
 }

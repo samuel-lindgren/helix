@@ -1,6 +1,8 @@
 //! Review controller: context epochs reject delayed results before touching the UI.
 //! Local HEAD is checked before rendering; remote work is asynchronous and explicit.
+mod commits;
 mod github;
+pub(crate) mod reply;
 
 use crate::{
     compositor, job,
@@ -369,23 +371,27 @@ pub(crate) fn toggle(cx: &mut compositor::Context) {
     }
 }
 pub(crate) fn refresh(cx: &mut compositor::Context, selection: Option<String>) {
-    cx.editor.review.enabled = true;
-    let context = current_context(cx.editor);
-    let selection = selection.or_else(|| {
-        (context == cx.editor.review.context)
-            .then(|| cx.editor.review.pull.clone())
-            .flatten()
-    });
-    cx.editor.review.invalidate(context);
-    cx.editor.review.pull = selection;
-    cx.editor.review.status.clear();
-    clear_documents(cx.editor);
-    synchronize(cx.editor);
+    refresh_editor(cx.editor, selection);
     if cx.editor.review.context.is_none() {
         cx.editor.set_error(cx.editor.review.status.clone());
     } else {
         cx.editor.set_status(cx.editor.review.status.clone());
     }
+}
+
+fn refresh_editor(editor: &mut Editor, selection: Option<String>) {
+    editor.review.enabled = true;
+    let context = current_context(editor);
+    let selection = selection.or_else(|| {
+        (context == editor.review.context)
+            .then(|| editor.review.pull.clone())
+            .flatten()
+    });
+    editor.review.invalidate(context);
+    editor.review.pull = selection;
+    editor.review.status.clear();
+    clear_documents(editor);
+    synchronize(editor);
 }
 
 fn under_cursor(editor: &Editor) -> Option<usize> {
@@ -776,6 +782,7 @@ mod tests {
                 }],
                 diff: String::new(),
                 url: String::new(),
+                ..Default::default()
             })
         };
         let review = Review {
@@ -787,6 +794,7 @@ mod tests {
                 thread("a.rs", None),
             ],
             sources: Default::default(),
+            ..Default::default()
         };
         let entries = list_entries(&review, Some(&root));
         assert_eq!(entries[0].path, Some(root.join("a.rs")));
@@ -849,7 +857,7 @@ mod editor_tests {
         }
     }
 
-    fn fixture_editor() -> Editor {
+    pub(super) fn fixture_editor() -> Editor {
         let config = Arc::new(arc_swap::ArcSwap::from_pointee(Config::default()));
         let handlers = crate::handlers::setup(config.clone());
         Editor::new(
@@ -901,8 +909,10 @@ mod editor_tests {
                 }],
                 diff: String::new(),
                 url: String::new(),
+                ..Default::default()
             })],
             sources: HashMap::from([("a.txt".into(), source.into())]),
+            ..Default::default()
         }));
         attach_documents(editor);
         settle(editor, &mut jobs).await;
@@ -966,6 +976,7 @@ mod editor_tests {
                     }],
                     diff: "@@ original".into(),
                     url: String::new(),
+                    ..Default::default()
                 })
             })
             .collect();
@@ -976,6 +987,7 @@ mod editor_tests {
             label: "fixture#1".into(),
             threads,
             sources: HashMap::from([("a.txt".into(), source.into())]),
+            ..Default::default()
         }));
         attach_documents(editor);
         // A mapping result already queued before an edit must not paint onto

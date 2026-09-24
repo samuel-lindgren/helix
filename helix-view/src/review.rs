@@ -1,4 +1,4 @@
-//! Read-only review data and conservative document anchoring. No GitHub or process I/O.
+//! Review data, reply drafts and conservative document anchoring. No GitHub or process I/O.
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -22,14 +22,15 @@ pub struct Context {
     pub config: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Comment {
     pub author: String,
     pub body: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Thread {
+    /// GraphQL node id; replies and resolution changes address this id only.
     pub id: String,
     pub path: String,
     /// One-based inclusive range at the fetched PR head. None for old-side,
@@ -40,6 +41,13 @@ pub struct Thread {
     pub comments: Vec<Comment>,
     pub diff: String,
     pub url: String,
+    /// Commit the discussion was written against (validated hex object id).
+    pub commit: Option<String>,
+    /// One-based inclusive range in `commit`, for right-side (new code) discussions.
+    pub original_lines: Option<Range<usize>>,
+    pub can_reply: bool,
+    pub can_resolve: bool,
+    pub can_unresolve: bool,
 }
 
 impl Thread {
@@ -61,9 +69,14 @@ impl Thread {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Review {
     pub label: String,
+    /// Base repository (`owner/repo`) and number of the pull request.
+    pub repo: String,
+    pub number: u64,
+    /// PR head revision all thread line numbers and `sources` belong to.
+    pub head: String,
     pub threads: Vec<Arc<Thread>>,
     pub sources: HashMap<String, String>,
 }
@@ -99,6 +112,44 @@ pub struct PendingSelection {
     pub version: i32,
 }
 
+/// A reply being written in a scratch buffer. Bound to one discussion node id
+/// when opened; posting never re-targets it to whatever is under the cursor.
+#[derive(Clone, Debug)]
+pub struct Compose {
+    pub context: Context,
+    pub repo: String,
+    pub number: u64,
+    pub thread: Arc<Thread>,
+    /// A post is in flight; a second `:w` must not send a duplicate.
+    pub sending: bool,
+}
+
+/// First line of the non-sent context section of a reply buffer.
+pub const REPLY_SEPARATOR: &str =
+    "<!-- review: everything from this line down is context and is not sent -->";
+
+/// The text above the separator, without surrounding blank lines. `Err` explains
+/// why nothing may be sent.
+pub fn reply_body(text: &str) -> Result<String, &'static str> {
+    let mut body = Vec::new();
+    let mut separated = false;
+    for line in text.lines() {
+        if line.trim() == REPLY_SEPARATOR {
+            separated = true;
+            break;
+        }
+        body.push(line.trim_end());
+    }
+    if !separated {
+        return Err("Reply separator line was removed; restore it so quoted context is not sent");
+    }
+    let body = body.join("\n").trim_matches('\n').to_owned();
+    if body.trim().is_empty() {
+        return Err("Reply is empty; write it above the separator line");
+    }
+    Ok(body)
+}
+
 #[derive(Default)]
 pub struct State {
     pub enabled: bool,
@@ -115,6 +166,8 @@ pub struct State {
     pub status: String,
     /// The last load failed or no reviewable context exists; `status` explains.
     pub failed: bool,
+    /// Reply drafts by scratch document. Survive refreshes and context changes.
+    pub compose: HashMap<crate::DocumentId, Compose>,
 }
 
 impl State {
@@ -553,6 +606,7 @@ mod tests {
                 comments: vec![],
                 diff: String::new(),
                 url: String::new(),
+                ..Default::default()
             })
         };
         let review = Review {
@@ -563,6 +617,7 @@ mod tests {
                 thread("3", Some(3..4), true),
             ],
             sources: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(review.pull(), "o/repo#12");
         let summary = review.summary();
