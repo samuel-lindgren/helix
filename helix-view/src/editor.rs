@@ -725,6 +725,9 @@ pub enum StatusLineElement {
 
     /// Debug adapter status (stopped/running/inactive)
     DebugStatus,
+
+    /// GitHub review discussion state while review display is enabled
+    Review,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs

@@ -18,8 +18,22 @@ disabled in each editor session.
 | `:review-next`, `:review-prev` | Visit discussions across files, with wraparound. |
 | `:review-expand` | Expand/collapse the discussion at the cursor or selected by navigation. |
 | `:review-open` | Open the complete discussion and original diff in a discussion buffer. |
-| `:review-list` | List the current PR's discussions, including unavailable locations. |
+| `:review-list` | Pick a discussion (first line, location, author/status/comment count) with a code preview; typing filters by location; `Enter` jumps to it. Includes outdated and file-level discussions. |
 | `:review-select owner/repo#123` | Explicitly select a PR when automatic association is ambiguous. |
+
+After loading, the status message summarizes the PR, e.g.
+`owner/repo#12: 3 discussion(s), 2 open · 2 inline, 1 outdated/file-level`.
+Outdated and file-level discussions are never drawn inline; reach them with
+`:review-next` or `:review-list`.
+
+Add the `review` element to a statusline section to keep that state visible
+while display is enabled (`reviews: loading`, `repo#12 2/3 open`,
+`reviews: no PR`, or `reviews: error` with the reason in the last message):
+
+```toml
+[editor.statusline]
+right = ["review", "separator", "selections", "position", "file-type"]
+```
 
 Several discussions can share a line; next/previous selects each individually.
 Collapsed blocks show the author, resolved/open status, comment count and the

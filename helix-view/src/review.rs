@@ -68,6 +68,28 @@ pub struct Review {
     pub sources: HashMap<String, String>,
 }
 
+impl Review {
+    /// `owner/repo#123`, without the revision suffix of `label`.
+    pub fn pull(&self) -> &str {
+        self.label.split(" @ ").next().unwrap_or(&self.label)
+    }
+
+    /// Counts that explain why fewer discussions may be visible inline.
+    pub fn summary(&self) -> String {
+        let total = self.threads.len();
+        if total == 0 {
+            return format!("{}: no review discussions", self.pull());
+        }
+        let open = self.threads.iter().filter(|t| !t.resolved).count();
+        let inline = self.threads.iter().filter(|t| t.lines.is_some()).count();
+        format!(
+            "{}: {total} discussion(s), {open} open · {inline} inline, {} outdated/file-level · :review-next, :review-list",
+            self.pull(),
+            total - inline,
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct PendingSelection {
     pub index: usize,
@@ -91,6 +113,8 @@ pub struct State {
     pub pending_selection: Option<PendingSelection>,
     pub document: Option<crate::DocumentId>,
     pub status: String,
+    /// The last load failed or no reviewable context exists; `status` explains.
+    pub failed: bool,
 }
 
 impl State {
@@ -102,6 +126,7 @@ impl State {
         self.generation = self.generation.wrapping_add(1);
         self.context = context;
         self.loading = false;
+        self.failed = false;
         self.review = None;
         self.selected = None;
         self.pending_selection = None;
@@ -110,6 +135,25 @@ impl State {
 
     pub fn accepts(&self, generation: u64, context: &Context) -> bool {
         self.enabled && self.generation == generation && self.context.as_ref() == Some(context)
+    }
+
+    /// Compact state for the statusline; `None` while display is disabled.
+    pub fn indicator(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        Some(if let Some(review) = &self.review {
+            let pull = review.pull();
+            let pull = pull.rsplit('/').next().unwrap_or(pull);
+            let open = review.threads.iter().filter(|t| !t.resolved).count();
+            format!("{pull} {open}/{} open", review.threads.len())
+        } else if self.loading {
+            "reviews: loading".into()
+        } else if self.failed {
+            "reviews: error".into()
+        } else {
+            "reviews: no PR".into()
+        })
     }
 }
 
@@ -495,6 +539,57 @@ mod tests {
         };
         state.invalidate(None);
         assert!(pending.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn summary_and_indicator_explain_counts() {
+        let thread = |id: &str, lines, resolved| {
+            Arc::new(Thread {
+                id: id.into(),
+                path: "a.rs".into(),
+                lines,
+                location: String::new(),
+                resolved,
+                comments: vec![],
+                diff: String::new(),
+                url: String::new(),
+            })
+        };
+        let review = Review {
+            label: "o/repo#12 @ abc".into(),
+            threads: vec![
+                thread("1", Some(1..2), false),
+                thread("2", None, false),
+                thread("3", Some(3..4), true),
+            ],
+            sources: HashMap::new(),
+        };
+        assert_eq!(review.pull(), "o/repo#12");
+        let summary = review.summary();
+        assert!(summary.contains("3 discussion(s), 2 open"), "{summary}");
+        assert!(
+            summary.contains("2 inline, 1 outdated/file-level"),
+            "{summary}"
+        );
+        let empty = Review {
+            threads: vec![],
+            ..review.clone()
+        };
+        assert_eq!(empty.summary(), "o/repo#12: no review discussions");
+
+        let mut state = State::default();
+        assert_eq!(state.indicator(), None);
+        state.enabled = true;
+        assert_eq!(state.indicator().unwrap(), "reviews: no PR");
+        state.loading = true;
+        assert_eq!(state.indicator().unwrap(), "reviews: loading");
+        state.loading = false;
+        state.failed = true;
+        assert_eq!(state.indicator().unwrap(), "reviews: error");
+        state.review = Some(Arc::new(review));
+        assert_eq!(state.indicator().unwrap(), "repo#12 2/3 open");
+        state.invalidate(None);
+        assert!(!state.failed);
     }
 
     #[test]

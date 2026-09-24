@@ -158,6 +158,7 @@ where
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
         helix_view::editor::StatusLineElement::DebugStatus => render_debug_status,
+        helix_view::editor::StatusLineElement::Review => render_review,
     }
 }
 
@@ -578,6 +579,21 @@ where
         .to_string_lossy()
         .to_string();
     write(context, cwd.into())
+}
+
+fn render_review<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let Some(indicator) = context.editor.review.indicator() else {
+        return;
+    };
+    let style = if context.editor.review.failed {
+        context.editor.theme.get("error")
+    } else {
+        Style::default()
+    };
+    write(context, Span::styled(indicator, style));
 }
 
 fn render_debug_status<'a, F>(context: &mut RenderContext<'a>, write: F)
