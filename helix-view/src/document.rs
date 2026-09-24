@@ -139,6 +139,7 @@ pub enum DocumentOpenError {
 }
 
 pub struct Document {
+    pub review: crate::review::DocumentReview,
     pub(crate) id: DocumentId,
     text: Rope,
     selections: HashMap<ViewId, Selection>,
@@ -709,6 +710,7 @@ impl Document {
         let old_state = None;
 
         Self {
+            review: crate::review::DocumentReview::default(),
             id: DocumentId::default(),
             active_snippet: None,
             path: None,
@@ -1438,6 +1440,7 @@ impl Document {
             return true;
         }
 
+        self.review = crate::review::DocumentReview::default();
         self.modified_since_accessed = true;
         self.version += 1;
 

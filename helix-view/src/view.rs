@@ -513,6 +513,12 @@ impl View {
             ));
         }
 
+        if !doc.review.blocks.is_empty() {
+            text_annotations.add_line_annotation(Box::new(crate::review::Layout::new(
+                &doc.review.blocks,
+                width,
+            )));
+        }
         text_annotations
     }
 

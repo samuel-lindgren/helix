@@ -271,6 +271,23 @@ impl<'a> TextRenderer<'a> {
             offset,
         }
     }
+    /// Draw viewport-relative virtual text, clipping before narrowing coordinates.
+    pub fn draw_virtual_text(&mut self, row: usize, text: &str, style: Style) {
+        let Some(row) = row.checked_sub(self.offset.row) else {
+            return;
+        };
+        if row >= usize::from(self.viewport.height) {
+            return;
+        }
+        self.surface.set_stringn(
+            self.viewport.x,
+            self.viewport.y + row as u16,
+            text,
+            usize::from(self.viewport.width),
+            style,
+        );
+    }
+
     /// Draws a single `grapheme` at the current render position with a specified `style`.
     pub fn draw_decoration_grapheme(
         &mut self,

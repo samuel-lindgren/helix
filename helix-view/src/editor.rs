@@ -1210,6 +1210,7 @@ use futures_util::stream::{Flatten, Once};
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
 pub struct Editor {
+    pub review: crate::review::State,
     /// Current editing mode.
     pub mode: Mode,
     pub tree: Tree,
@@ -1404,6 +1405,7 @@ impl Editor {
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
             branch_diff_enabled: false,
+            review: crate::review::State::default(),
             go_test_doc_id: None,
             go_test_cancel: None,
             go_test_last_run: None,

@@ -59,6 +59,14 @@
 | `:tree-sitter-scopes` | Display tree sitter scopes, primarily for theming and development. |
 | `:tree-sitter-highlight-name` | Display name of tree-sitter highlight scope under the cursor. |
 | `:tree-sitter-layers` | Display language names of tree-sitter injection layers under the cursor. |
+| `:review-toggle` | Show or hide GitHub review comments globally. |
+| `:review-refresh` | Refresh reviews for the current branch. |
+| `:review-next` | Go to the next review discussion. |
+| `:review-prev` | Go to the previous review discussion. |
+| `:review-expand` | Expand or collapse the selected inline discussion. |
+| `:review-open` | Read the full discussion and original diff context. |
+| `:review-list` | List the current PR review discussions. |
+| `:review-select` | Select an ambiguous PR using owner/repo#number. |
 | `:go-test` | Select and run a saved Go test without debugging. |
 | `:go-test-package` | Run all tests in the current Go file's package, including external package tests. |
 | `:go-test-nearest` | Run the saved Go test or static subtest at the cursor without debugging. |
