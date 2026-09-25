@@ -29,6 +29,9 @@ pub struct Draft {
     /// Changes on every commit attempt and update, so that a slower
     /// background update cannot replace newer content.
     pub revision: u64,
+    /// The review discussion selected when the draft opened, as
+    /// `@author on path:line`.
+    pub discussion: Option<String>,
 }
 
 /// A running write operation (staging, commit or push) in one repository.

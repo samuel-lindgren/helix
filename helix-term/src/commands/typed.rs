@@ -3828,9 +3828,25 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "git-push",
+        aliases: &[],
+        doc: "Choose the destination of the checked-out branch and push it (never forced).",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::git::push(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "git-cancel",
         aliases: &[],
-        doc: "Cancel the running commit in the current repository.",
+        doc: "Cancel the running commit or push in the current repository.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
                 crate::git::cancel(cx.editor);

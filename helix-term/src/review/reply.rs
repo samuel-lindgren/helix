@@ -728,6 +728,7 @@ mod editor_tests {
         )
         .unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+        let _gh = github::TEST_GH_LOCK.lock().await;
         *github::TEST_GH.lock().unwrap() = Some(gh.to_str().unwrap().to_owned());
 
         let mut editor_value = fixture_editor();
@@ -765,6 +766,7 @@ mod editor_tests {
             )]
             .into(),
             originals: Default::default(),
+            head_repo: None,
         }));
         select(editor, 0);
         pump(editor, &mut jobs, |e| e.review.pending_selection.is_none()).await;

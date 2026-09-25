@@ -1,7 +1,7 @@
 //! Review controller: context epochs reject delayed results before touching the UI.
 //! Local HEAD is checked before rendering; remote work is asynchronous and explicit.
 mod commits;
-mod github;
+pub(crate) mod github;
 pub(crate) mod reply;
 
 use crate::{
@@ -188,8 +188,26 @@ pub(crate) fn synchronize(editor: &mut Editor) {
                 match result {
                     Ok(Some(review)) => {
                         editor.review.status = review.summary();
+                        // Keep the discussion being worked on across the reload
+                        // after a commit or push on the same branch.
+                        editor.review.selected = editor
+                            .review
+                            .remembered
+                            .as_ref()
+                            .filter(|(root, branch, _)| {
+                                *root == context.root && *branch == context.branch
+                            })
+                            .and_then(|(_, _, id)| review.threads.iter().position(|t| &t.id == id));
                         editor.review.review = Some(Arc::new(review));
-                        editor.set_status(editor.review.status.clone());
+                        let message = editor
+                            .review
+                            .after_load
+                            .take()
+                            .filter(|(root, branch, _)| {
+                                *root == context.root && *branch == context.branch
+                            })
+                            .map_or_else(|| editor.review.status.clone(), |(_, _, m)| m);
+                        editor.set_status(message);
                     }
                     Ok(None) => {
                         editor.review.status = format!(
@@ -425,7 +443,7 @@ pub(crate) fn refresh(cx: &mut compositor::Context, selection: Option<String>) {
     }
 }
 
-fn refresh_editor(editor: &mut Editor, selection: Option<String>) {
+pub(crate) fn refresh_editor(editor: &mut Editor, selection: Option<String>) {
     editor.review.enabled = true;
     let context = current_context(editor);
     let selection = selection.or_else(|| {
@@ -438,6 +456,45 @@ fn refresh_editor(editor: &mut Editor, selection: Option<String>) {
     editor.review.status.clear();
     clear_documents(editor);
     synchronize(editor);
+}
+
+/// Select discussion `index` and remember it beyond reloads of this branch.
+fn remember(editor: &mut Editor, index: usize) {
+    editor.review.selected = Some(index);
+    if let (Some(context), Some(thread)) = (
+        &editor.review.context,
+        editor
+            .review
+            .review
+            .as_ref()
+            .and_then(|r| r.threads.get(index)),
+    ) {
+        editor.review.remembered = Some((
+            context.root.clone(),
+            context.branch.clone(),
+            thread.id.clone(),
+        ));
+    }
+}
+
+/// The selected discussion of the loaded review for `root` and `branch`, as
+/// `@author on path:line`.
+pub(crate) fn selected_label(editor: &Editor, root: &Path, branch: &str) -> Option<String> {
+    let context = editor.review.context.as_ref()?;
+    if context.root != root || context.branch != branch {
+        return None;
+    }
+    let thread = editor
+        .review
+        .review
+        .as_ref()?
+        .threads
+        .get(editor.review.selected?)?;
+    let author = thread
+        .comments
+        .first()
+        .map_or("[deleted]", |c| c.author.as_str());
+    Some(format!("@{author} on {}", list_location(thread)))
 }
 
 fn under_cursor(editor: &Editor) -> Option<usize> {
@@ -513,7 +570,7 @@ fn select(editor: &mut Editor, index: usize) {
     let Some(thread) = review.threads.get(index) else {
         return;
     };
-    editor.review.selected = Some(index);
+    remember(editor, index);
     editor.review.pending_selection = None;
     let Some(context) = editor.review.context.as_ref() else {
         return;
@@ -632,7 +689,7 @@ fn open_thread(editor: &mut Editor, index: usize) {
         thread.diff,
         thread.url
     );
-    editor.review.selected = Some(index);
+    remember(editor, index);
     let id = if let Some(id) = editor.review.document.filter(|id| {
         editor
             .documents

@@ -68,10 +68,11 @@ A block whose code changed since the review says so:
       │ Could this return an error for an empty input?
 ```
 
-There are no new default shortcuts. An optional keymap in `config.toml` is:
+There are no new default shortcuts. An optional keymap in `config.toml`, with
+the [Git commands](./git.md) in the same menu (`Space i` is unused by default):
 
 ```toml
-[keys.normal.space.R]
+[keys.normal.space.i]
 t = ":review-toggle"
 r = ":review-refresh"
 n = ":review-next"
@@ -85,16 +86,50 @@ c = ":review-insert-commit"
 y = ":review-yank-commit"
 s = ":review-resolve"
 u = ":review-unresolve"
+g = ":git-status"
+m = ":git-commit"
+P = ":git-push"
+x = ":git-cancel"
 ```
 
-With this configuration, press `Space R t` to toggle, `Space R n` to navigate,
-`Space R e` to expand and `Space R a` to answer. Closing the discussion buffer with `:buffer-close`
+With this configuration, press `Space i t` to toggle, `Space i n` to navigate,
+`Space i e` to expand and `Space i a` to answer. Closing the discussion buffer with `:buffer-close`
 returns to another buffer; `:buffer-previous` also returns to the previous file.
+
+## From a review comment to a pushed fix and a reply
+
+The whole loop runs in Helix. With the keymap above:
+
+```text
+Space i l, Enter      pick the discussion; the cursor goes to its code
+(edit, :w)            fix and save; the discussion stays next to the code,
+                      marked `code changed` if it moved
+Space i g             :git-status: preview the diff; Alt-s stages the file
+Alt-c                 open the commit draft; it names the selected discussion
+(type message, :w)    commit; the status line says `local only, not pushed`
+Space i P, Enter      :git-push: check the destination and commits, push
+                      (the status line ends with `in owner/repo#12 ·
+                      :review-fixed replies to @reviewer on path:line`)
+Space i f             :review-fixed: a reply draft with `Fixed in <commit>.`
+:w                    post the reply to that discussion
+Space i s             optionally resolve it
+```
+
+Nothing is committed, pushed, posted or resolved without its explicit step. The
+discussion selected with `:review-list` or `:review-next` stays selected while
+Git views and drafts are open and while the review reloads after the commit and
+the push on the same branch, so `:review-fixed`, `:review-reply` and
+`:review-resolve` target it from any buffer. After the push, Helix waits for
+the PR head on GitHub to contain the commit and reloads the review; outdated
+discussions are then placed on the new code (see
+[Locations](#locations-and-refresh)). The reply draft's commit check (below)
+still refuses a commit that GitHub does not have yet. See
+[Git status, commits and push](./git.md) for staging, commit drafts and
+push destinations.
 
 ## Replying with the commit that fixed it
 
-The usual loop is: navigate to a discussion, change the code, commit, push, and
-answer with the commit. For example:
+Replies can also be written for commits made outside Helix:
 
 ```text
 :review-next                 select the discussion
@@ -192,7 +227,8 @@ reuses that buffer.
 
 The focused file selects the repository. All matching open buffers show that
 repository's discussions. Local branch, HEAD and repository changes clear the
-previous inline context and start discovery again. Helix checks the local context
+previous inline context and start discovery again; the selected discussion is
+kept when the branch stays the same. Helix checks the local context
 before rendering, before accepting results, and once per second while enabled.
 Remote comments are cached until `:review-refresh`, a context change, or a reply
 or resolution from Helix; there is no periodic GitHub polling. Delayed results for an earlier context are discarded.
