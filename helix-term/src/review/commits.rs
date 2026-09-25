@@ -4,8 +4,8 @@
 //! passed after `--`, object ids are validated hex.
 use super::github::{self, git, valid_oid};
 use anyhow::{anyhow, Context as _};
-use helix_view::review::{safe_text, Context, Thread};
-use std::{collections::HashSet, ops::Range};
+use helix_view::review::{safe_text, track, Context, Hunk, Thread};
+use std::collections::HashSet;
 
 /// Why a commit was suggested for a discussion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,14 +36,6 @@ impl Commit {
     pub fn describe(&self) -> String {
         format!("{} {}", self.short(), self.subject)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Hunk {
-    old_start: usize,
-    old_len: usize,
-    new_start: usize,
-    new_len: usize,
 }
 
 fn parse_range(text: &str) -> Option<(usize, usize)> {
@@ -79,60 +71,6 @@ fn parse_log(out: &str) -> Vec<(String, Vec<Hunk>)> {
         }
     }
     commits
-}
-
-/// Carry a one-based inclusive line range through one commit's zero-context
-/// hunks. Returns whether the commit touched the range and the range afterwards.
-/// A touching hunk widens the range to its new lines so that follow-up edits of
-/// the replacement code are recognized too.
-fn track(range: Range<usize>, hunks: &[Hunk]) -> (bool, Range<usize>) {
-    let (start, end) = (range.start, range.end - 1);
-    // A hunk lies entirely before line `line` in old coordinates.
-    let before = |h: &Hunk, line: usize| {
-        if h.old_len == 0 {
-            h.old_start < line
-        } else {
-            h.old_start + h.old_len - 1 < line
-        }
-    };
-    let map = |line: usize, last: bool| {
-        let mut shift: isize = 0;
-        for h in hunks {
-            if before(h, line) {
-                shift += h.new_len as isize - h.old_len as isize;
-            } else if h.old_len > 0 && h.old_start <= line {
-                // The line itself was replaced or deleted.
-                return if last && h.new_len > 0 {
-                    h.new_start + h.new_len - 1
-                } else if h.new_len > 0 {
-                    h.new_start
-                } else {
-                    h.new_start.max(1)
-                };
-            } else {
-                break;
-            }
-        }
-        (line as isize + shift).max(1) as usize
-    };
-    let (mut new_start, mut new_end) = (map(start, false), map(end, true));
-    let mut touched = false;
-    for h in hunks {
-        let hit = if h.old_len == 0 {
-            // Insertions inside the range or directly adjacent to it.
-            h.old_start + 1 >= start && h.old_start <= end
-        } else {
-            h.old_start <= end && h.old_start + h.old_len > start
-        };
-        if hit {
-            touched = true;
-            if h.new_len > 0 {
-                new_start = new_start.min(h.new_start);
-                new_end = new_end.max(h.new_start + h.new_len - 1);
-            }
-        }
-    }
-    (touched, new_start..new_end.max(new_start) + 1)
 }
 
 async fn has_commit(context: &Context, oid: &str) -> bool {
@@ -432,30 +370,6 @@ mod tests {
                 ("bbb".into(), vec![])
             ]
         );
-    }
-
-    #[test]
-    fn tracking_follows_shifts_and_detects_touches() {
-        // Lines 10-12. An edit above shifts the range without touching it.
-        assert_eq!(track(10..13, &[hunk(2, 1, 2, 3)]), (false, 12..15));
-        // Deletion above.
-        assert_eq!(track(10..13, &[hunk(2, 2, 1, 0)]), (false, 8..11));
-        // An edit below is unrelated.
-        assert_eq!(track(10..13, &[hunk(20, 1, 20, 1)]), (false, 10..13));
-        // Changing a discussed line.
-        assert_eq!(track(10..13, &[hunk(11, 1, 11, 1)]), (true, 10..13));
-        // Replacing the whole range with more lines widens it.
-        assert_eq!(track(10..13, &[hunk(10, 3, 10, 5)]), (true, 10..15));
-        // Inserting directly after the last line (a missing check) counts.
-        assert_eq!(track(10..13, &[hunk(12, 0, 13, 2)]), (true, 10..15));
-        // Inserting directly before the first line counts too.
-        assert_eq!(track(10..13, &[hunk(9, 0, 10, 1)]), (true, 10..14));
-        // Inserting further away does not.
-        assert_eq!(track(10..13, &[hunk(13, 0, 14, 1)]), (false, 10..13));
-        // Deleting the discussed lines keeps a one-line anchor.
-        let (touched, range) = track(10..13, &[hunk(10, 3, 9, 0)]);
-        assert!(touched);
-        assert_eq!(range.len(), 1);
     }
 
     #[test]

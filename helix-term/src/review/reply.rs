@@ -764,6 +764,7 @@ mod editor_tests {
                 source.replace("line 4\n", "line 4 fixed\n"),
             )]
             .into(),
+            originals: Default::default(),
         }));
         select(editor, 0);
         pump(editor, &mut jobs, |e| e.review.pending_selection.is_none()).await;

@@ -1,10 +1,13 @@
-//! Review data, reply drafts and conservative document anchoring. No GitHub or process I/O.
+//! Review data, reply drafts and document placement. No GitHub or process I/O.
 use std::{
+    cell::OnceCell,
     collections::{HashMap, HashSet},
     ops::Range,
     path::PathBuf,
     sync::Arc,
 };
+
+use imara_diff::{Algorithm, Diff, InternedInput};
 
 use helix_core::{
     doc_formatter::FormattedGrapheme,
@@ -38,6 +41,9 @@ pub struct Thread {
     pub lines: Option<Range<usize>>,
     pub location: String,
     pub resolved: bool,
+    /// GitHub reports the discussion as outdated: its diff hunk changed on the
+    /// PR head. Independent of local edits and of the local placement.
+    pub outdated: bool,
     pub comments: Vec<Comment>,
     pub diff: String,
     pub url: String,
@@ -54,10 +60,17 @@ impl Thread {
     pub fn title(&self) -> String {
         let author = self.comments.first().map_or("[deleted]", |c| &c.author);
         format!(
-            "@{author} · {} · {} comment(s)",
+            "@{author} · {}{} · {} comment(s)",
             if self.resolved { "resolved" } else { "open" },
+            if self.outdated { " · outdated" } else { "" },
             self.comments.len()
         )
+    }
+
+    /// Right-side discussion with a line range, current or original, that can
+    /// be shown on the code. Old-side and file-level discussions cannot.
+    pub fn placeable(&self) -> bool {
+        self.lines.is_some() || self.original_lines.is_some()
     }
 
     pub fn conversation(&self) -> String {
@@ -79,6 +92,9 @@ pub struct Review {
     pub head: String,
     pub threads: Vec<Arc<Thread>>,
     pub sources: HashMap<String, String>,
+    /// File contents at an outdated discussion's original commit, by
+    /// `(commit, path)`, read from the local repository when available.
+    pub originals: HashMap<(String, String), String>,
 }
 
 impl Review {
@@ -94,9 +110,14 @@ impl Review {
             return format!("{}: no review discussions", self.pull());
         }
         let open = self.threads.iter().filter(|t| !t.resolved).count();
-        let inline = self.threads.iter().filter(|t| t.lines.is_some()).count();
+        let inline = self.threads.iter().filter(|t| t.placeable()).count();
+        let outdated = self
+            .threads
+            .iter()
+            .filter(|t| t.placeable() && t.lines.is_none())
+            .count();
         format!(
-            "{}: {total} discussion(s), {open} open · {inline} inline, {} outdated/file-level · :review-next, :review-list",
+            "{}: {total} discussion(s), {open} open · {inline} inline ({outdated} outdated), {} old-side/file-level · :review-next, :review-list",
             self.pull(),
             total - inline,
         )
@@ -224,6 +245,31 @@ impl Drop for DocumentReview {
     }
 }
 
+/// How a discussion's position in the current document was derived. The
+/// discussion's own location (path, lines, commit, diff) is never changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// The reviewed lines and their context are unchanged and unambiguous.
+    #[default]
+    Exact,
+    /// The file changed since the reviewed version; the lines were carried
+    /// through a line diff to the closest remaining code.
+    Changed,
+    /// No position could be derived; shown at the original line number.
+    Approximate,
+}
+
+impl Placement {
+    /// Marker for blocks, lists and status messages; empty when exact.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "",
+            Self::Changed => "code changed",
+            Self::Approximate => "approximate location",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Block {
     pub thread: Arc<Thread>,
@@ -232,6 +278,126 @@ pub struct Block {
     /// completely rendered before the discussion is inserted.
     pub anchor: usize,
     pub expanded: bool,
+    pub placement: Placement,
+}
+
+/// A line diff hunk in `git diff -U0` terms: one-based starts, and for an
+/// empty side the start is the line after which the change happens (0 at the top).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hunk {
+    pub old_start: usize,
+    pub old_len: usize,
+    pub new_start: usize,
+    pub new_len: usize,
+}
+
+/// Line hunks turning `before` into `after`, as `git diff -U0` would report them.
+pub fn line_hunks(before: &str, after: &str) -> Vec<Hunk> {
+    let input = InternedInput::new(before, after);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+    let side = |range: Range<u32>| {
+        let len = (range.end - range.start) as usize;
+        let start = range.start as usize;
+        (if len == 0 { start } else { start + 1 }, len)
+    };
+    diff.hunks()
+        .map(|hunk| {
+            let (old_start, old_len) = side(hunk.before);
+            let (new_start, new_len) = side(hunk.after);
+            Hunk {
+                old_start,
+                old_len,
+                new_start,
+                new_len,
+            }
+        })
+        .collect()
+}
+
+/// Carry a one-based inclusive line range through one change's zero-context
+/// hunks. Returns whether the change touched the range and the range afterwards.
+/// A touching hunk widens the range to its new lines so that follow-up edits of
+/// the replacement code are recognized too.
+pub fn track(range: Range<usize>, hunks: &[Hunk]) -> (bool, Range<usize>) {
+    let (start, end) = (range.start, range.end - 1);
+    // A hunk lies entirely before line `line` in old coordinates.
+    let before = |h: &Hunk, line: usize| {
+        if h.old_len == 0 {
+            h.old_start < line
+        } else {
+            h.old_start + h.old_len - 1 < line
+        }
+    };
+    let map = |line: usize, last: bool| {
+        let mut shift: isize = 0;
+        for h in hunks {
+            if before(h, line) {
+                shift += h.new_len as isize - h.old_len as isize;
+            } else if h.old_len > 0 && h.old_start <= line {
+                // The line itself was replaced or deleted.
+                return if last && h.new_len > 0 {
+                    h.new_start + h.new_len - 1
+                } else if h.new_len > 0 {
+                    h.new_start
+                } else {
+                    h.new_start.max(1)
+                };
+            } else {
+                break;
+            }
+        }
+        (line as isize + shift).max(1) as usize
+    };
+    let (mut new_start, mut new_end) = (map(start, false), map(end, true));
+    let mut touched = false;
+    for h in hunks {
+        let hit = if h.old_len == 0 {
+            // Insertions inside the range or directly adjacent to it.
+            h.old_start + 1 >= start && h.old_start <= end
+        } else {
+            h.old_start <= end && h.old_start + h.old_len > start
+        };
+        if hit {
+            touched = true;
+            if h.new_len > 0 {
+                new_start = new_start.min(h.new_start);
+                new_end = new_end.max(h.new_start + h.new_len - 1);
+            }
+        }
+    }
+    (touched, new_start..new_end.max(new_start) + 1)
+}
+
+/// Characters of the one-based `lines` in `text`, clamped to its content lines
+/// so that short and empty documents still get a valid (possibly empty) range.
+pub fn line_range(text: &Rope, lines: Range<usize>) -> Range<usize> {
+    let len = text.len_chars();
+    if len == 0 {
+        return 0..0;
+    }
+    // The line holding the final character; a trailing newline adds no line.
+    let last = text.char_to_line(len - 1);
+    let first = lines.start.saturating_sub(1).min(last);
+    let end = lines.end.saturating_sub(2).max(first).min(last);
+    text.line_to_char(first)..text.line_to_char(end + 1)
+}
+
+/// Anchor at the terminating newline of `range` (before a `\r\n` pair), or at
+/// EOF for an unterminated final line and empty documents.
+pub fn anchor(text: &Rope, range: &Range<usize>) -> usize {
+    let len = text.len_chars();
+    if range.end == 0 || range.end > len {
+        return range.end.min(len);
+    }
+    let mut anchor = range.end - 1;
+    if anchor > 0 && text.char(anchor) == '\n' && text.char(anchor - 1) == '\r' {
+        anchor -= 1;
+    }
+    if range.end == len && !matches!(text.char(anchor), '\n' | '\r') {
+        anchor = range.end;
+    }
+    anchor
 }
 
 /// Only map an unchanged, unique context window. A diff algorithm alone can
@@ -294,6 +460,8 @@ pub struct LineMapper<'a> {
     equal: bool,
     before_index: LineIndex,
     after_index: LineIndex,
+    /// Computed on the first discussion that cannot be mapped exactly.
+    hunks: OnceCell<Vec<Hunk>>,
 }
 
 impl<'a> LineMapper<'a> {
@@ -320,8 +488,31 @@ impl<'a> LineMapper<'a> {
                 local.to_string()
             },
             equal,
+            hunks: OnceCell::new(),
         })
     }
+
+    /// Place one-based `lines` of the snapshot: exact when the unchanged context
+    /// can be verified, else carried through a line diff of the snapshot and the
+    /// document, else at the clamped original line numbers.
+    pub fn place(&self, lines: Range<usize>) -> (Range<usize>, Placement) {
+        if let Some(range) = self.map(lines.clone()) {
+            return (range, Placement::Exact);
+        }
+        if self.equal
+            || lines.start == 0
+            || lines.start >= lines.end
+            || lines.end - 1 > self.before.len_lines()
+        {
+            return (line_range(self.local, lines), Placement::Approximate);
+        }
+        let hunks = self
+            .hunks
+            .get_or_init(|| line_hunks(self.source, &self.after));
+        let (_, lines) = track(lines, hunks);
+        (line_range(self.local, lines), Placement::Changed)
+    }
+
     pub fn map(&self, lines: Range<usize>) -> Option<Range<usize>> {
         if lines.start == 0 || lines.start >= lines.end || lines.end - 1 > self.before.len_lines() {
             return None;
@@ -431,10 +622,12 @@ pub fn rows(block: &Block, width: u16) -> Vec<String> {
         }
         true
     }
+    let placement = block.placement.label();
     let title = format!(
-        "{} {}",
+        "{} {}{}{placement}",
         if block.expanded { "[-]" } else { "[+]" },
-        block.thread.title()
+        block.thread.title(),
+        if placement.is_empty() { "" } else { " · " },
     );
     let mut complete = append(&title, width, limit, &mut rows);
     if complete && block.expanded {
@@ -583,6 +776,143 @@ mod tests {
         );
     }
 
+    fn hunk(old_start: usize, old_len: usize, new_start: usize, new_len: usize) -> Hunk {
+        Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+        }
+    }
+
+    #[test]
+    fn tracking_follows_shifts_and_detects_touches() {
+        // Lines 10-12. An edit above shifts the range without touching it.
+        assert_eq!(track(10..13, &[hunk(2, 1, 2, 3)]), (false, 12..15));
+        // Deletion above.
+        assert_eq!(track(10..13, &[hunk(2, 2, 1, 0)]), (false, 8..11));
+        // An edit below is unrelated.
+        assert_eq!(track(10..13, &[hunk(20, 1, 20, 1)]), (false, 10..13));
+        // Changing a discussed line.
+        assert_eq!(track(10..13, &[hunk(11, 1, 11, 1)]), (true, 10..13));
+        // Replacing the whole range with more lines widens it.
+        assert_eq!(track(10..13, &[hunk(10, 3, 10, 5)]), (true, 10..15));
+        // Inserting directly after the last line (a missing check) counts.
+        assert_eq!(track(10..13, &[hunk(12, 0, 13, 2)]), (true, 10..15));
+        // Inserting directly before the first line counts too.
+        assert_eq!(track(10..13, &[hunk(9, 0, 10, 1)]), (true, 10..14));
+        // Inserting further away does not.
+        assert_eq!(track(10..13, &[hunk(13, 0, 14, 1)]), (false, 10..13));
+        // Deleting the discussed lines keeps a one-line anchor.
+        let (touched, range) = track(10..13, &[hunk(10, 3, 9, 0)]);
+        assert!(touched);
+        assert_eq!(range.len(), 1);
+    }
+
+    #[test]
+    fn line_hunks_use_git_zero_context_coordinates() {
+        let base = "a\nb\nc\n";
+        assert_eq!(line_hunks(base, base), vec![]);
+        assert_eq!(line_hunks(base, "a\nx\nb\nc\n"), vec![hunk(1, 0, 2, 1)]);
+        assert_eq!(line_hunks(base, "a\nc\n"), vec![hunk(2, 1, 1, 0)]);
+        assert_eq!(line_hunks(base, "a\nB\nc\n"), vec![hunk(2, 1, 2, 1)]);
+        assert_eq!(line_hunks(base, "x\na\nb\nc\n"), vec![hunk(0, 0, 1, 1)]);
+        assert_eq!(line_hunks(base, ""), vec![hunk(1, 3, 0, 0)]);
+    }
+
+    /// Place line `line` of `source` in `local`: the placement and the
+    /// one-based local line the block's range starts on.
+    fn place(source: &str, local: &str, line: usize) -> (Placement, usize) {
+        let local = Rope::from(local);
+        let (range, placement) = LineMapper::new(source, &local)
+            .unwrap()
+            .place(line..line + 1);
+        assert!(range.end <= local.len_chars());
+        (placement, local.char_to_line(range.start) + 1)
+    }
+
+    #[test]
+    fn placement_follows_changed_code() {
+        let source =
+            "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n\nfn c() {\n    three();\n}\n";
+        // Unchanged, and shifted by an unsaved edit: exact.
+        assert_eq!(place(source, source, 6), (Placement::Exact, 6));
+        let shifted = format!("// new\n{source}");
+        assert_eq!(place(source, &shifted, 6), (Placement::Exact, 7));
+        // The discussed line itself changed.
+        let changed = source.replace("two();", "two(1);");
+        assert_eq!(place(source, &changed, 6), (Placement::Changed, 6));
+        // Only the context window changed.
+        let context = source.replace("fn b() {", "fn b(x: u8) {");
+        assert_eq!(place(source, &context, 6), (Placement::Changed, 6));
+        // The discussed line was deleted: shown at the remaining line above it.
+        let deleted = source.replace("    two();\n", "");
+        assert_eq!(place(source, &deleted, 6), (Placement::Changed, 5));
+        // A change combined with a shift.
+        let both = format!("x\ny\nz\n{changed}");
+        assert_eq!(place(source, &both, 6), (Placement::Changed, 9));
+        // Undoing the change restores the exact location.
+        assert_eq!(place(source, source, 10), (Placement::Exact, 10));
+        // Code the exact mapper rejects as ambiguous follows the diff.
+        let repeated = format!("{source}{source}");
+        assert_eq!(
+            place(&repeated, &format!("x\n{repeated}"), 17),
+            (Placement::Changed, 18)
+        );
+        // Short, empty and unterminated documents stay in bounds.
+        assert_eq!(place(source, "short\n", 10), (Placement::Changed, 1));
+        assert_eq!(place(source, "", 10), (Placement::Changed, 1));
+        assert_eq!(place(source, "fn a() {", 10).1, 1);
+        // Lines outside the snapshot keep the original number, clamped.
+        assert_eq!(place(source, &changed, 40), (Placement::Approximate, 11));
+        assert_eq!(place(source, source, 40), (Placement::Approximate, 11));
+    }
+
+    #[test]
+    fn ranges_and_anchors_in_short_and_empty_documents() {
+        let empty = Rope::from("");
+        assert_eq!(line_range(&empty, 3..4), 0..0);
+        assert_eq!(anchor(&empty, &(0..0)), 0);
+        let unterminated = Rope::from("a\nb");
+        assert_eq!(line_range(&unterminated, 5..6), 2..3);
+        assert_eq!(anchor(&unterminated, &(2..3)), 3);
+        let terminated = Rope::from("a\nb\n");
+        assert_eq!(line_range(&terminated, 9..10), 2..4);
+        assert_eq!(line_range(&terminated, 1..3), 0..4);
+        assert_eq!(anchor(&terminated, &(2..4)), 3);
+        let crlf = Rope::from("a\r\nb\r\n");
+        assert_eq!(line_range(&crlf, 1..2), 0..3);
+        assert_eq!(anchor(&crlf, &(0..3)), 1);
+    }
+
+    #[test]
+    fn block_titles_name_placement_and_github_state() {
+        let thread = Arc::new(Thread {
+            outdated: true,
+            comments: vec![Comment {
+                author: "a".into(),
+                body: "body".into(),
+            }],
+            ..Default::default()
+        });
+        let block = |placement| Block {
+            thread: thread.clone(),
+            range: 0..0,
+            anchor: 0,
+            expanded: false,
+            placement,
+        };
+        assert_eq!(
+            rows(&block(Placement::Changed), 200)[0],
+            "[+] @a · open · outdated · 1 comment(s) · code changed"
+        );
+        assert_eq!(
+            rows(&block(Placement::Exact), 200)[0],
+            "[+] @a · open · outdated · 1 comment(s)"
+        );
+        assert!(rows(&block(Placement::Approximate), 200)[0].ends_with("· approximate location"));
+    }
+
     #[tokio::test]
     async fn invalidation_cancels_pending_work() {
         let pending = tokio::spawn(std::future::pending::<()>());
@@ -623,7 +953,7 @@ mod tests {
         let summary = review.summary();
         assert!(summary.contains("3 discussion(s), 2 open"), "{summary}");
         assert!(
-            summary.contains("2 inline, 1 outdated/file-level"),
+            summary.contains("2 inline (0 outdated), 1 old-side/file-level"),
             "{summary}"
         );
         let empty = Review {

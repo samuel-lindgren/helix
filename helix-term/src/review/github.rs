@@ -491,6 +491,7 @@ fn parse_thread(value: &Value, comments: Vec<Value>) -> anyhow::Result<Thread> {
         lines,
         location,
         resolved: value["isResolved"].as_bool().unwrap_or(false),
+        outdated,
         diff: safe_text(
             first["diffHunk"]
                 .as_str()
@@ -781,6 +782,7 @@ async fn fetch_with(
             }
         }
     }
+    let originals = originals(transport.context, &threads, &mut content_bytes).await;
     let data = api(transport, "query($owner:String!,$repo:String!,$number:Int!) { repository(owner:$owner,name:$repo) { pullRequest(number:$number) { headRefOid updatedAt } } }", json!({"owner":owner,"repo":repo,"number":pull.number})).await?;
     let pr = &data["repository"]["pullRequest"];
     ensure!(
@@ -806,7 +808,60 @@ async fn fetch_with(
         head: revision,
         threads,
         sources,
+        originals,
     }))
+}
+
+/// File contents at the original commit of each outdated discussion, from the
+/// local repository only (commits and blobs are immutable). Missing commits,
+/// for example after a rebase, leave the discussion at its original line numbers.
+async fn originals(
+    context: &Context,
+    threads: &[Arc<Thread>],
+    content_bytes: &mut usize,
+) -> HashMap<(String, String), String> {
+    let mut originals = HashMap::new();
+    let mut visited = HashSet::new();
+    for thread in threads {
+        let (None, Some(_), Some(commit)) = (&thread.lines, &thread.original_lines, &thread.commit)
+        else {
+            continue;
+        };
+        let key = (commit.clone(), thread.path.clone());
+        if !valid_path(&thread.path) || !valid_oid(commit) || !visited.insert(key.clone()) {
+            continue;
+        }
+        let size = run(
+            &context.root,
+            "git",
+            &["cat-file", "-s", &format!("{commit}:{}", thread.path)],
+            None,
+        )
+        .await;
+        if !size.is_ok_and(|size| {
+            size.trim()
+                .parse::<usize>()
+                .is_ok_and(|n| n <= 2 * 1024 * 1024)
+        }) {
+            continue;
+        }
+        let Ok(text) = run(
+            &context.root,
+            "git",
+            &["cat-file", "blob", &format!("{commit}:{}", thread.path)],
+            None,
+        )
+        .await
+        else {
+            continue;
+        };
+        if *content_bytes + text.len() > LIMIT as usize {
+            break;
+        }
+        *content_bytes += text.len();
+        originals.insert(key, text);
+    }
+    originals
 }
 
 #[cfg(test)]
@@ -1132,6 +1187,61 @@ mod transport_tests {
             .unwrap_err()
             .to_string()
             .contains("PR changed"));
+    }
+
+    #[tokio::test]
+    async fn outdated_sources_come_from_local_history_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        sh(&["init", "--quiet", "--initial-branch=topic"]);
+        fs::write(dir.path().join("a.rs"), "one\ntwo\n").unwrap();
+        sh(&["add", "a.rs"]);
+        sh(&["commit", "--quiet", "-m", "reviewed"]);
+        let sha = sh(&["rev-parse", "HEAD"]);
+        let context = Context {
+            root: dir.path().into(),
+            git_dir: dir.path().join(".git"),
+            branch: "topic".into(),
+            head: sha.clone(),
+            config: vec![],
+        };
+        let thread = |path: &str, lines, commit: &str| {
+            Arc::new(Thread {
+                path: path.into(),
+                lines,
+                original_lines: Some(1..2),
+                commit: Some(commit.into()),
+                outdated: true,
+                ..Default::default()
+            })
+        };
+        let threads = [
+            thread("a.rs", None, &sha),
+            thread("a.rs", None, &sha),
+            thread("a.rs", None, "0123abcd"),
+            thread("missing.rs", None, &sha),
+            thread("../a.rs", None, &sha),
+            thread("a.rs", Some(1..2), &sha),
+        ];
+        let mut bytes = 0;
+        let originals = originals(&context, &threads, &mut bytes).await;
+        assert_eq!(originals.len(), 1);
+        assert_eq!(originals[&(sha, "a.rs".to_owned())], "one\ntwo\n");
+        assert_eq!(bytes, 8);
     }
 
     /// Records every request; answers mutations and the single-thread reload.

@@ -100,6 +100,7 @@ mod tests {
             range: 0..17,
             anchor: 16,
             expanded,
+            placement: Default::default(),
         };
         let mut blocks = vec![block.clone()];
         if extra_block {
@@ -179,6 +180,71 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// A discussion placed in an empty or unterminated document is anchored at
+    /// EOF and still drawn, with its placement label.
+    #[test]
+    fn eof_anchors_in_empty_and_unterminated_documents_are_drawn() {
+        for (source, anchor) in [("", 0), ("code", 4)] {
+            let text = Rope::from(source);
+            let thread = Arc::new(Thread {
+                comments: vec![Comment {
+                    author: "reviewer".into(),
+                    body: "still here".into(),
+                }],
+                ..Default::default()
+            });
+            let blocks = vec![Block {
+                thread,
+                range: 0..text.len_chars(),
+                anchor,
+                expanded: false,
+                placement: helix_view::review::Placement::Approximate,
+            }];
+            let format = TextFormat {
+                viewport_width: 60,
+                ..TextFormat::default()
+            };
+            let mut annotations = TextAnnotations::default();
+            annotations.add_line_annotation(Box::new(Layout::new(&blocks, 60)));
+            let doc = Document::from(
+                text.clone(),
+                None,
+                Arc::new(ArcSwap::from_pointee(Config::default())),
+                Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+            );
+            let theme = Theme::default();
+            let area = Rect::new(0, 0, 60, 6);
+            let mut buffer = Buffer::empty(area);
+            let mut renderer =
+                TextRenderer::new(&mut buffer, &doc, &theme, Position::new(0, 0), area);
+            let mut decorations = DecorationManager::default();
+            decorations.add_decoration(Reviews::new(&blocks, 60, &theme));
+            render_text(
+                &mut renderer,
+                text.slice(..),
+                0,
+                &format,
+                &annotations,
+                None,
+                vec![],
+                &theme,
+                decorations,
+            );
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol.as_str())
+                        .collect()
+                })
+                .collect();
+            assert!(
+                rows[1].contains("[+] @reviewer") && rows[1].contains("approximate location"),
+                "{rows:?}"
+            );
+            assert!(rows[2].contains("still here"), "{rows:?}");
+        }
     }
 
     #[test]
