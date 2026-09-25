@@ -82,6 +82,20 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> AsyncHook
                     Ok(syntax) => syntax,
                     Err(err) => {
                         log::info!("highlighting picker preview failed: {err}");
+                        // Show plain text instead of retrying on every render,
+                        // e.g. when the language's grammar is not installed.
+                        job::dispatch_blocking(move |_, compositor| {
+                            if let Some(Overlay {
+                                content: picker, ..
+                            }) = compositor.find::<Overlay<Picker<T, D>>>()
+                            {
+                                if let Some(CachedPreview::Document(ref mut doc)) =
+                                    picker.preview_cache.get_mut(&path)
+                                {
+                                    doc.language = None;
+                                }
+                            }
+                        });
                         return;
                     }
                 };
