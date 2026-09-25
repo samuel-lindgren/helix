@@ -26,6 +26,9 @@ pub struct Draft {
     pub snapshot: Snapshot,
     /// A commit is running; another `:w` must not start a second one.
     pub committing: bool,
+    /// Changes on every commit attempt and update, so that a slower
+    /// background update cannot replace newer content.
+    pub revision: u64,
 }
 
 /// A running write operation (staging, commit or push) in one repository.

@@ -36,31 +36,41 @@ impl Output {
     }
 }
 
-/// A child's process group, terminated when dropped before the child was
-/// waited for. Never signalled after waiting, when its id may be reused.
-struct Group(Option<u32>);
-
-impl Group {
+/// Signal the process group led by `pid` (the child leads its own session).
+fn signal(pid: Option<u32>, _signal: i32) {
     #[cfg(unix)]
-    fn signal(&self, signal: i32) {
-        if let Some(pid) = self.0.and_then(|pid| i32::try_from(pid).ok()) {
-            // The child leads its own session and process group.
-            unsafe { libc::kill(-pid, signal) };
-        }
-    }
-    fn terminate(&self) {
-        #[cfg(unix)]
-        self.signal(libc::SIGTERM);
-    }
-    fn kill(&self) {
-        #[cfg(unix)]
-        self.signal(libc::SIGKILL);
+    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+        unsafe { libc::kill(-pid, _signal) };
     }
 }
 
+#[cfg(unix)]
+const SIGTERM: i32 = libc::SIGTERM;
+#[cfg(unix)]
+const SIGKILL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+const SIGTERM: i32 = 15;
+#[cfg(not(unix))]
+const SIGKILL: i32 = 9;
+
+/// A child's process group, terminated when dropped before the child was
+/// waited for. Never signalled after waiting: only an unreaped leader keeps
+/// the group id from being reused.
+struct Group(Option<u32>);
+
 impl Drop for Group {
+    /// A cancelled run: SIGTERM first so that Git can remove its locks, then
+    /// SIGKILL after two seconds for whatever ignores it (e.g. a hook that
+    /// traps SIGTERM).
     fn drop(&mut self) {
-        self.terminate();
+        let pid = self.0.take();
+        if pid.is_some() {
+            signal(pid, SIGTERM);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                signal(pid, SIGKILL);
+            });
+        }
     }
 }
 
@@ -155,12 +165,12 @@ pub(crate) async fn output(
     })
     .await;
     let Ok(result) = result else {
-        group.terminate();
+        signal(group.0, SIGTERM);
         if tokio::time::timeout(Duration::from_secs(2), child.wait())
             .await
             .is_err()
         {
-            group.kill();
+            signal(group.0, SIGKILL);
         }
         group.0 = None;
         bail!("{program} timed out after {}s", timeout.as_secs());
@@ -262,6 +272,23 @@ mod tests {
         .unwrap();
         assert!(!out.success);
         assert!(!String::from_utf8_lossy(&out.stdout).contains("tty"));
+    }
+
+    /// Cancelling a run (dropping it) terminates the child and everything it
+    /// started, also when they ignore SIGTERM.
+    #[tokio::test]
+    async fn cancellation_kills_what_ignores_sigterm() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let script = format!("trap '' TERM; sleep 4; touch '{}'", marker.display());
+        let root = dir.path().to_owned();
+        let run = tokio::spawn(async move {
+            output(&root, "sh", &["-c", &script], None, Duration::from_secs(60)).await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        run.abort();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!marker.exists());
     }
 
     /// A timeout terminates the child and everything it started.

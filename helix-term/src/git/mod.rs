@@ -65,12 +65,11 @@ pub(crate) fn current_repo(editor: &Editor) -> Result<Repo, String> {
     repo_at(&path).ok_or_else(|| missing_context(&path).replacen("Reviews: ", "Git: ", 1))
 }
 
-/// Repository-relative key of `path`, also for files not yet on disk.
+/// Repository-relative key of `path` as Git names it: directories are
+/// resolved, the file itself is not (it may be a tracked symlink, or not yet
+/// on disk).
 pub(crate) fn relative(root: &Path, path: &Path) -> Option<String> {
-    let real = match canonical(path) {
-        Ok(real) => real,
-        Err(_) => canonical(path.parent()?).ok()?.join(path.file_name()?),
-    };
+    let real = canonical(path.parent()?).ok()?.join(path.file_name()?);
     relative_key(real.strip_prefix(root).ok()?)
 }
 
@@ -738,6 +737,7 @@ fn open_draft(editor: &mut Editor, root: PathBuf, branch: String, prepared: Prep
             branch: branch.clone(),
             snapshot: prepared.snapshot,
             committing: false,
+            revision: 0,
         },
     );
     editor.set_status(format!(
@@ -797,9 +797,9 @@ fn refresh_drafts(editor: &mut Editor, root: &Path) {
         .drafts
         .iter()
         .filter(|(_, d)| d.root == root && !d.committing)
-        .map(|(&id, _)| id)
+        .map(|(&id, d)| (id, d.revision))
         .collect();
-    for id in drafts {
+    for (id, revision) in drafts {
         let root = root.to_owned();
         let unsaved = unsaved.clone();
         tokio::spawn(async move {
@@ -808,9 +808,11 @@ fn refresh_drafts(editor: &mut Editor, root: &Path) {
             };
             job::dispatch(move |editor, _| {
                 if let Some(draft) = editor.git.drafts.get_mut(&id) {
-                    if draft.committing {
+                    // A commit attempt or another update came first.
+                    if draft.committing || draft.revision != revision {
                         return;
                     }
+                    draft.revision += 1;
                     draft.snapshot = prepared.snapshot;
                     replace_context(editor, id, &prepared.context);
                 }
@@ -950,6 +952,7 @@ pub(crate) fn send(editor: &mut Editor, force: bool) {
     }
     if let Some(draft) = editor.git.drafts.get_mut(&id) {
         draft.committing = true;
+        draft.revision += 1;
     }
     editor.set_status(format!("Committing on {}…", draft.branch));
     let root = draft.root.clone();
@@ -986,6 +989,7 @@ fn finish_commit(
     }
     let update = |editor: &mut Editor, prepared: Prepared| {
         if let Some(draft) = editor.git.drafts.get_mut(&id) {
+            draft.revision += 1;
             draft.snapshot = prepared.snapshot;
             replace_context(editor, id, &prepared.context);
         }
@@ -1402,6 +1406,26 @@ mod editor_tests {
             .contains("#\tmodified:   b.txt"));
     }
 
+    /// Paths are named as Git names them: a tracked symlink is not resolved.
+    #[test]
+    fn relative_paths_keep_file_symlinks() {
+        let (_dir, root) = fixture(true);
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("target.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("target.txt"), root.join("link.txt"))
+            .unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        assert_eq!(
+            relative(&root, &root.join("link.txt")).as_deref(),
+            Some("link.txt")
+        );
+        assert_eq!(
+            relative(&root, &root.join("dir/new.txt")).as_deref(),
+            Some("dir/new.txt")
+        );
+        assert_eq!(relative(&root, &outside.path().join("target.txt")), None);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn unstaging_before_the_first_commit() {
         let (_dir, root) = fixture(false);
@@ -1446,7 +1470,11 @@ mod editor_tests {
         match script {
             Some(script) => {
                 let status = std::process::Command::new("sh")
-                    .args(["-c", "printf '%s\\n' \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+                    .args([
+                        "-c",
+                        "printf '%s\\n' \"$1\" > \"$2\" && chmod 755 \"$2\"",
+                        "sh",
+                    ])
                     .arg(format!("#!/bin/sh\n{script}"))
                     .arg(&path)
                     .status()

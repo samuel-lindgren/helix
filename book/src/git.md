@@ -120,14 +120,14 @@ history editing and conflict resolution are not part of this workflow.
 
 Git runs with fixed argument lists and literal pathspecs (never through a
 shell), in the repository root, without `GIT_DIR`-style overrides from the
-editor's environment. It runs in its own session without a terminal and with
-`GIT_TERMINAL_PROMPT=0`, so it cannot draw a prompt over the editor. Operations
+editor's environment. It runs with `GIT_TERMINAL_PROMPT=0` and, on Unix, in its
+own session without a terminal, so it cannot draw a prompt over the editor. Operations
 that would need a password, passphrase or PIN entry on the terminal fail with
 Git's message instead; use a credential helper, an SSH agent, or a graphical or
 cached pinentry for signing. Status, diffs and staging time out after 30 seconds,
 commits after 10 minutes. A timeout or `:git-cancel` terminates Git and the
 processes it started (hooks, SSH) with `SIGTERM`, which lets Git remove its lock
-files.
+files, and with `SIGKILL` two seconds later if they are still running.
 
 ## Development checks
 
