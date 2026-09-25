@@ -5,7 +5,10 @@
 //! action; opening views, navigating and saving files never do. A commit is
 //! created only while the branch, HEAD and the index still match the draft
 //! that shows them.
+mod push;
 pub(crate) mod status;
+
+pub(crate) use push::push;
 
 use crate::{
     alt, compositor, job, process,
@@ -327,7 +330,7 @@ fn show(
         },
     );
     editor.set_status(format!(
-        "{} · {counts} · Alt-s stage · Alt-a stage whole file · Alt-u unstage · Alt-c commit",
+        "{} · {counts} · Alt-s stage · Alt-a stage whole file · Alt-u unstage · Alt-c commit · Alt-p push",
         branch_line(&loaded.status)
     ));
     if loaded.rows.is_empty() {
@@ -413,6 +416,10 @@ fn show(
     .with_key_action(alt!('u'), action(IndexAction::Unstage))
     .with_key_action(alt!('c'), |cx, _| {
         commit(cx.editor);
+        true
+    })
+    .with_key_action(alt!('p'), |cx, _| {
+        push(cx);
         true
     });
     compositor.push(Box::new(overlaid(picker)));
@@ -534,6 +541,7 @@ async fn prepare(
     root: &Path,
     unsaved: &[String],
     failure: Option<&str>,
+    discussion: Option<&str>,
 ) -> anyhow::Result<Prepared> {
     let head = head(root).await?;
     let tree = git_text(root, &["write-tree"])
@@ -602,6 +610,12 @@ async fn prepare(
     match &subject {
         Some(subject) => text.push_str(&format!("# HEAD {}\n", safe_text(subject))),
         None => text.push_str("# No commits yet\n"),
+    }
+    if let Some(discussion) = discussion {
+        text.push_str(&format!(
+            "# Review discussion {}: after :git-push, :review-fixed replies with this commit\n",
+            safe_text(discussion)
+        ));
     }
     text.push_str("#\n");
     if staged.is_empty() {
@@ -701,18 +715,25 @@ pub(crate) fn commit(editor: &mut Editor) {
         .into_iter()
         .map(|(path, _)| path)
         .collect();
+    let discussion = crate::review::selected_label(editor, &repo.root, &branch);
     editor.set_status("Preparing commit draft…");
     tokio::spawn(async move {
-        let prepared = prepare(&repo.root, &unsaved, None).await;
+        let prepared = prepare(&repo.root, &unsaved, None, discussion.as_deref()).await;
         job::dispatch(move |editor, _| match prepared {
-            Ok(prepared) => open_draft(editor, repo.root, branch, prepared),
+            Ok(prepared) => open_draft(editor, repo.root, branch, discussion, prepared),
             Err(err) => editor.set_error(safe_text(&format!("{err:#}"))),
         })
         .await;
     });
 }
 
-fn open_draft(editor: &mut Editor, root: PathBuf, branch: String, prepared: Prepared) {
+fn open_draft(
+    editor: &mut Editor,
+    root: PathBuf,
+    branch: String,
+    discussion: Option<String>,
+    prepared: Prepared,
+) {
     if let Some((&id, _)) = editor.git.drafts.iter().find(|(_, d)| d.root == root) {
         editor.switch(id, Action::Replace);
         return;
@@ -738,6 +759,7 @@ fn open_draft(editor: &mut Editor, root: PathBuf, branch: String, prepared: Prep
             snapshot: prepared.snapshot,
             committing: false,
             revision: 0,
+            discussion,
         },
     );
     editor.set_status(format!(
@@ -797,13 +819,13 @@ fn refresh_drafts(editor: &mut Editor, root: &Path) {
         .drafts
         .iter()
         .filter(|(_, d)| d.root == root && !d.committing)
-        .map(|(&id, d)| (id, d.revision))
+        .map(|(&id, d)| (id, d.revision, d.discussion.clone()))
         .collect();
-    for (id, revision) in drafts {
+    for (id, revision, discussion) in drafts {
         let root = root.to_owned();
         let unsaved = unsaved.clone();
         tokio::spawn(async move {
-            let Ok(prepared) = prepare(&root, &unsaved, None).await else {
+            let Ok(prepared) = prepare(&root, &unsaved, None, discussion.as_deref()).await else {
                 return;
             };
             job::dispatch(move |editor, _| {
@@ -852,7 +874,10 @@ async fn create_commit(
             draft.branch
         )));
     }
-    let prepared = prepare(root, unsaved, None).await.map_err(Failure::Other)?;
+    let discussion = draft.discussion.as_deref();
+    let prepared = prepare(root, unsaved, None, discussion)
+        .await
+        .map_err(Failure::Other)?;
     if prepared.snapshot.head != draft.snapshot.head
         || prepared.snapshot.tree != draft.snapshot.tree
     {
@@ -873,7 +898,7 @@ async fn create_commit(
     .map_err(Failure::Other)?;
     if !out.success {
         let text = out.message();
-        let prepared = prepare(root, unsaved, Some(&text)).await.ok();
+        let prepared = prepare(root, unsaved, Some(&text), discussion).await.ok();
         return Err(Failure::Refused(text, prepared));
     }
     let info = git_text(
@@ -1014,11 +1039,17 @@ fn finish_commit(
                 format!(" · note: {}", committed.warnings.join("; "))
             };
             let status = format!(
-                "Committed {} {} on {} · local only, not pushed{warnings}",
+                "Committed {} {} on {} · local only, not pushed: :git-push{warnings}",
                 &committed.oid[..committed.oid.len().min(10)],
                 committed.subject,
                 draft.branch,
             );
+            // The new HEAD reloads a displayed review of this branch; keep this
+            // message instead of the review summary.
+            if editor.review.enabled {
+                editor.review.after_load =
+                    Some((draft.root.clone(), draft.branch.clone(), status.clone()));
+            }
             if committed.warnings.is_empty() {
                 editor.set_status(status);
             } else {
@@ -1142,23 +1173,23 @@ mod editor_tests {
         while !done(editor, compositor) {
             let callback = tokio::time::timeout(Duration::from_secs(20), jobs.callbacks.recv())
                 .await
-                .expect("a job result")
+                .unwrap_or_else(|_| panic!("no job result; status: {:?}", status_text(editor)))
                 .unwrap();
             jobs.handle_callback(editor, compositor, Ok(Some(callback)));
         }
     }
 
-    fn has_picker(compositor: &mut Compositor) -> bool {
+    pub(crate) fn has_picker(compositor: &mut Compositor) -> bool {
         compositor
             .find::<crate::ui::overlay::Overlay<Picker<Row, View>>>()
             .is_some()
     }
 
-    fn committed(editor: &Editor) -> bool {
+    pub(crate) fn committed(editor: &Editor) -> bool {
         editor.git.drafts.values().all(|d| !d.committing)
     }
 
-    fn status_text(editor: &Editor) -> String {
+    pub(crate) fn status_text(editor: &Editor) -> String {
         editor
             .get_status()
             .map(|(text, _)| text.to_string())
@@ -1166,7 +1197,7 @@ mod editor_tests {
     }
 
     #[track_caller]
-    fn expect(editor: &Editor, text: &str) {
+    pub(crate) fn expect(editor: &Editor, text: &str) {
         let status = status_text(editor);
         assert!(status.contains(text), "expected {text:?} in {status:?}");
     }
@@ -1456,7 +1487,7 @@ mod editor_tests {
         assert!(root.join("a.txt").exists());
     }
 
-    fn type_message(editor: &mut Editor, message: &str) {
+    pub(crate) fn type_message(editor: &mut Editor, message: &str) {
         let (view, doc) = current!(editor);
         let change = Transaction::change(doc.text(), [(0, 0, Some(message.into()))].into_iter());
         doc.apply(&change, view.id);
@@ -1465,7 +1496,7 @@ mod editor_tests {
     /// Install or remove a pre-commit hook. A child process writes it: an
     /// executable written by this multi-threaded process could be held open by
     /// a concurrently forked child and fail with "Text file busy".
-    fn hook(root: &Path, script: Option<&str>) {
+    pub(crate) fn hook(root: &Path, script: Option<&str>) {
         let path = root.join(".git/hooks/pre-commit");
         match script {
             Some(script) => {
@@ -1487,7 +1518,7 @@ mod editor_tests {
         }
     }
 
-    async fn open(
+    pub(crate) async fn open(
         editor: &mut Editor,
         jobs: &mut job::Jobs,
         compositor: &mut Compositor,

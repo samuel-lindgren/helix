@@ -95,6 +95,8 @@ pub struct Review {
     /// File contents at an outdated discussion's original commit, by
     /// `(commit, path)`, read from the local repository when available.
     pub originals: HashMap<(String, String), String>,
+    /// The PR's head repository (`owner/repo`) when discovered from the branch.
+    pub head_repo: Option<String>,
 }
 
 impl Review {
@@ -189,6 +191,12 @@ pub struct State {
     pub failed: bool,
     /// Reply drafts by scratch document. Survive refreshes and context changes.
     pub compose: HashMap<crate::DocumentId, Compose>,
+    /// The last selected discussion as (repository root, branch, thread id).
+    /// Survives the reload after a commit or push on the same branch.
+    pub remembered: Option<(PathBuf, String, String)>,
+    /// A status message for the next load in (repository root, branch),
+    /// shown instead of the summary: the result of the Git action that caused it.
+    pub after_load: Option<(PathBuf, String, String)>,
 }
 
 impl State {

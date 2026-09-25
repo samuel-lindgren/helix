@@ -7,7 +7,7 @@
   - [Building from source](./building-from-source.md)
 - [Usage](./usage.md)
   - [GitHub review comments](./github-reviews.md)
-  - [Git status and commits](./git.md)
+  - [Git status, commits and push](./git.md)
   - [Registers](./registers.md)
   - [Surround](./surround.md)
   - [Textobjects](./textobjects.md)

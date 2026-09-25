@@ -111,7 +111,8 @@ pub(super) fn valid_path(path: &str) -> bool {
             .all(|p| matches!(p, Component::Normal(_)))
 }
 
-fn repository(url: &str) -> Option<String> {
+/// `owner/repo` of a github.com remote URL.
+pub(crate) fn repository(url: &str) -> Option<String> {
     let path = if let Some(path) = url.strip_prefix("git@github.com:") {
         path.to_owned()
     } else {
@@ -158,6 +159,8 @@ struct Pull {
     repo: String,
     number: u64,
     url: String,
+    /// Head repository, when discovered from the branch.
+    head_repo: Option<String>,
 }
 
 const DISCOVER: &str = r#"query($owner:String!,$repo:String!,$branch:String!,$after:String) {
@@ -260,6 +263,7 @@ async fn find_pulls(
                             .as_u64()
                             .ok_or_else(|| anyhow!("Missing PR number"))?,
                         url: safe_text(string(pr, "url")?),
+                        head_repo: Some(head_repo.to_owned()),
                     });
                 }
             }
@@ -494,14 +498,14 @@ async fn thread_comments(transport: &Transport<'_>, raw: &Value) -> anyhow::Resu
 /// The current PR head, fetched fresh for every write-side check: a push after
 /// the review loaded must count.
 #[derive(Clone, Debug)]
-pub(super) struct PullHead {
+pub(crate) struct PullHead {
     pub oid: String,
     /// `owner/repo:branch`, for messages.
     pub name: String,
     pub base: Option<String>,
 }
 
-pub(super) async fn pull_head(
+pub(crate) async fn pull_head(
     context: &Context,
     repo: &str,
     number: u64,
@@ -604,9 +608,12 @@ async fn set_resolved_with(
         .ok_or_else(|| anyhow!("{action} failed: GitHub returned no thread state"))
 }
 
-/// Unit tests substitute a recording fake for the GitHub CLI program.
+/// Unit tests substitute a recording fake for the GitHub CLI program. Tests
+/// that set it hold `TEST_GH_LOCK` until they finish.
 #[cfg(test)]
-pub(super) static TEST_GH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(crate) static TEST_GH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) static TEST_GH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn gh() -> String {
     #[cfg(test)]
@@ -639,6 +646,7 @@ async fn fetch_with(
             repo: repo.into(),
             number: number.parse()?,
             url: String::new(),
+            head_repo: None,
         }
     } else if let Some(pull) = discover(transport).await? {
         pull
@@ -751,6 +759,7 @@ async fn fetch_with(
         threads,
         sources,
         originals,
+        head_repo: pull.head_repo,
     }))
 }
 
@@ -816,6 +825,7 @@ mod tests {
             repo: "o/r".into(),
             number: 1,
             url: "https://github.com/o/r/pull/1".into(),
+            head_repo: None,
         };
         assert_eq!(unique_pull(vec![pull.clone()]).unwrap().unwrap().number, 1);
         assert!(unique_pull(vec![pull.clone(), pull])

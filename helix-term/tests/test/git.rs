@@ -1,5 +1,6 @@
 //! The Git flow driven by keys in a temporary repository: edit and save,
-//! `:git-status`, stage with `Alt-s`, `Alt-c` for the draft, `:w` commits.
+//! `:git-status`, stage with `Alt-s`, `Alt-c` for the draft, `:w` commits,
+//! `:git-push` and `Enter` push to a local remote.
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -87,6 +88,9 @@ impl Keys {
                 "timed out waiting for {what}; status: {:?}",
                 app.editor.get_status()
             );
+            // Background results are not input events: re-arm the idle timer
+            // so that the loop returns even if none arrives.
+            app.editor.reset_idle_timer();
             app.event_loop_until_idle(&mut self.rx).await;
         }
     }
@@ -100,9 +104,15 @@ pub fn status(app: &Application) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stage_and_commit_by_keyboard() -> anyhow::Result<()> {
+async fn stage_commit_and_push_by_keyboard() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let root = repository(&dir.path().canonicalize()?);
+    let bare = root.parent().unwrap().join("remote.git");
+    git(
+        root.parent().unwrap(),
+        &["init", "--quiet", "--bare", "remote.git"],
+    );
+    git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
     let mut app = AppBuilder::new()
         .with_file(root.join("a.txt"), None)
         .build()?;
@@ -137,6 +147,26 @@ async fn stage_and_commit_by_keyboard() -> anyhow::Result<()> {
         "fix: greet politely"
     );
     assert_eq!(git(&root, &["status", "--porcelain"]), "");
+
+    keys.send(&mut app, ":git-push<ret>").await?;
+    keys.until(&mut app, "the push picker", |app| {
+        status(app).starts_with("Push topic at ")
+    })
+    .await;
+    keys.send(&mut app, "<ret>").await?;
+    keys.until(&mut app, "the push", |app| {
+        status(app).starts_with("Pushed ")
+    })
+    .await;
+    assert!(
+        status(&app).ends_with("to origin/topic (upstream set)"),
+        "{}",
+        status(&app)
+    );
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/heads/topic"]),
+        git(&root, &["rev-parse", "HEAD"])
+    );
 
     keys.send(&mut app, ":q!<ret>").await?;
     let errors = app.close().await;
