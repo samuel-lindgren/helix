@@ -15,10 +15,11 @@ use crate::{
 use helix_core::{Rope, Selection, Transaction};
 use helix_view::{
     editor::Action,
-    review::{self, safe_text, Block, Context, DocumentReview},
+    review::{self, safe_text, Block, Context, DocumentReview, Placement},
     Editor,
 };
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -213,6 +214,12 @@ fn attach_documents(editor: &mut Editor) {
     };
     let generation = editor.review.generation;
     let expanded = editor.review.expanded.clone();
+    let paths: HashSet<&str> = review
+        .threads
+        .iter()
+        .filter(|t| t.placeable())
+        .map(|t| t.path.as_str())
+        .collect();
     for doc in editor.documents_mut() {
         let Some(path) = doc.path().cloned() else {
             continue;
@@ -243,15 +250,14 @@ fn attach_documents(editor: &mut Editor) {
         let Ok(relative) = real.strip_prefix(&context.root) else {
             continue;
         };
-        let Some(relative) = relative_key(relative).filter(|p| review.sources.contains_key(p))
-        else {
+        let Some(relative) = relative_key(relative).filter(|p| paths.contains(p.as_str())) else {
             continue;
         };
         let doc_id = doc.id();
         let version = doc.version();
         let text = doc.text().clone();
         let context = context.clone();
-        let review = review.clone();
+        let review = Arc::clone(&review);
         let expanded = expanded.clone();
         // Coalesce typing before doing CPU work. Dropping DocumentReview aborts
         // the debounce and callback; submitted mappers finish on their snapshots.
@@ -311,45 +317,78 @@ fn attach_documents(editor: &mut Editor) {
     }
 }
 
+/// Place the file's discussions in `text`. Each discussion is mapped from the
+/// snapshot its lines belong to: the PR head, or the original commit of an
+/// outdated discussion. Without a snapshot, the original line numbers are used.
 fn map_blocks(
     review: &review::Review,
     relative: &str,
     text: &Rope,
-    expanded: &std::collections::HashSet<String>,
+    expanded: &HashSet<String>,
 ) -> Vec<Block> {
-    let Some(source) = review.sources.get(relative) else {
-        return Vec::new();
-    };
-    let Some(mapper) = review::LineMapper::new(source, text) else {
-        return Vec::new();
-    };
+    let mut mappers: HashMap<Option<&str>, Option<review::LineMapper>> = HashMap::new();
     let mut blocks = Vec::new();
     for thread in &review.threads {
         if !github::valid_path(&thread.path) || relative != thread.path {
             continue;
         }
-        let Some(lines) = thread.lines.clone() else {
-            continue;
+        let (snapshot, lines) = match (&thread.lines, &thread.original_lines) {
+            (Some(lines), _) => (None, lines.clone()),
+            (None, Some(lines)) => match thread.commit.as_deref() {
+                Some(commit) => (Some(commit), lines.clone()),
+                None => {
+                    let range = review::line_range(text, lines.clone());
+                    blocks.push(block(thread, text, range, Placement::Approximate, expanded));
+                    continue;
+                }
+            },
+            (None, None) => continue,
         };
-        let Some(range) = mapper.map(lines) else {
-            continue;
+        let source = match snapshot {
+            None => review.sources.get(relative),
+            Some(commit) => review
+                .originals
+                .get(&(commit.to_owned(), relative.to_owned())),
         };
-        let mut anchor = range.end.saturating_sub(1);
-        if anchor > 0 && text.char(anchor) == '\n' && text.char(anchor - 1) == '\r' {
-            anchor -= 1;
-        }
-        if range.end == text.len_chars() && text.char(anchor) != '\n' && text.char(anchor) != '\r' {
-            anchor = range.end;
-        }
-        blocks.push(Block {
-            thread: thread.clone(),
-            range,
-            anchor,
-            expanded: expanded.contains(&thread.id),
-        });
+        let mapper = match source {
+            Some(source) => mappers
+                .entry(snapshot)
+                .or_insert_with(|| review::LineMapper::new(source, text))
+                .as_ref(),
+            None => None,
+        };
+        let (range, placement) = match mapper {
+            Some(mapper) => mapper.place(lines),
+            None => (review::line_range(text, lines), Placement::Approximate),
+        };
+        blocks.push(block(thread, text, range, placement, expanded));
     }
     blocks.sort_by_key(|b| b.anchor);
     blocks
+}
+
+fn block(
+    thread: &Arc<review::Thread>,
+    text: &Rope,
+    range: std::ops::Range<usize>,
+    placement: Placement,
+    expanded: &HashSet<String>,
+) -> Block {
+    Block {
+        thread: thread.clone(),
+        anchor: review::anchor(text, &range),
+        range,
+        expanded: expanded.contains(&thread.id),
+        placement,
+    }
+}
+
+/// `" · label"` for a placement that needs one.
+fn placement_note(placement: Placement) -> String {
+    match placement.label() {
+        "" => String::new(),
+        label => format!(" · {label}"),
+    }
 }
 
 pub(crate) fn toggle(cx: &mut compositor::Context) {
@@ -472,7 +511,8 @@ fn select(editor: &mut Editor, index: usize) {
     let Some(context) = editor.review.context.as_ref() else {
         return;
     };
-    if github::valid_path(&thread.path) {
+    // Old-side and file-level discussions have no place on the code.
+    if thread.placeable() && github::valid_path(&thread.path) {
         let path = context.root.join(&thread.path);
         // Remote paths are never opened without canonical containment checks.
         if canonical(&path).is_ok_and(|p| p.starts_with(&context.root) && p == path)
@@ -529,14 +569,21 @@ fn finish_selection(editor: &mut Editor, index: usize) {
         return;
     };
     let (view, doc) = current!(editor);
-    if let Some(block) = doc.review.blocks.iter().find(|b| b.thread.id == thread.id) {
+    let found = doc
+        .review
+        .blocks
+        .iter()
+        .find(|b| b.thread.id == thread.id)
+        .map(|b| (b.anchor, b.placement));
+    if let Some((anchor, placement)) = found {
         doc.set_selection(
             view.id,
-            Selection::point(block.anchor.min(doc.text().len_chars())),
+            Selection::point(anchor.min(doc.text().len_chars())),
         );
         helix_view::align_view(doc, view, helix_view::Align::Top);
+        let note = placement_note(placement);
         editor.set_status(format!(
-            "Review {}/{} · {} · :review-expand / :review-open",
+            "Review {}/{} · {}{note} · :review-expand / :review-open",
             index + 1,
             review.threads.len(),
             thread.title()
@@ -554,18 +601,24 @@ fn open_thread(editor: &mut Editor, index: usize) {
     let Some(thread) = review.threads.get(index) else {
         return;
     };
-    let mapped = editor
-        .documents
-        .values()
-        .any(|d| d.review.blocks.iter().any(|b| b.thread.id == thread.id));
+    let placement = editor.documents.values().find_map(|d| {
+        d.review
+            .blocks
+            .iter()
+            .find(|b| b.thread.id == thread.id)
+            .map(|b| b.placement)
+    });
     let text = format!(
         "{}\n{}\n{}\n{}\n\n{}\n\nOriginal diff context:\n{}\n\n{}\n",
         review.label,
         thread.location,
-        if mapped {
-            "Location mapped to current document"
-        } else {
-            "Location unavailable in current document; original context only"
+        match placement {
+            Some(Placement::Exact) => "Location mapped to current document",
+            Some(Placement::Changed) =>
+                "Location mapped to current document; the code changed since the review",
+            Some(Placement::Approximate) =>
+                "Approximate location in current document (original line number)",
+            None => "Location unavailable in current document; original context only",
         },
         thread.title(),
         thread.conversation(),
@@ -616,6 +669,8 @@ struct ListEntry {
     thread: Arc<review::Thread>,
     /// Local file for previews, only when safely inside the repository.
     path: Option<PathBuf>,
+    /// Placement and zero-based first/last line in the local file when listed.
+    placement: Option<(Placement, usize, usize)>,
 }
 
 fn list_entries(review: &review::Review, root: Option<&Path>) -> Vec<ListEntry> {
@@ -630,12 +685,64 @@ fn list_entries(review: &review::Review, root: Option<&Path>) -> Vec<ListEntry> 
                 .filter(|_| github::valid_path(&thread.path))
                 .map(|root| root.join(&thread.path))
                 .filter(|path| canonical(path).is_ok_and(|p| &p == path) && path.is_file()),
+            placement: None,
         })
         .collect()
 }
 
+/// Current text of open buffers by repository-relative path.
+fn open_texts(editor: &Editor, root: &Path) -> HashMap<String, Rope> {
+    editor
+        .documents()
+        .filter_map(|doc| {
+            let real = canonical(doc.path()?).ok()?;
+            let relative = relative_key(real.strip_prefix(root).ok()?)?;
+            Some((relative, doc.text().clone()))
+        })
+        .collect()
+}
+
+/// Place listed discussions in open buffers, or else in their files on disk,
+/// exactly as inline blocks would be placed.
+fn place_entries(
+    review: &review::Review,
+    entries: &mut [ListEntry],
+    texts: &HashMap<String, Rope>,
+) {
+    let index: HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.thread.id.clone(), i))
+        .collect();
+    let mut visited = HashSet::new();
+    for i in 0..entries.len() {
+        let (thread, path) = (&entries[i].thread, &entries[i].path);
+        let Some(path) = path.as_ref().filter(|_| thread.placeable()) else {
+            continue;
+        };
+        let relative = thread.path.clone();
+        if !visited.insert(relative.clone()) {
+            continue;
+        }
+        let Some(text) = texts.get(&relative).cloned().or_else(|| {
+            String::from_utf8(read_small(path)?)
+                .ok()
+                .map(|text| Rope::from(text.as_str()))
+        }) else {
+            continue;
+        };
+        for block in map_blocks(review, &relative, &text, &HashSet::new()) {
+            let start = text.char_to_line(block.range.start);
+            let end = text.char_to_line(block.range.end.saturating_sub(1).max(block.range.start));
+            if let Some(&entry) = index.get(&block.thread.id) {
+                entries[entry].placement = Some((block.placement, start, end));
+            }
+        }
+    }
+}
+
 /// Preview the mapped range in an open buffer when available, otherwise the
-/// PR-head line numbers in the file on disk.
+/// listed placement or the PR-head line numbers in the file on disk.
 fn list_preview<'a>(editor: &'a Editor, entry: &'a ListEntry) -> Option<FileLocation<'a>> {
     for doc in editor.documents() {
         if let Some(block) = doc
@@ -649,6 +756,9 @@ fn list_preview<'a>(editor: &'a Editor, entry: &'a ListEntry) -> Option<FileLoca
             let end = text.char_to_line(block.range.end.saturating_sub(1).max(block.range.start));
             return Some((PathOrId::Id(doc.id()), Some((start, end))));
         }
+    }
+    if let Some((_, start, end)) = entry.placement {
+        return Some((entry.path.as_deref()?.into(), Some((start, end))));
     }
     let lines = entry.thread.lines.as_ref()?;
     Some((
@@ -681,9 +791,28 @@ fn list_location(thread: &review::Thread) -> String {
             format!("{}:{}-{}", thread.path, lines.start, lines.end - 1)
         }
         Some(lines) => format!("{}:{}", thread.path, lines.start),
-        // parse_thread records why a discussion is not placed on current code.
-        None if thread.location.contains("(outdated") => format!("{} (outdated)", thread.path),
+        None if thread.outdated => format!("{} (outdated)", thread.path),
         None => format!("{} (no line)", thread.path),
+    }
+}
+
+/// The local position when the discussion could be placed, else its GitHub location.
+fn entry_location(entry: &ListEntry) -> String {
+    match entry.placement {
+        Some((placement, start, end)) if end > start => format!(
+            "{}:{}-{}{}",
+            entry.thread.path,
+            start + 1,
+            end + 1,
+            placement_note(placement)
+        ),
+        Some((placement, start, _)) => format!(
+            "{}:{}{}",
+            entry.thread.path,
+            start + 1,
+            placement_note(placement)
+        ),
+        None => list_location(&entry.thread),
     }
 }
 
@@ -699,9 +828,17 @@ pub(crate) fn list(cx: &mut compositor::Context) {
     }
     let generation = cx.editor.review.generation;
     let context = cx.editor.review.context.clone();
-    let entries = list_entries(&review, context.as_ref().map(|c| c.root.as_path()));
+    let root = context.as_ref().map(|c| c.root.as_path());
+    let mut entries = list_entries(&review, root);
+    let texts = root.map_or_else(HashMap::new, |root| open_texts(cx.editor, root));
     let selected = cx.editor.review.selected.unwrap_or(0);
     cx.jobs.callback(async move {
+        // Placing may read and diff files; keep it off the UI thread.
+        let entries = tokio::task::spawn_blocking(move || {
+            place_entries(&review, &mut entries, &texts);
+            entries
+        })
+        .await?;
         Ok(job::Callback::EditorCompositor(Box::new(
             move |_, compositor| {
                 let picker = Picker::new(
@@ -710,7 +847,7 @@ pub(crate) fn list(cx: &mut compositor::Context) {
                             first_line(&entry.thread).into()
                         }),
                         PickerColumn::new("location", |entry: &ListEntry, _| {
-                            list_location(&entry.thread).into()
+                            entry_location(entry).into()
                         }),
                         PickerColumn::new("discussion", |entry: &ListEntry, _| {
                             entry.thread.title().into()
@@ -805,9 +942,18 @@ mod tests {
         assert_eq!(list_location(&review.threads[3]), "a.rs (no line)");
         let outdated = Thread {
             location: "a.rs:? (outdated, RIGHT, original 3, commit abc)".into(),
+            outdated: true,
             ..(*review.threads[3]).clone()
         };
         assert_eq!(list_location(&outdated), "a.rs (outdated)");
+        // Listed placements show the local position and how it was derived.
+        let mut entry = list_entries(&review, Some(&root)).remove(0);
+        entry.placement = Some((Placement::Exact, 0, 0));
+        assert_eq!(entry_location(&entry), "a.rs:1");
+        entry.placement = Some((Placement::Changed, 4, 6));
+        assert_eq!(entry_location(&entry), "a.rs:5-7 · code changed");
+        entry.placement = Some((Placement::Approximate, 2, 2));
+        assert_eq!(entry_location(&entry), "a.rs:3 · approximate location");
         assert_eq!(first_line(&review.threads[0]), "first line");
         let long = Thread {
             comments: vec![Comment {
@@ -939,6 +1085,146 @@ mod editor_tests {
         }
     }
 
+    /// Discussions stay on the code when it changed locally or on GitHub:
+    /// outdated ones are placed from their original commit's text, and every
+    /// placement is labelled, navigable and remains bound to its discussion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changed_outdated_and_approximate_discussions_stay_on_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path()).unwrap();
+        fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        fs::write(root.join(".git/refs/heads/topic"), "aaa\n").unwrap();
+        let original = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n";
+        let head = original.replace("one();", "one(1);");
+        let local = format!("// added\n{}", head.replace("two();", "two(2);"));
+        fs::write(root.join("a.txt"), &local).unwrap();
+        fs::write(root.join("empty.txt"), "").unwrap();
+        let mut editor_value = fixture_editor();
+        let mut jobs = job::Jobs::new();
+        let editor = &mut editor_value;
+        editor
+            .open(&root.join("a.txt"), Action::VerticalSplit)
+            .unwrap();
+        let thread = |id: &str, path: &str, lines, original_lines, commit: Option<&str>| {
+            Arc::new(Thread {
+                id: id.into(),
+                path: path.into(),
+                lines,
+                original_lines,
+                commit: commit.map(str::to_owned),
+                outdated: commit.is_some(),
+                location: format!("{path}:?"),
+                comments: vec![Comment {
+                    author: id.into(),
+                    body: format!("body {id}"),
+                }],
+                ..Default::default()
+            })
+        };
+        let threads = vec![
+            thread("exact", "a.txt", Some(2..3), Some(2..3), None),
+            thread("changed", "a.txt", Some(6..7), Some(6..7), None),
+            thread("outdated", "a.txt", None, Some(2..3), Some("c1")),
+            thread("unknown", "a.txt", None, Some(6..7), Some("c2")),
+            thread("old-side", "a.txt", None, None, None),
+            thread("empty", "empty.txt", Some(3..4), Some(3..4), None),
+        ];
+        editor.review.enabled = true;
+        editor.review.context = context_at(&root);
+        editor.review.status = "fixture".into();
+        editor.review.review = Some(Arc::new(Review {
+            label: "fixture#1".into(),
+            threads,
+            sources: HashMap::from([
+                ("a.txt".into(), head.clone()),
+                ("empty.txt".into(), "x\ny\nz\n".into()),
+            ]),
+            originals: HashMap::from([(("c1".into(), "a.txt".into()), original.into())]),
+            ..Default::default()
+        }));
+        attach_documents(editor);
+        settle(editor, &mut jobs).await;
+        let placed: Vec<_> = {
+            let doc = doc!(editor);
+            let mut placed: Vec<_> = doc
+                .review
+                .blocks
+                .iter()
+                .map(|b| {
+                    (
+                        b.thread.id.as_str().to_owned(),
+                        b.placement,
+                        doc.text().char_to_line(b.range.start) + 1,
+                    )
+                })
+                .collect();
+            placed.sort_by(|a, b| a.0.cmp(&b.0));
+            placed
+        };
+        assert_eq!(
+            placed,
+            vec![
+                ("changed".into(), Placement::Changed, 7),
+                ("exact".into(), Placement::Exact, 3),
+                ("outdated".into(), Placement::Changed, 3),
+                ("unknown".into(), Placement::Approximate, 6),
+            ]
+        );
+        // Navigation goes to the code, reports the placement, and a reply
+        // started there targets the selected discussion.
+        select(editor, 3);
+        assert_eq!(under_cursor(editor), Some(3));
+        let status = editor.get_status().unwrap().0.to_string();
+        assert!(status.contains("approximate location"), "{status}");
+        assert!(status.contains("outdated"), "{status}");
+        select(editor, 2);
+        assert_eq!(under_cursor(editor), Some(2));
+        assert!(doc!(editor).path().is_some());
+        let text = doc!(editor).text().clone();
+        let cursor = doc!(editor)
+            .selection(view!(editor).id)
+            .primary()
+            .cursor(text.slice(..));
+        assert_eq!(text.char_to_line(cursor), 2);
+        // The list places closed files from disk and open buffers as shown.
+        let review = editor.review.review.clone().unwrap();
+        let mut entries = list_entries(&review, Some(&root));
+        place_entries(&review, &mut entries, &open_texts(editor, &root));
+        let locations: Vec<_> = entries.iter().map(entry_location).collect();
+        assert_eq!(
+            locations,
+            vec![
+                "a.txt:3",
+                "a.txt:7 · code changed",
+                "a.txt:3 · code changed",
+                "a.txt:6 · approximate location",
+                "a.txt (no line)",
+                "empty.txt:1 · code changed",
+            ]
+        );
+        // An empty file still shows the discussion.
+        select(editor, 5);
+        settle(editor, &mut jobs).await;
+        assert_eq!(doc!(editor).path(), Some(&root.join("empty.txt")));
+        assert_eq!(doc!(editor).review.blocks.len(), 1);
+        assert_eq!(doc!(editor).review.blocks[0].anchor, 0);
+        assert_eq!(under_cursor(editor), Some(5));
+        // Old-side discussions open the discussion view.
+        select(editor, 4);
+        assert!(doc!(editor).readonly);
+        assert!(doc!(editor)
+            .text()
+            .to_string()
+            .contains("Location unavailable"));
+        // The discussion view names a changed placement.
+        open_thread(editor, 1);
+        assert!(doc!(editor)
+            .text()
+            .to_string()
+            .contains("the code changed since the review"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn fixture_navigation_edits_context_switch_and_symlink_rejection() {
         let dir = tempfile::tempdir().unwrap();
@@ -1023,7 +1309,7 @@ mod editor_tests {
         // user focuses another split with the same document and cursor.
         let requesting_view = view!(editor).id;
         doc_mut!(editor).review.stamp = None;
-        select(editor, 2);
+        select(editor, 0);
         assert!(editor.review.pending_selection.is_some());
         editor.switch(original_id, Action::VerticalSplit);
         let other_view = view!(editor).id;
@@ -1056,7 +1342,12 @@ mod editor_tests {
         }
         attach_documents(editor);
         settle(editor, &mut jobs).await;
-        assert!(doc!(editor).review.blocks.is_empty());
+        // The discussed line changed: both discussions stay on the code, marked.
+        let blocks = &doc!(editor).review.blocks;
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|b| b.placement == Placement::Changed));
+        assert_eq!(doc!(editor).text().char_to_line(blocks[0].range.start), 4);
+        // A discussion without lines opens the discussion view.
         select(editor, 2);
         assert!(doc!(editor).readonly);
         assert!(doc!(editor)

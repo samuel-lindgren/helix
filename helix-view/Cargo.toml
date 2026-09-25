@@ -24,6 +24,8 @@ helix-lsp = { path = "../helix-lsp" }
 helix-dap = { path = "../helix-dap" }
 helix-vcs = { path = "../helix-vcs" }
 
+imara-diff = "0.2.0"
+
 bitflags.workspace = true
 anyhow = "1"
 termina = { workspace = true, optional = true }

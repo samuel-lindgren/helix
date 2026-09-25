@@ -16,10 +16,10 @@ disabled in each editor session.
 | --- | --- |
 | `:review-toggle` | Enable/disable review display in all views. |
 | `:review-refresh` | Reload the current branch's PR and comments; also enables display. |
-| `:review-next`, `:review-prev` | Visit discussions across files, with wraparound. |
+| `:review-next`, `:review-prev` | Visit discussions across files, with wraparound. Goes to the code, also when it changed; see [Locations](#locations-and-refresh). |
 | `:review-expand` | Expand/collapse the discussion at the cursor or selected by navigation. |
 | `:review-open` | Open the complete discussion and original diff in a discussion buffer. |
-| `:review-list` | Pick a discussion (first line, location, author/status/comment count) with a code preview; typing filters by location; `Enter` jumps to it. Includes outdated and file-level discussions. |
+| `:review-list` | Pick a discussion (first line, current location and placement, author/status/comment count) with a code preview; typing filters by location; `Enter` jumps to the code. Includes outdated and file-level discussions. |
 | `:review-select owner/repo#123` | Explicitly select a PR when automatic association is ambiguous. |
 | `:review-reply [text]` | Reply to the discussion at the cursor or selected by navigation. With text, post it at once; without, open a reply draft. |
 | `:review-send` | Post the reply draft in the current buffer. `:write` (`:w`) in a draft does the same. |
@@ -29,9 +29,11 @@ disabled in each editor session.
 | `:review-resolve`, `:review-unresolve` | Resolve or reopen the discussion. |
 
 After loading, the status message summarizes the PR, e.g.
-`owner/repo#12: 3 discussion(s), 2 open · 2 inline, 1 outdated/file-level`.
-Outdated and file-level discussions are never drawn inline; reach them with
-`:review-next` or `:review-list`.
+`owner/repo#12: 3 discussion(s), 2 open · 2 inline (1 outdated), 1 old-side/file-level`.
+Discussions on new code are drawn inline, including those GitHub reports as
+outdated. Discussions on removed code (the diff's old side) and file-level
+discussions are never drawn inline; reach them with `:review-next` or
+`:review-list`, which open the discussion view.
 
 Add the `review` element to a statusline section to keep that state visible
 while display is enabled (`reviews: loading`, `repo#12 2/3 open`,
@@ -56,6 +58,14 @@ For example:
       │ [+] @reviewer · open · 2 comment(s)
       │ Could this return an error for an empty input?
   13  return result;
+```
+
+A block whose code changed since the review says so:
+
+```text
+  14  let result = parse(input).unwrap_or_default();
+      │ [+] @reviewer · open · outdated · 1 comment(s) · code changed
+      │ Could this return an error for an empty input?
 ```
 
 There are no new default shortcuts. An optional keymap in `config.toml` is:
@@ -149,19 +159,32 @@ command or a command option.
 
 ## Locations and refresh
 
-Review line numbers belong to a PR revision. Helix fetches that immutable head's
-file contents, verifies the PR has not changed while loading, and maps only
-unchanged, unambiguous context into the current buffer. This includes line shifts
-from saved or unsaved local edits. Editing the reviewed text, edits within its
-three-line context window, ambiguous repeated code, unsupported paths, and missing
-or oversized source blobs may make the location unavailable. Undoing the change
-can restore the mapping. Helix never guesses a replacement line. Mapping runs in
-the background and is debounced while typing; results must still match the
-document version before being displayed.
+Review line numbers belong to a revision: the PR head for current discussions,
+and the commit a discussion was written against for discussions GitHub reports
+as `outdated`. Helix fetches the PR head's file contents from GitHub (and
+verifies the PR has not changed while loading) and reads an outdated
+discussion's original file from the local repository. It then places each
+discussion on new code in the current buffer, saved or unsaved, in one of three
+ways:
 
-Old-side/deleted-code, outdated, and file-level discussions remain accessible
-through navigation and `:review-list`; they open with their original location,
-commit, diff side, diff hunk and conversation. They are not placed on current code.
+| Placement | Label | Meaning |
+| --- | --- | --- |
+| Exact | none | The reviewed lines and three lines of context around them are unchanged and unambiguous. Line shifts from edits elsewhere are followed. |
+| Code changed | `code changed` | The reviewed lines or their context changed. Helix carries the lines through a line diff of the reviewed and the current text to the closest remaining code: edited lines stay on their replacement, deleted lines move to the line above them. |
+| Approximate | `approximate location` | No reviewed text is available (the original commit is not in the local repository, for example after a rebase, or the file exceeds the size limit), or the lines lie outside it. The discussion is shown at its original line number, limited to the file's last line. |
+
+The label appears on the inline block, in `:review-list` and in the status
+message when navigating. It is independent of GitHub's `outdated` state, which
+the block, the list and the status message show separately. Undoing a change
+restores the exact placement. The placement only decides where a discussion is
+shown: replies, resolution and `:review-open` always use the discussion itself,
+and `:review-open` still shows the original location, commit, diff side and diff
+hunk. Mapping runs in the background and is debounced while typing; results must
+still match the document version before being displayed.
+
+Old-side/deleted-code and file-level discussions remain accessible through
+navigation and `:review-list`; they open with their original location, commit,
+diff side, diff hunk and conversation. They are not placed on current code.
 Navigation opens a matching file only if its path is safely inside the repository;
 symlinks inside the repository are deliberately not followed. A checkout opened
 through a symlinked directory is matched by its resolved location, and navigation
@@ -188,7 +211,8 @@ failures produce a status/error message (also when enabling with `:review-toggle
 retry with `:review-refresh` after correcting the condition.
 
 The initial transport supports `github.com`, ordinary Git repositories and Git
-worktrees. Source mapping is limited to 2 MiB per file. Fetches have per-process
+worktrees. Source mapping is limited to 2 MiB per file; larger files use the
+approximate placement. Fetches have per-process
 30-second timeouts, bounded pagination, a 16 MiB aggregate content budget and a
 2,000-thread limit. Exceeding a limit is reported instead of silently truncating
 the review. GitHub Enterprise hosts, renamed-path inference, rich Markdown,
@@ -209,7 +233,11 @@ cargo test -p helix-view review --lib
 Tests exercise actual virtual-row reservation/drawing, scrolling and wrapping,
 multiple same-line threads, unsaved edits, symlink rejection, context invalidation,
 old-side/outdated anchors, terminal controls, fork identity and a fake CLI that
-paginates threads/replies and changes revisions mid-fetch. Write-side tests record
+paginates threads/replies and changes revisions mid-fetch. Placement tests cover
+changed, deleted and shifted lines, changed context, ambiguous repeated code,
+short, empty and unterminated files, restored exact matches, outdated
+discussions read from a temporary repository's history, navigation and list
+locations for every placement, and drawing at the end of empty files. Write-side tests record
 the fake CLI's requests (mutation payloads as JSON variables, thread ids,
 resolve/unresolve, access errors), select suggested commits in temporary Git
 repositories, and drive a reply draft in the editor from suggestion to an
