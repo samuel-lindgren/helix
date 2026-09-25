@@ -215,7 +215,8 @@ worktrees. Source mapping is limited to 2 MiB per file; larger files use the
 approximate placement. Fetches have per-process
 30-second timeouts, bounded pagination, a 16 MiB aggregate content budget and a
 2,000-thread limit. Exceeding a limit is reported instead of silently truncating
-the review. GitHub Enterprise hosts, renamed-path inference, rich Markdown,
+the review. Original-commit files for outdated discussions are best effort: those
+that do not fit the budget leave their discussions at the approximate placement. GitHub Enterprise hosts, renamed-path inference, rich Markdown,
 mouse interactions, new discussions and review submission are future work.
 Suggested commits do not follow file renames or multi-parent history beyond the
 first parent.
