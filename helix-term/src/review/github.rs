@@ -2,23 +2,21 @@
 //! replying to and (un)resolving an existing review discussion, addressed by its
 //! node id. All user and remote text travels as JSON variables on stdin, never
 //! in the query, a shell or command options.
-use anyhow::{anyhow, bail, ensure, Context as _};
+use anyhow::{anyhow, bail, ensure};
 use helix_view::review::{safe_text, Comment, Context, Review, Thread};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     path::{Component, Path},
-    process::Stdio,
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-};
 
-const LIMIT: u64 = 16 * 1024 * 1024;
+use crate::process::LIMIT;
 const MAX_PAGES: usize = 100;
+
+/// Every process is bounded by its own timeout; see [`crate::process`].
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn run(
     root: &Path,
@@ -26,63 +24,7 @@ async fn run(
     args: &[&str],
     input: Option<Vec<u8>>,
 ) -> anyhow::Result<String> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(root)
-        .kill_on_drop(true)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_PAGER", "cat")
-        .env_remove("GH_REPO")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("Cannot run {program}"))?;
-    let mut stdout = child.stdout.take().unwrap().take(LIMIT + 1);
-    let mut stderr = child.stderr.take().unwrap().take(LIMIT + 1);
-    let mut stdin = child.stdin.take();
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        tokio::try_join!(
-            async {
-                if let (Some(mut stdin), Some(input)) = (stdin.take(), input) {
-                    stdin.write_all(&input).await?;
-                    stdin.shutdown().await?;
-                }
-                Ok::<_, std::io::Error>(())
-            },
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err)
-        )?;
-        ensure!(
-            out.len() as u64 <= LIMIT && err.len() as u64 <= LIMIT,
-            "{program} output exceeded review size limit"
-        );
-        let status = child.wait().await?;
-        ensure!(
-            status.success(),
-            "{program}: {}",
-            safe_text(&String::from_utf8_lossy(&err))
-                .chars()
-                .take(500)
-                .collect::<String>()
-        );
-        Ok(String::from_utf8(out)?)
-    })
-    .await
-    .context("Review command timed out")?;
-    result
+    crate::process::run(root, program, args, input, TIMEOUT).await
 }
 
 pub(super) async fn git(context: &Context, args: &[&str]) -> anyhow::Result<String> {

@@ -1214,6 +1214,7 @@ type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
 pub struct Editor {
     pub review: crate::review::State,
+    pub git: crate::git::State,
     /// Current editing mode.
     pub mode: Mode,
     pub tree: Tree,
@@ -1409,6 +1410,7 @@ impl Editor {
             diff_providers: DiffProviderRegistry::default(),
             branch_diff_enabled: false,
             review: crate::review::State::default(),
+            git: crate::git::State::default(),
             go_test_doc_id: None,
             go_test_cancel: None,
             go_test_last_run: None,

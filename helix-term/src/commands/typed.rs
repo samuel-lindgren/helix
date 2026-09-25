@@ -487,14 +487,22 @@ pub struct WriteOptions {
     pub auto_format: bool,
 }
 
-/// A GitHub review reply draft has no file; writing it posts the reply.
+/// A GitHub review reply draft has no file; writing it posts the reply. Writing
+/// a commit draft creates the commit.
 fn write_review_reply(cx: &mut compositor::Context, args: &Args, force: bool) -> bool {
-    let reply =
-        args.first().is_none() && crate::review::reply::is_compose(cx.editor, doc!(cx.editor).id());
-    if reply {
-        crate::review::reply::send(cx.editor, force, false);
+    if args.first().is_some() {
+        return false;
     }
-    reply
+    let doc = doc!(cx.editor).id();
+    if crate::review::reply::is_compose(cx.editor, doc) {
+        crate::review::reply::send(cx.editor, force, false);
+        true
+    } else if crate::git::is_draft(cx.editor, doc) {
+        crate::git::send(cx.editor, force);
+        true
+    } else {
+        false
+    }
 }
 
 fn write(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -3778,6 +3786,54 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
                 crate::review::reply::yank_commit(cx.editor);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-status",
+        aliases: &[],
+        doc: "Show the repository's staged, unstaged and untracked changes; stage, unstage and commit from the picker.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::git::status_view(cx);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-commit",
+        aliases: &[],
+        doc: "Open a commit draft for the staged changes; `:write` in the draft commits.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::git::commit(cx.editor);
+            }
+            Ok(())
+        },
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git-cancel",
+        aliases: &[],
+        doc: "Cancel the running commit in the current repository.",
+        fun: |cx, _, event| {
+            if event == PromptEvent::Validate {
+                crate::git::cancel(cx.editor);
             }
             Ok(())
         },
