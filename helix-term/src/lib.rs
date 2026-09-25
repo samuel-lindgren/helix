@@ -8,9 +8,11 @@ pub mod compositor;
 pub mod config;
 pub(crate) mod dap_display;
 pub mod events;
+pub(crate) mod git;
 pub mod health;
 pub mod job;
 pub mod keymap;
+pub(crate) mod process;
 pub(crate) mod review;
 pub mod ui;
 

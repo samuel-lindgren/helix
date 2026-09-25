@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
 };
 
-fn read_small(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_small(path: &Path) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     fs::File::open(path)
         .ok()?
@@ -38,10 +38,10 @@ fn read_small(path: &Path) -> Option<Vec<u8>> {
 
 // Resolve symlinks first, then use the editor's platform path spelling (notably
 // Windows verbatim-prefix simplification). normalize alone is not containment.
-fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn canonical(path: &Path) -> std::io::Result<PathBuf> {
     path.canonicalize().map(helix_stdx::path::normalize)
 }
-fn relative_key(path: &Path) -> Option<String> {
+pub(crate) fn relative_key(path: &Path) -> Option<String> {
     path.components()
         .map(|c| match c {
             std::path::Component::Normal(c) => c.to_str(),
@@ -51,9 +51,9 @@ fn relative_key(path: &Path) -> Option<String> {
         .map(|parts| parts.join("/"))
 }
 
-/// Resolve worktree gitdirs and common refs without spawning a process in the UI.
-/// Do not cache HEAD: a late response after a checkout must never paint old data.
-fn context_at(path: &Path) -> Option<Context> {
+/// The working tree root and Git directory (of a worktree, too) containing
+/// `path`, without spawning a process.
+pub(crate) fn repository_at(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let root = canonical(path.ancestors().find(|dir| dir.join(".git").exists())?).ok()?;
     let git = root.join(".git");
     let git_dir = if git.is_dir() {
@@ -62,6 +62,13 @@ fn context_at(path: &Path) -> Option<Context> {
         let text = String::from_utf8(read_small(&git)?).ok()?;
         canonical(&root.join(text.trim().strip_prefix("gitdir: ")?)).ok()?
     };
+    Some((root, git_dir))
+}
+
+/// Resolve worktree gitdirs and common refs without spawning a process in the UI.
+/// Do not cache HEAD: a late response after a checkout must never paint old data.
+fn context_at(path: &Path) -> Option<Context> {
+    let (root, git_dir) = repository_at(path)?;
     let common = read_small(&git_dir.join("commondir"))
         .and_then(|s| String::from_utf8(s).ok())
         .map(|s| git_dir.join(s.trim()))
@@ -94,7 +101,7 @@ fn context_at(path: &Path) -> Option<Context> {
 }
 
 /// Explain why `context_at` found no reviewable branch at `path`.
-fn missing_context(path: &Path) -> String {
+pub(crate) fn missing_context(path: &Path) -> String {
     let Some(root) = path.ancestors().find(|dir| dir.join(".git").exists()) else {
         return format!(
             "Reviews: {} is not inside a Git repository",
@@ -126,7 +133,7 @@ fn missing_context(path: &Path) -> String {
     }
 }
 
-fn current_path(editor: &Editor) -> PathBuf {
+pub(crate) fn current_path(editor: &Editor) -> PathBuf {
     doc!(editor)
         .path()
         .and_then(|p| p.parent())

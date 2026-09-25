@@ -47,6 +47,7 @@ use helix_core::{
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
+    input::KeyEvent,
     theme::Style,
     view::ViewPosition,
     Document, DocumentId, Editor,
@@ -259,6 +260,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     callback_fn: PickerCallback<T>,
     default_action: Action,
+    key_actions: Vec<(KeyEvent, PickerKeyAction<T>)>,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -387,6 +389,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             show_preview: true,
             callback_fn: Box::new(callback_fn),
             default_action: Action::Replace,
+            key_actions: Vec::new(),
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
@@ -452,6 +455,18 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn with_default_action(mut self, action: Action) -> Self {
         self.default_action = action;
+        self
+    }
+
+    /// Run `action` on the selected item when `key` is pressed; it returns
+    /// whether the picker closes. Keys that the picker or its prompt handle
+    /// (typing, navigation, `Enter`, `ctrl-s`/`ctrl-v`/`ctrl-t`) are unsuitable.
+    pub fn with_key_action(
+        mut self,
+        key: KeyEvent,
+        action: impl Fn(&mut Context, &T) -> bool + 'static,
+    ) -> Self {
+        self.key_actions.push((key, Box::new(action)));
         self
     }
 
@@ -1087,6 +1102,15 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             EventResult::Consumed(Some(callback))
         };
 
+        if let Some((_, action)) = self.key_actions.iter().find(|(key, _)| *key == key_event) {
+            let close = self.selection().is_some_and(|option| action(ctx, option));
+            return if close {
+                close_fn(self)
+            } else {
+                EventResult::Consumed(None)
+            };
+        }
+
         match key_event {
             shift!(Tab) | key!(Up) | ctrl!('p') => {
                 self.move_by(1, Direction::Backward);
@@ -1206,3 +1230,4 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+type PickerKeyAction<T> = Box<dyn Fn(&mut Context, &T) -> bool>;
