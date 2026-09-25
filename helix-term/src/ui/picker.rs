@@ -600,7 +600,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     // retrieve the `Arc<Path>` key. The `path` in scope here is a `&Path` and
                     // we can cheaply clone the key for the preview highlight handler.
                     let (path, preview) = self.preview_cache.get_key_value(path).unwrap();
-                    if matches!(preview, CachedPreview::Document(doc) if doc.syntax().is_none()) {
+                    // Only documents with a language can be highlighted; asking for
+                    // others on every render keeps the editor from becoming idle.
+                    if matches!(preview, CachedPreview::Document(doc) if doc.syntax().is_none() && doc.language_config().is_some())
+                    {
                         helix_event::send_blocking(&self.preview_highlight_handler, path.clone());
                     }
                     return Some((Preview::Cached(preview), range));
