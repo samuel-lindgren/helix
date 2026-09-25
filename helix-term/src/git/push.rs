@@ -4,7 +4,10 @@
 use super::{current_repo, git, git_text, head, output, summary};
 use crate::{
     compositor, job,
-    ui::{overlay::overlaid, Picker, PickerColumn},
+    ui::{
+        overlay::{overlaid, Overlay},
+        Picker, PickerColumn,
+    },
 };
 use anyhow::{anyhow, bail};
 use helix_view::{git::Running, review::safe_text, Editor};
@@ -334,6 +337,8 @@ fn show(editor: &mut Editor, compositor: &mut compositor::Compositor, mut plan: 
         start(cx.editor, &plan, target.destination.clone())
     })
     .with_preview(|_, target: &Target| Some((target.log.as_deref()?.into(), None)));
+    // A repeated :git-push replaces an open push picker instead of stacking.
+    compositor.remove_type::<Overlay<Picker<Target, ()>>>();
     compositor.push(Box::new(overlaid(picker)));
 }
 
@@ -491,6 +496,13 @@ fn follow_review(editor: &mut Editor, plan: &Plan, pushed: String) {
             }
         }
         job::dispatch(move |editor, _| {
+            // Say nothing once the user has moved on to another branch or repository.
+            let current = current_repo(editor).ok();
+            if current.as_ref().map(|r| (&r.root, r.branch.as_ref()))
+                != Some((&root, Some(&branch)))
+            {
+                return;
+            }
             if !contained {
                 return editor.set_status(format!(
                     "{pushed} · GitHub does not show it in {pull} yet; :review-refresh later"
@@ -618,7 +630,7 @@ mod editor_tests {
         committed, editor, expect, fixture, open, pump, sh, status_text, type_message,
     };
     use super::*;
-    use crate::{compositor::Compositor, key, review::canonical, ui::overlay::Overlay};
+    use crate::{compositor::Compositor, key, review::canonical};
     use helix_view::{editor::Action, input::Event};
     use std::fs;
 
@@ -723,6 +735,13 @@ mod editor_tests {
         );
         assert!(rig.editor.git.running.is_empty());
 
+        // Preparing twice shows one picker.
+        rig.plan().await;
+        push(&mut rig.cx());
+        rig.pump(|e, _| status_text(e).starts_with("Push topic at "))
+            .await;
+        rig.compositor.pop();
+        assert!(!has_push_picker(&mut rig.compositor));
         // Configured now: one destination, already up to date.
         rig.plan().await;
         rig.confirm().await;
