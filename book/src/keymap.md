@@ -334,16 +334,34 @@ Save modified files in the Go module/workspace first.
 | `p` | Run all tests in the current package | `go_test_package` |
 | `l` | Rerun the last started test selection | `go_test_last` |
 | `r` | Show retained test output | `go_test_results` |
-| `f` | Pick a reported source location, with preview | `go_test_locations` |
+| `f` | Go to the source or test on an output line, or pick one | `go_test_locations` |
 | `c` | Cancel the current run | `go_test_cancel` |
 
 The corresponding typed commands are `:go-test`, `:go-test-nearest`, `:go-test-package`, `:go-test-last`,
 `:go-test-results`, `:go-test-locations`, and `:go-test-cancel`. The `[go-test]` buffer opens in a
 split while the source keeps focus. It shows the selected test, package, command,
 result and test/build output after completion. Its contents remain available
-until the next run or until you close the buffer. The location picker supports
-normal picker split actions and `Space '` to reopen it. Reported line numbers
+until the next run or until you close the buffer. Reported line numbers
 refer to the tested files on disk; save and rerun after further edits.
+
+In the `[go-test]` buffer, `Space t f` follows the cursor line into the source,
+in the split beside the output so the output stays visible:
+
+- A `file.go:line` location (an assertion, compiler error, stack frame, or
+  testify `Error Trace:`) opens that line.
+- A test name (`=== RUN`, `--- FAIL:`, or testify's `Test:` field) opens the
+  test. For a subtest, it opens the line naming the case: a `t.Run("…")` call,
+  a table row's name field, a map key or the first value of a row. testify
+  suite methods (`TestSuite/TestMethod`) open the method.
+- Any other output line opens the test whose output it is.
+
+Names built at runtime (for example with `fmt.Sprintf`) have no source line, so
+the closest enclosing test opens instead and the status line says so. When
+several lines name the same case, a picker lists them; for Go's repeated-name
+suffixes (`#01`) the matching occurrence comes first. On other lines, or when
+invoked outside the output, `Space t f` opens a picker of every reported
+location and failed subtest, with preview, normal picker split actions and
+`Space '` to reopen it.
 
 Runs bypass Go's test cache. Tests time out after two minutes; the whole command,
 including compilation, is limited to three minutes. Output is capped at 2 MiB

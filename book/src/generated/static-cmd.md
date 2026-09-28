@@ -297,7 +297,7 @@
 | `go_test_package` | Run all tests in the current Go package without debugging | normal: `` <space>tp ``, select: `` <space>tp `` |
 | `go_test_picker` | Select and run a Go test without debugging | normal: `` <space>tt ``, select: `` <space>tt `` |
 | `go_test_results` | Show retained Go test output | normal: `` <space>tr ``, select: `` <space>tr `` |
-| `go_test_locations` | Jump to a source location in Go test output | normal: `` <space>tf ``, select: `` <space>tf `` |
+| `go_test_locations` | Go to the source or test on a Go test output line, or pick one | normal: `` <space>tf ``, select: `` <space>tf `` |
 | `go_test_cancel` | Cancel the running Go test | normal: `` <space>tc ``, select: `` <space>tc `` |
 | `dap_launch` | Launch debug target | normal: `` <space>Gl ``, select: `` <space>Gl `` |
 | `dap_rerun_last` | Rerun last debug target | normal: `` <F2> ``, `` <space>GR ``, `` <space>G<F2> ``, select: `` <F2> ``, `` <space>GR ``, `` <space>G<F2> `` |
