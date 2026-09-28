@@ -31,6 +31,7 @@ use crate::{
 };
 
 mod cursor;
+mod names;
 
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024; // per stream; keep draining after the cap
 const RUN_TIMEOUT: Duration = Duration::from_secs(180); // includes compilation
@@ -281,7 +282,7 @@ fn start_run(cx: &mut compositor::Context, target: GoTestRun) {
     let header = format!(
         "Go test: {}\nPackage: {}\nCommand: go test -json -count=1 -timeout=2m {filter}.\n\
          Tests read saved files from disk. Save and rerun after edits.\n\
-         Space t f: source locations | Space t r: results | Space t c: cancel\n{notice}\n",
+         Space t f: go to this line's test or source | Space t r: results | Space t c: cancel\n{notice}\n",
         target.name,
         target.directory.display(),
     );
@@ -494,7 +495,7 @@ async fn run(
     let parsed = parse_output(&out, selected, dir);
     let mut output = parsed.output;
     if !err.is_empty() {
-        output.push_str("\n--- stderr / build diagnostics ---\n");
+        output.push_str(&format!("\n{STDERR_SEPARATOR}\n"));
         output.push_str(&resolve_locations(&String::from_utf8_lossy(&err), dir));
     }
     if out.len() >= OUTPUT_LIMIT || err.len() >= OUTPUT_LIMIT {
@@ -581,8 +582,19 @@ struct SourceLocation {
     line: usize,
     message: String,
 }
-static LOCATION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\s*(.*\.go):([0-9]+)(?::[0-9]+)?(?::|\s|$)(.*)").unwrap());
+// The path may follow tab-separated labels, as in testify's `Error Trace:`.
+static LOCATION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:[^\t]*\t)*?\s*([^\t]*?\.go):([0-9]+)(?::[0-9]+)?(?::|\s|$)(.*)").unwrap()
+});
+/// Lines naming a test: `go test` progress markers and testify's `Test:` field.
+static TEST_NAME: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*(?:=== (?:RUN|PAUSE|CONT|NAME)|--- (?:FAIL|PASS|SKIP):|Test:)\s+(\S+)")
+        .unwrap()
+});
+static FAILED_TEST: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*--- FAIL: (\S+)").unwrap());
+/// Package results, which belong to no single test.
+static SUMMARY: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(?:PASS|FAIL|ok|\?)(?:\s|$)").unwrap());
+const STDERR_SEPARATOR: &str = "--- stderr / build diagnostics ---";
 
 fn source_location(line: &str, dir: &Path) -> Option<SourceLocation> {
     let captures = LOCATION.captures(line)?;
@@ -612,29 +624,139 @@ fn resolve_locations(output: &str, dir: &Path) -> String {
     result
 }
 
+/// From the output buffer, jump to the source location or test on the cursor
+/// line. Elsewhere, or on a line without either, pick from all reported
+/// locations and failed tests.
 pub(super) fn show_locations(cx: &mut compositor::Context) {
-    let Some(doc) = cx
+    let Some(id) = cx
         .editor
         .go_test_doc_id
-        .and_then(|id| cx.editor.documents.get(&id))
+        .filter(|id| cx.editor.documents.contains_key(id))
     else {
         cx.editor.set_error("No retained Go test output");
         return;
     };
+    let lines: Vec<String> = cx.editor.documents[&id]
+        .text()
+        .lines()
+        .map(|line| line.to_string().trim_end().to_owned())
+        .collect();
+    let package = package_dir(&lines).map(|dir| names::Package::read(&dir));
+    let (view, doc) = current_ref!(cx.editor);
+    if doc.id() == id {
+        let line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        if let Some(location) = source_location(&lines[line], Path::new("")) {
+            jump_to_location(cx.editor, &location, Action::Replace);
+            return;
+        }
+        if let Some(test) = test_on_line(&lines, line) {
+            let Some(resolution) = package.as_ref().and_then(|p| p.resolve(test)) else {
+                cx.editor.set_error(format!(
+                    "{test} is not declared in the package's _test.go files"
+                ));
+                return;
+            };
+            if resolution.shown != test {
+                cx.editor.set_status(format!(
+                    "No source line names {test}; showing {}",
+                    resolution.shown
+                ));
+            }
+            match <[_; 1]>::try_from(resolution.locations) {
+                Ok([location]) => jump_to_location(cx.editor, &location, Action::Replace),
+                Err(locations) => pick_location(cx, locations),
+            }
+            return;
+        }
+    }
+    let locations = reported_locations(&lines, package.as_ref());
+    if locations.is_empty() {
+        cx.editor.set_error(
+            "No source locations or failed tests reported; Space t r shows the full output",
+        );
+        return;
+    }
+    pick_location(cx, locations);
+}
+
+/// Every source location in the output, plus where each failed test is
+/// declared. Parents fail with their subtests; only the subtests are listed.
+fn reported_locations(lines: &[String], package: Option<&names::Package>) -> Vec<SourceLocation> {
+    let failed: Vec<&str> = lines
+        .iter()
+        .filter_map(|line| Some(FAILED_TEST.captures(line)?.get(1)?.as_str()))
+        .collect();
+    let leaf = |test: &str| {
+        !failed.iter().any(|other| {
+            other
+                .strip_prefix(test)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
     let mut locations = Vec::new();
     let mut seen = HashSet::new();
-    for line in doc.text().lines() {
-        if let Some(location) = source_location(line.to_string().trim_end(), Path::new("")) {
+    for line in lines {
+        let found = if let Some(location) = source_location(line, Path::new("")) {
+            vec![location]
+        } else if let Some(test) = FAILED_TEST
+            .captures(line)
+            .map(|c| c.get(1).unwrap().as_str())
+            .filter(|test| leaf(test))
+        {
+            let resolution = package.and_then(|p| p.resolve(test));
+            let message = match &resolution {
+                Some(resolution) if resolution.shown != test => {
+                    format!("--- FAIL: {test} (showing {})", resolution.shown)
+                }
+                _ => format!("--- FAIL: {test}"),
+            };
+            resolution
+                .map(|resolution| resolution.locations)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|location| SourceLocation {
+                    message: message.clone(),
+                    ..location
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for location in found {
             if seen.insert(location.clone()) {
                 locations.push(location);
             }
         }
     }
-    if locations.is_empty() {
-        cx.editor
-            .set_error("No source locations reported; Space t r shows the full output");
-        return;
+    locations
+}
+
+fn package_dir(lines: &[String]) -> Option<PathBuf> {
+    lines
+        .iter()
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| line.strip_prefix("Package: "))
+        .map(PathBuf::from)
+}
+
+/// The test an output line belongs to: named on the line, else by the closest
+/// marker above it. `go test -json` output is serialized per test, and
+/// interleaved parallel output is re-announced with `=== CONT`/`=== NAME`.
+fn test_on_line(lines: &[String], line: usize) -> Option<&str> {
+    if SUMMARY.is_match(&lines[line]) {
+        return None;
     }
+    lines[..=line]
+        .iter()
+        .rev()
+        .take_while(|line| *line != STDERR_SEPARATOR)
+        .find_map(|line| Some(TEST_NAME.captures(line)?.get(1)?.as_str()))
+}
+
+fn pick_location(cx: &mut compositor::Context, locations: Vec<SourceLocation>) {
     cx.jobs.callback(async move {
         Ok(Callback::EditorCompositor(Box::new(
             move |_, compositor| {
@@ -672,6 +794,12 @@ fn jump_to_location(editor: &mut Editor, location: &SourceLocation, action: Acti
         editor.set_error("Reported source file no longer exists");
         return;
     }
+    // Keep the output on screen: open sources in the split beside it.
+    if matches!(action, Action::Replace) && Some(view!(editor).doc) == editor.go_test_doc_id {
+        if let Some(view) = source_view(editor) {
+            editor.focus(view);
+        }
+    }
     let id = match editor.open(&location.path, action) {
         Ok(id) => id,
         Err(err) => {
@@ -692,6 +820,17 @@ fn jump_to_location(editor: &mut Editor, location: &SourceLocation, action: Acti
     if action.align_view(view, id) {
         super::align_view(doc, view, super::Align::Center);
     }
+}
+
+/// The most recently focused split that is not showing the test output.
+fn source_view(editor: &Editor) -> Option<helix_view::ViewId> {
+    editor
+        .tree
+        .views()
+        .map(|(view, _)| view)
+        .filter(|view| Some(view.doc) != editor.go_test_doc_id)
+        .max_by_key(|view| editor.documents[&view.doc].focused_at)
+        .map(|view| view.id)
 }
 
 #[cfg(test)]
@@ -787,6 +926,76 @@ mod tests {
             resolve_locations(&text, Path::new("/different/package")),
             text
         );
+    }
+
+    #[test]
+    fn locations_skip_labels_and_stop_at_the_first_go_file() {
+        let dir = Path::new("/package");
+        for (text, file, line, message) in [
+            // testify: a tab-separated label precedes the path.
+            (
+                "        \tError Trace:\t/abs/foo_test.go:25",
+                "/abs/foo_test.go",
+                24,
+                "",
+            ),
+            (
+                "        \t            \t\t\t\t/abs/helper_test.go:10",
+                "/abs/helper_test.go",
+                9,
+                "",
+            ),
+            // Later paths and tabs in the message do not move the location.
+            (
+                "    foo_test.go:12: see bar.go:5\tand\tbaz.go:6",
+                "/package/foo_test.go",
+                11,
+                "see bar.go:5\tand\tbaz.go:6",
+            ),
+        ] {
+            let location = source_location(text, dir).unwrap();
+            assert_eq!(location.path, Path::new(file), "{text}");
+            assert_eq!(location.line, line, "{text}");
+            assert_eq!(location.message, message, "{text}");
+        }
+        let testify = "        \tError Trace:\t/abs/foo_test.go:25\n";
+        assert_eq!(resolve_locations(testify, dir), testify);
+    }
+
+    #[test]
+    fn output_lines_belong_to_the_test_marked_above_them() {
+        let output = format!(
+            "Go test: All tests in package\nPackage: /package\n\nFAILED (exit status 1)\n\n\
+             === RUN   TestTable\n\
+             === RUN   TestTable/case_one\n\
+             \x20   table_test.go:21: got 1, want 2\n\
+             \x20       second line\n\
+             --- FAIL: TestTable/case_one (0.00s)\n\
+             === CONT  TestParallel/p2\n\
+             \x20   table_test.go:51: log from p2\n\
+             \x20       \tError:      \tNot equal\n\
+             \x20       \tTest:       \tTestSuite/TestCreate/empty_key\n\
+             FAIL\n\
+             FAIL\texample.com/sample\t0.005s\n\
+             \n{STDERR_SEPARATOR}\n\
+             # example.com/sample\n"
+        );
+        let lines: Vec<String> = output.lines().map(str::to_owned).collect();
+        let owner = |needle: &str| {
+            let line = lines.iter().position(|l| l.contains(needle)).unwrap();
+            test_on_line(&lines, line)
+        };
+        assert_eq!(package_dir(&lines), Some(PathBuf::from("/package")));
+        assert_eq!(owner("Go test:"), None);
+        assert_eq!(owner("FAILED"), None);
+        assert_eq!(owner("=== RUN   TestTable"), Some("TestTable"));
+        assert_eq!(owner("second line"), Some("TestTable/case_one"));
+        assert_eq!(owner("--- FAIL: TestTable/"), Some("TestTable/case_one"));
+        assert_eq!(owner("log from p2"), Some("TestParallel/p2"));
+        assert_eq!(owner("Error:"), Some("TestParallel/p2"));
+        assert_eq!(owner("Test:"), Some("TestSuite/TestCreate/empty_key"));
+        assert_eq!(owner("FAIL\texample.com"), None);
+        assert_eq!(owner("# example.com"), None);
     }
 
     #[tokio::test]
@@ -1603,6 +1812,194 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             .unwrap()
             .0
             .contains("Save modified files"));
+        assert!(app.close().await.is_empty());
+    }
+
+    /// Put the cursor on the first output line containing `needle` and run
+    /// Space t f, as a user reading the results would.
+    async fn follow(app: &mut Application, needle: &str) {
+        let id = app.editor.go_test_doc_id.unwrap();
+        focus_results(&mut app.editor, id);
+        let (view, doc) = current!(app.editor);
+        let line = doc
+            .text()
+            .lines()
+            .position(|line| line.to_string().contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not in output:\n{}", doc.text()));
+        doc.set_selection(view.id, Selection::point(doc.text().line_to_char(line)));
+        keys(app, "<space>tf").await;
+    }
+
+    /// The focused file and 1-based cursor line.
+    fn position(app: &Application) -> (PathBuf, usize) {
+        let (view, doc) = current_ref!(app.editor);
+        let line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        (doc.path().cloned().unwrap_or_default(), line + 1)
+    }
+
+    fn status(app: &Application) -> String {
+        app.editor
+            .get_status()
+            .map(|(status, _)| status.to_string())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn output_lines_open_their_test_row_or_location_beside_the_output() {
+        let fixture = tempfile::tempdir().unwrap();
+        let dir = helix_stdx::path::canonicalize(fixture.path());
+        let path = dir.join("table_test.go");
+        std::fs::write(
+            &path,
+            "package sample\n\nimport \"testing\"\n\nfunc TestTable(t *testing.T) {\n\
+             \tfor _, tt := range []struct{ name string }{\n\
+             \t\t{name: \"case one\"},\n\
+             \t} {\n\
+             \t\tt.Run(tt.name, func(t *testing.T) {\n\
+             \t\t\tt.Error(\"got 1, want 2\")\n\
+             \t\t})\n\
+             \t}\n}\n",
+        )
+        .unwrap();
+        let mut app = test_app(&path);
+        let source_view = view!(app.editor).id;
+        let id = result_buffer(&mut app.editor);
+        replace_output(
+            &mut app.editor,
+            id,
+            format!(
+                "Go test: All tests in package\nPackage: {}\n\nFAILED (exit status 1)\n\n\
+                 === RUN   TestTable\n\
+                 === RUN   TestTable/case_one\n\
+                 \x20   {}:10: got 1, want 2\n\
+                 \x20       more detail\n\
+                 --- FAIL: TestTable/case_one (0.00s)\n\
+                 === RUN   TestTable/dynamic-1\n\
+                 --- FAIL: TestTable/dynamic-1 (0.00s)\n\
+                 --- FAIL: TestTable (0.00s)\n\
+                 --- FAIL: TestGone (0.00s)\n\
+                 FAIL\n",
+                dir.display(),
+                path.display()
+            ),
+        );
+        let visible = |app: &Application| app.editor.tree.views().any(|(v, _)| v.doc == id);
+        for (needle, line) in [
+            ("--- FAIL: TestTable/case_one", 7),
+            ("=== RUN   TestTable/case_one", 7),
+            ("more detail", 7),
+            (":10: got 1", 10),
+            ("=== RUN   TestTable\n", 5),
+        ] {
+            follow(&mut app, needle.trim_end()).await;
+            assert_eq!(position(&app), (path.clone(), line), "{needle}");
+            // The source opens in the split beside the output, which stays.
+            assert_eq!(view!(app.editor).id, source_view, "{needle}");
+            assert!(visible(&app), "{needle}");
+        }
+        follow(&mut app, "=== RUN   TestTable/dynamic-1").await;
+        assert_eq!(position(&app), (path.clone(), 5));
+        assert!(
+            status(&app).contains("No source line names TestTable/dynamic-1; showing TestTable")
+        );
+        follow(&mut app, "TestGone").await;
+        assert_eq!(doc!(app.editor).id(), id);
+        assert!(status(&app).contains("TestGone is not declared"));
+
+        // A line without a test or location offers every location and the
+        // failed subtests (not their failing parents) in a picker.
+        follow(&mut app, "Go test:").await;
+        keys(&mut app, "case_one<ret>").await;
+        assert_eq!(position(&app), (path.clone(), 7));
+        assert!(visible(&app));
+        follow(&mut app, "Go test:").await;
+        keys(&mut app, "showing<ret>").await;
+        assert_eq!(position(&app), (path.clone(), 5));
+        follow(&mut app, "Go test:").await;
+        keys(&mut app, "got<ret>").await;
+        assert_eq!(position(&app), (path.clone(), 10));
+        let lines: Vec<String> = app.editor.documents[&id]
+            .text()
+            .lines()
+            .map(|line| line.to_string().trim_end().to_owned())
+            .collect();
+        let package = names::Package::read(&dir);
+        let messages: Vec<_> = reported_locations(&lines, Some(&package))
+            .into_iter()
+            .map(|location| (location.line + 1, location.message))
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                (10, "got 1, want 2".to_owned()),
+                (7, "--- FAIL: TestTable/case_one".to_owned()),
+                (
+                    5,
+                    "--- FAIL: TestTable/dynamic-1 (showing TestTable)".to_owned()
+                ),
+            ]
+        );
+        assert!(app.close().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Go on PATH; navigates real output to table rows"]
+    async fn real_output_navigates_to_repeated_and_dynamic_cases() {
+        let fixture = tempfile::tempdir().unwrap();
+        let dir = helix_stdx::path::canonicalize(fixture.path());
+        let path = dir.join("sample_test.go");
+        std::fs::write(dir.join("go.mod"), "module example.com/rows\n\ngo 1.20\n").unwrap();
+        std::fs::write(
+            &path,
+            r#"package sample
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestTable(t *testing.T) {
+	for i, tt := range []struct {
+		name string
+		ok   bool
+	}{
+		{name: "same name", ok: true},
+		{name: "same name", ok: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if !tt.ok {
+				t.Error("row failed")
+			}
+		})
+		t.Run(fmt.Sprint("dynamic-", i), func(t *testing.T) {
+			if i == 1 {
+				t.Error("dynamic failed")
+			}
+		})
+	}
+}
+"#,
+        )
+        .unwrap();
+        let mut app = test_app(&path);
+        keys(&mut app, "<space>tp").await;
+        let output = finished_output(&mut app).await;
+        assert!(
+            output.contains("--- FAIL: TestTable/same_name#01"),
+            "{output}"
+        );
+        // Go numbers the second row; both rows are offered, that one first.
+        follow(&mut app, "--- FAIL: TestTable/same_name#01").await;
+        keys(&mut app, "<ret>").await;
+        assert_eq!(position(&app), (path.clone(), 14));
+        follow(&mut app, "row failed").await;
+        assert_eq!(position(&app), (path.clone(), 18));
+        follow(&mut app, "--- FAIL: TestTable/dynamic-1").await;
+        assert_eq!(position(&app), (path.clone(), 8));
+        assert!(status(&app).contains("showing TestTable"));
         assert!(app.close().await.is_empty());
     }
 }

@@ -79,7 +79,7 @@
 | `:go-test-nearest` | Run the saved Go test or static subtest at the cursor without debugging. |
 | `:go-test-last` | Rerun the last started Go test selection in its original package. |
 | `:go-test-results` | Show retained output from the most recent Go test run. |
-| `:go-test-locations` | Pick a source location reported by the most recent Go test run. |
+| `:go-test-locations` | In Go test output, go to the source location or test on the cursor line. Elsewhere, pick a reported location or failed test. |
 | `:go-test-cancel` | Cancel the running Go test. |
 | `:debug-start`, `:dbg` | Start a debug session from a given template with given parameters. |
 | `:debug-remote`, `:dbg-tcp` | Connect to a debug adapter by TCP address and start a debugging session from a given template with given parameters. |

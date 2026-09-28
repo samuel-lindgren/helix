@@ -602,7 +602,7 @@ impl MappableCommand {
         go_test_package, "Run all tests in the current Go package without debugging",
         go_test_picker, "Select and run a Go test without debugging",
         go_test_results, "Show retained Go test output",
-        go_test_locations, "Jump to a source location in Go test output",
+        go_test_locations, "Go to the source or test on a Go test output line, or pick one",
         go_test_cancel, "Cancel the running Go test",
         dap_launch, "Launch debug target",
         dap_rerun_last, "Rerun last debug target",

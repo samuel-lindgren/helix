@@ -3942,7 +3942,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "go-test-locations",
         aliases: &[],
-        doc: "Pick a source location reported by the most recent Go test run.",
+        doc: "In Go test output, go to the source location or test on the cursor line. Elsewhere, pick a reported location or failed test.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
                 super::go_test::show_locations(cx);
