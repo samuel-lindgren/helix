@@ -26,6 +26,44 @@ P = ":git-push"
 x = ":git-cancel"
 ```
 
+## Changes in the gutter
+
+With the `diff` gutter enabled, lines that differ from `HEAD` are marked:
+added and modified lines with `▍`, removed lines with `▔` on the line below
+them. `Space T` adds the branch diff: the lines changed since the branch left
+`main` (or `master`), committed or not, marked in a second color.
+
+| Key | Action |
+| --- | --- |
+| `Space K` | Show the change at the cursor: its removed (`-`) and added (`+`) lines, with the words that changed highlighted. With the branch diff on, its change at the cursor is shown as well. |
+| `]g` / `[g` | Go to the next / previous change (`]G` / `[G`: last / first). |
+| `]B` / `[B` | Go to the next / previous branch change. |
+| `Space T` | Toggle the branch diff. |
+| `Space v` | Reset the branch change at the cursor to its content at the merge-base. |
+
+```text
+Uncommitted change 1/2  @@ -7 +7 @@
+-       timeout: 300
++       timeout: 600
+
+Branch change 1/2  @@ -7 +7,2 @@
+-       timeout: 300
++       timeout: 600
++       helmfile_extra_flags: "--timeout=600"
+```
+
+Each header counts the file's changes and numbers the lines like `git diff`,
+including `\ No newline at end of file`. The branch section is left out when it
+shows the same change, as it does on the base branch itself.
+
+Each removed line is compared with the added line it most likely became, and
+the words that differ are highlighted, on lines that keep at least a third of
+their text. Changed whitespace is drawn as `·` (space), `→` (tab) and `␍` (the
+carriage return of a CRLF line break). Control characters are shown as symbols
+such as `␛`. Words are compared in changes of up to 100 lines and 16 KiB. Lines
+longer than 1000 characters are cut (`…`), and changes longer than 500 lines per
+side are cut too. `Ctrl-d` / `Ctrl-u` scroll the popup; other keys close it.
+
 ## The changes picker
 
 `:git-status` lists one row per file and side of the index. The status line
@@ -180,6 +218,8 @@ files, and with `SIGKILL` two seconds later if they are still running.
 ## Development checks
 
 ```sh
+cargo test -p helix-core --lib diff::
+cargo test -p helix-term --lib hunk_preview
 cargo test -p helix-view git --lib
 cargo test -p helix-term --features integration --lib -- git:: process::
 cargo test -p helix-term --features integration --test integration -- test::git

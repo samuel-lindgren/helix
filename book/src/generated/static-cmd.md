@@ -165,7 +165,7 @@
 | `goto_prev_branch_change` | Goto previous branch change (vs main/master) | normal: `` [B ``, select: `` [B `` |
 | `goto_first_branch_change` | Goto first branch change (vs main/master) |  |
 | `goto_last_branch_change` | Goto last branch change (vs main/master) |  |
-| `diff_peek` | Peek removed content of the hunk at cursor (HEAD and branch diff) | normal: `` <space>K ``, select: `` <space>K `` |
+| `diff_peek` | Show the diff of the change at cursor (HEAD and branch diff) | normal: `` <space>K ``, select: `` <space>K `` |
 | `git_blame_line` | Show git blame popup for line at cursor | normal: `` <space>L ``, select: `` <space>L `` |
 | `reset_branch_change` | Reset branch diff hunk at cursor to merge-base content | normal: `` <space>v ``, select: `` <space>v `` |
 | `goto_line_start` | Goto line start | normal: `` gh ``, `` <home> ``, select: `` gh ``, insert: `` <home> `` |

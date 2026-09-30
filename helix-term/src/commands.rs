@@ -470,7 +470,7 @@ impl MappableCommand {
         goto_prev_branch_change, "Goto previous branch change (vs main/master)",
         goto_first_branch_change, "Goto first branch change (vs main/master)",
         goto_last_branch_change, "Goto last branch change (vs main/master)",
-        diff_peek, "Peek removed content of the hunk at cursor (HEAD and branch diff)",
+        diff_peek, "Show the diff of the change at cursor (HEAD and branch diff)",
         git_blame_line, "Show git blame popup for line at cursor",
         reset_branch_change, "Reset branch diff hunk at cursor to merge-base content",
         goto_line_start, "Goto line start",
@@ -4148,24 +4148,6 @@ impl ChangeDiffSource {
     }
 }
 
-/// Extract the pre-change text of the hunk containing `cursor_line` from the
-/// given diff handle's base rope. Returns `None` when there is no hunk at the
-/// cursor or when the hunk is a pure addition (nothing previously at that
-/// position).
-fn peek_removed_text(handle: Option<&DiffHandle>, cursor_line: u32) -> Option<String> {
-    let diff = handle?.load();
-    let idx = diff.hunk_at(cursor_line, true)?;
-    let hunk = diff.nth_hunk(idx);
-    if hunk.before.is_empty() {
-        return None;
-    }
-    let base = diff.diff_base();
-    let start = base.line_to_char(hunk.before.start as usize);
-    let end = base.line_to_char(hunk.before.end as usize);
-    let text = base.slice(start..end).to_string();
-    Some(text.trim_end_matches('\n').to_string())
-}
-
 fn goto_first_change(cx: &mut Context) {
     goto_first_change_impl(cx, false, ChangeDiffSource::Head);
 }
@@ -4337,33 +4319,37 @@ fn reset_branch_change(cx: &mut Context) {
     }
 }
 
+/// Show the diff of the change at the cursor: the lines it removed and added,
+/// with changed words marked. Covers the working-tree diff and, when the branch
+/// diff is on, the branch diff too.
 fn diff_peek(cx: &mut Context) {
-    use crate::ui::Markdown;
-
     let (view, doc) = current_ref!(cx.editor);
+    if doc.diff_handle().is_none() && doc.branch_diff_handle().is_none() {
+        cx.editor
+            .set_status(ChangeDiffSource::Head.missing_message());
+        return;
+    }
     let text = doc.text().slice(..);
     let cursor_line = doc.selection(view.id).primary().cursor_line(text) as u32;
-    let lang = doc.language_name().unwrap_or("text").to_string();
+    let tab_width = doc.tab_width();
 
-    let head = peek_removed_text(doc.diff_handle(), cursor_line);
-    let branch = peek_removed_text(doc.branch_diff_handle(), cursor_line);
+    let head = doc.diff_handle().and_then(|handle| {
+        ui::HunkSection::at_line("Uncommitted change", handle, cursor_line, tab_width)
+    });
+    let branch = doc.branch_diff_handle().and_then(|handle| {
+        ui::HunkSection::at_line("Branch change", handle, cursor_line, tab_width)
+    });
+    // On the base branch itself, both diffs show the same change.
+    let branch =
+        branch.filter(|branch| !head.as_ref().is_some_and(|head| head.same_change(branch)));
+    let sections: Vec<_> = head.into_iter().chain(branch).collect();
+    if sections.is_empty() {
+        cx.editor.set_status("No change at cursor");
+        return;
+    }
 
-    let md = match (head, branch) {
-        (None, None) => {
-            cx.editor.set_status("No change at cursor");
-            return;
-        }
-        (Some(h), None) => format!("```{lang}\n{h}\n```"),
-        (None, Some(b)) => format!("```{lang}\n{b}\n```"),
-        (Some(h), Some(b)) => {
-            format!("### HEAD\n```{lang}\n{h}\n```\n\n### Branch\n```{lang}\n{b}\n```")
-        }
-    };
-
-    let syn_loader = cx.editor.syn_loader.clone();
     cx.callback.push(Box::new(move |compositor, _cx| {
-        let contents = Markdown::new(md, syn_loader);
-        let popup = Popup::new("diff-peek", contents).auto_close(true);
+        let popup = Popup::new("diff-peek", ui::HunkPreview::new(sections)).auto_close(true);
         compositor.replace_or_push("diff-peek", popup);
     }));
 }
