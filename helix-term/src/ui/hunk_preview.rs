@@ -1,6 +1,6 @@
 //! Popup contents showing what a change (a diff hunk) removed and added.
 
-use std::ops::Range;
+use std::{iter::Peekable, ops::Range, slice};
 
 use helix_core::{
     diff::compare_words,
@@ -45,7 +45,8 @@ struct Line {
     /// Whether the line was longer than [`MAX_LINE_CHARS`].
     cut: bool,
     /// The byte ranges of `text` that differ from the line it was paired
-    /// with. Empty for a line that is all new, or when words were not compared.
+    /// with. Empty for a line that is all new, when words were not compared,
+    /// or when the line was cut.
     changed: Vec<Range<usize>>,
 }
 
@@ -69,15 +70,17 @@ impl Side {
             .clone()
             .map(|idx| {
                 let line = text.line(idx);
-                let line_break = match get_line_ending(&line) {
-                    Some(LineEnding::Crlf) => 1,
-                    Some(line_ending) => line_ending.len_chars(),
-                    None => 0,
+                let (line_break, cr) = match get_line_ending(&line) {
+                    Some(LineEnding::Crlf) => (2, 1),
+                    Some(line_ending) => (line_ending.len_chars(), 0),
+                    None => (0, 0),
                 };
                 let len = line.len_chars() - line_break;
+                let cut = len > MAX_LINE_CHARS;
+                let kept = if cut { MAX_LINE_CHARS } else { len + cr };
                 Line {
-                    text: line.slice(..len.min(MAX_LINE_CHARS)).to_string(),
-                    cut: len > MAX_LINE_CHARS,
+                    text: line.slice(..kept).to_string(),
+                    cut,
                     changed: Vec::new(),
                 }
             })
@@ -215,11 +218,16 @@ impl HunkSection {
 /// Popup contents showing the diff of the hunks at the cursor.
 pub struct HunkPreview {
     sections: Vec<HunkSection>,
+    /// The size last required, and the text width it was measured for.
+    size: Option<(u16, (u16, u16))>,
 }
 
 impl HunkPreview {
     pub fn new(sections: Vec<HunkSection>) -> Self {
-        Self { sections }
+        Self {
+            sections,
+            size: None,
+        }
     }
 
     fn text(&self, theme: Option<&Theme>) -> Text<'static> {
@@ -246,22 +254,39 @@ impl Component for HunkPreview {
     fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
         let padding = 2;
         let max_text_width = viewport.0.saturating_sub(padding).min(120);
+        if let Some((text_width, size)) = self.size {
+            if text_width == max_text_width {
+                return Some(size);
+            }
+        }
+
         let text = self.text(None);
-        // Measure with the wrapping used to render. It counts rows in a `u16`;
-        // a row holds at least one column of a line, which bounds them.
-        let most_rows: usize = text.lines.iter().map(|line| line.width() + 1).sum();
-        let (width, height) = if most_rows <= usize::from(u16::MAX - padding) {
-            Paragraph::new(&text)
-                .wrap(Wrap { trim: false })
-                .required_size(max_text_width)
-        } else {
-            (max_text_width, u16::MAX - padding)
+        // Measure with the wrapping used to render, line by line: `Paragraph`
+        // counts rows in a `u16`, which a whole hunk can exceed.
+        let measure = |width: u16| {
+            text.lines.iter().fold((0, 0), |(widest, rows), line| {
+                let line = Text::from(line.clone());
+                let (line_width, line_rows) = Paragraph::new(&line)
+                    .wrap(Wrap { trim: false })
+                    .required_size(width);
+                (line_width.max(widest), rows + usize::from(line_rows))
+            })
         };
-        Some((width + padding, height + padding))
+        let (width, _) = measure(max_text_width);
+        // The text is rendered at the width of its widest row, where rows can
+        // break differently, e.g. within a run of spaces.
+        let (_, rows) = measure(width);
+        // Leave room for the popup's border.
+        let height = rows.min(usize::from(u16::MAX - 2 * padding)) as u16;
+        let size = (width + padding, height + padding);
+        self.size = Some((max_text_width, size));
+        Some(size)
     }
 }
 
-/// One `-` or `+` line, with its changed words in reverse video.
+/// One `-` or `+` line, with its changed words in reverse video. Changes
+/// separated only by whitespace are shown as one, the whitespace in between
+/// drawn as it is.
 fn diff_line(
     sign: &str,
     line: &Line,
@@ -272,19 +297,19 @@ fn diff_line(
     let emphasis = style.add_modifier(Modifier::REVERSED);
     let mut spans = vec![Span::styled(format!("{sign} "), style)];
     let mut shown = String::new();
-    let mut shown_changed = false;
+    let mut shown_emphasized = false;
     let mut column = 0;
+    let joined = join_changes(&line.text, &line.changed);
+    let mut joined = joined.iter().peekable();
     let mut changed_ranges = line.changed.iter().peekable();
     for (idx, ch) in line.text.char_indices() {
-        while changed_ranges.next_if(|range| range.end <= idx).is_some() {}
-        let changed = changed_ranges
-            .peek()
-            .is_some_and(|range| range.contains(&idx));
-        if changed != shown_changed && !shown.is_empty() {
-            let style = if shown_changed { emphasis } else { style };
+        let changed = advance_to(&mut changed_ranges, idx);
+        let emphasized = advance_to(&mut joined, idx);
+        if emphasized != shown_emphasized && !shown.is_empty() {
+            let style = if shown_emphasized { emphasis } else { style };
             spans.push(Span::styled(std::mem::take(&mut shown), style));
         }
-        shown_changed = changed;
+        shown_emphasized = emphasized;
 
         match ch {
             '\t' => {
@@ -297,10 +322,6 @@ fn diff_line(
                 }
                 column += width;
             }
-            ' ' if changed => {
-                shown.push(CHANGED_SPACE);
-                column += 1;
-            }
             // The `\r` of a CRLF line break.
             '\r' if idx + 1 == line.text.len() && !line.cut => {
                 if changed {
@@ -312,6 +333,12 @@ fn diff_line(
                 shown.push(control_picture(ch));
                 column += 1;
             }
+            ch if changed && ch.is_whitespace() => {
+                let width = ch.width().unwrap_or(1).max(1);
+                shown.push(CHANGED_SPACE);
+                shown.extend(std::iter::repeat_n(NBSP, width - 1));
+                column += width;
+            }
             ch => {
                 shown.push(ch);
                 column += ch.width().unwrap_or(0);
@@ -319,13 +346,20 @@ fn diff_line(
         }
     }
     if !shown.is_empty() {
-        let style = if shown_changed { emphasis } else { style };
+        let style = if shown_emphasized { emphasis } else { style };
         spans.push(Span::styled(shown, style));
     }
     if line.cut {
         spans.push(Span::styled("…", meta));
     }
     Spans::from(spans)
+}
+
+/// Skips the ascending `ranges` that end before `idx`, and returns whether the
+/// next one contains it.
+fn advance_to(ranges: &mut Peekable<slice::Iter<Range<usize>>>, idx: usize) -> bool {
+    while ranges.next_if(|range| range.end <= idx).is_some() {}
+    ranges.peek().is_some_and(|range| range.contains(&idx))
 }
 
 /// A visible stand-in for a control character, which would otherwise reach
@@ -370,10 +404,15 @@ fn mark_changed_words(removed: &mut Side, added: &mut Side) {
     }
 
     // Two lines can pair when they share a third of the longer one's
-    // visible text. The weight prefers pairs that share more.
+    // visible text. The weight prefers pairs that share more. Cut lines do
+    // not pair: what differs may be past the cut.
     let mut pairs = Vec::with_capacity(rows * cols);
     for old in &removed.lines {
         for new in &added.lines {
+            if old.cut || new.cut {
+                pairs.push(None);
+                continue;
+            }
             let (old_changed, new_changed) = compare_words(&old.text, &new.text);
             let kept = visible(&old.text) - visible_in(&old.text, &old_changed);
             let longest = visible(&old.text).max(visible(&new.text));
@@ -411,9 +450,9 @@ fn mark_changed_words(removed: &mut Side, added: &mut Side) {
             col -= 1;
             if let Some((_, old_changed, new_changed)) = pairs[row * cols + col].take() {
                 let old = &mut removed.lines[row];
-                old.changed = tidy_changes(&old.text, old_changed);
+                old.changed = worth_marking(&old.text, old_changed);
                 let new = &mut added.lines[col];
-                new.changed = tidy_changes(&new.text, new_changed);
+                new.changed = worth_marking(&new.text, new_changed);
             }
         }
     }
@@ -430,25 +469,29 @@ fn visible_in(text: &str, ranges: &[Range<usize>]) -> usize {
         .sum()
 }
 
-/// Joins changes separated only by whitespace, and drops them all when the line
-/// has too little unchanged text for them to stand out.
-fn tidy_changes(line: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+/// The changes of a line, or none when the line has too little unchanged text
+/// for them to stand out.
+fn worth_marking(line: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    let total = visible(line);
+    let changed = visible_in(line, &ranges);
+    // At least a third of the visible text must be unchanged. Changes of
+    // whitespace alone are always kept: they would not be seen otherwise.
+    if total > 0 && (changed == total || changed * 3 > total * 2) {
+        return Vec::new();
+    }
+    ranges
+}
+
+/// `ranges` with those separated only by whitespace joined.
+fn join_changes(line: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
     let mut joined: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for range in ranges {
         match joined.last_mut() {
             Some(last) if line[last.end..range.start].chars().all(char::is_whitespace) => {
                 last.end = range.end
             }
-            _ => joined.push(range),
+            _ => joined.push(range.clone()),
         }
-    }
-
-    let total = visible(line);
-    let changed = visible_in(line, &joined);
-    // At least a third of the visible text must be unchanged. Changes of
-    // whitespace alone are always kept: they would not be seen otherwise.
-    if total > 0 && (changed == total || changed * 3 > total * 2) {
-        return Vec::new();
     }
     joined
 }
@@ -496,6 +539,26 @@ mod tests {
 
     fn preview(base: &str, doc: &str, hunk: Hunk) -> Vec<String> {
         rendered(&HunkPreview::new(vec![section(base, doc, hunk)]))
+    }
+
+    /// The text of the cells drawn in reverse video on each row, as rendered
+    /// 40 columns wide.
+    fn reversed(base: &str, doc: &str, hunk: Hunk) -> Vec<String> {
+        let text = HunkPreview::new(vec![section(base, doc, hunk)]).text(None);
+        let area = Rect::new(0, 0, 40, text.lines.len() as u16);
+        let mut surface = Surface::empty(area);
+        Paragraph::new(&text)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut surface);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| &surface[(x, y)])
+                    .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+                    .map(|cell| cell.symbol.as_str())
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -596,8 +659,25 @@ mod tests {
             "the slow red fox\n",
             hunk(0..1, 0..1),
         );
-        assert_eq!(changed_text(&section.removed), [["quick brown"]]);
-        assert_eq!(changed_text(&section.added), [["slow red"]]);
+        assert_eq!(changed_text(&section.removed), [["quick", "brown"]]);
+        // The unchanged space in between is reversed too, but not drawn as a
+        // changed space.
+        assert_eq!(
+            reversed(
+                "the quick brown fox\n",
+                "the slow red fox\n",
+                hunk(0..1, 0..1)
+            )[1..],
+            ["quick brown", "slow red"]
+        );
+        assert_eq!(
+            preview(
+                "the quick brown fox\n",
+                "the slow red fox\n",
+                hunk(0..1, 0..1)
+            )[1..],
+            ["- the quick brown fox", "+ the slow red fox"]
+        );
     }
 
     #[test]
@@ -623,19 +703,48 @@ mod tests {
 
     #[test]
     fn changes_render_in_reverse_video_up_to_the_end_of_the_row() {
-        let preview = HunkPreview::new(vec![section("x = 1\n", "x = 1  \n", hunk(0..1, 0..1))]);
-        let text = preview.text(None);
-        let area = Rect::new(0, 0, 40, 3);
-        let mut surface = Surface::empty(area);
-        Paragraph::new(&text)
-            .wrap(Wrap { trim: false })
-            .render(area, &mut surface);
-        let reversed: String = (0..area.width)
-            .map(|x| &surface[(x, 2)])
-            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
-            .map(|cell| cell.symbol.as_str())
-            .collect();
-        assert_eq!(reversed, "··");
+        assert_eq!(
+            reversed("x = 1\n", "x = 1  \n", hunk(0..1, 0..1))[1..],
+            ["", "··"]
+        );
+        // Wide whitespace keeps its width.
+        assert_eq!(
+            reversed("x = 1\n", "x = 1\u{3000}\n", hunk(0..1, 0..1))[2],
+            "·\u{a0}"
+        );
+    }
+
+    #[test]
+    fn crlf_line_breaks_stay_apart_from_trailing_whitespace() {
+        assert_eq!(
+            preview("let x = 1;  \r\n", "let x = 1;\r\n", hunk(0..1, 0..1))[1..],
+            ["- let x = 1;··", "+ let x = 1;"]
+        );
+    }
+
+    #[test]
+    fn a_crlf_line_of_the_longest_shown_length_is_not_cut() {
+        let line = "x".repeat(MAX_LINE_CHARS);
+        let lines = preview(
+            &format!("{line}\r\n"),
+            &format!("{line}\n"),
+            hunk(0..1, 0..1),
+        );
+        assert_eq!(lines[1], format!("- {line}␍"));
+        assert_eq!(lines[2], format!("+ {line}"));
+    }
+
+    #[test]
+    fn cut_lines_are_not_word_diffed() {
+        let rest = "x".repeat(MAX_LINE_CHARS);
+        let section = section(
+            &format!("a {rest} end\n"),
+            &format!("b {rest} end\n"),
+            hunk(0..1, 0..1),
+        );
+        assert!(section.removed.lines[0].cut);
+        assert_eq!(changed_text(&section.removed), [Vec::<&str>::new()]);
+        assert_eq!(changed_text(&section.added), [Vec::<&str>::new()]);
     }
 
     #[test]
@@ -736,7 +845,25 @@ mod tests {
         let doc = line.repeat(MAX_LINES);
         let mut preview =
             HunkPreview::new(vec![section("", &doc, hunk(0..0, 0..MAX_LINES as u32))]);
-        assert_eq!(preview.required_size((20, 26)), Some((20, u16::MAX)));
+        // More rows than a `u16` holds in total, but counted line by line.
+        let (_, height) = preview.required_size((20, 26)).unwrap();
+        assert!(height > 20_000 && height < u16::MAX - 2, "{height}");
+        // Room is left for the popup's border.
+        assert_eq!(preview.required_size((3, 26)), Some((3, u16::MAX - 2)));
+    }
+
+    #[test]
+    fn required_size_counts_rows_at_the_width_rendered() {
+        // At the widest row's width, the second space starts a row of its own.
+        let doc = format!("{}  {}\n", "a".repeat(58), "b".repeat(60));
+        let mut preview = HunkPreview::new(vec![section("", &doc, hunk(0..0, 0..1))]);
+        let (width, height) = preview.required_size((120, 26)).unwrap();
+        let text = preview.text(None);
+        let rows = Paragraph::new(&text)
+            .wrap(Wrap { trim: false })
+            .required_size(width - 2)
+            .1;
+        assert_eq!(height, rows + 2);
     }
 
     #[test]

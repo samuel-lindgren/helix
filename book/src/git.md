@@ -58,11 +58,12 @@ shows the same change, as it does on the base branch itself.
 
 Each removed line is compared with the added line it most likely became, and
 the words that differ are highlighted, on lines that keep at least a third of
-their text. Changed whitespace is drawn as `·` (space), `→` (tab) and `␍` (the
-carriage return of a CRLF line break). Control characters are shown as symbols
-such as `␛`. Words are compared in changes of up to 100 lines and 16 KiB. Lines
-longer than 1000 characters are cut (`…`), and changes longer than 500 lines per
-side are cut too. `Ctrl-d` / `Ctrl-u` scroll the popup; other keys close it.
+their text. Changed whitespace is drawn as `→` (tab), `␍` (the carriage return
+of a CRLF line break) and `·` (a space or other whitespace). Control characters
+are shown as symbols such as `␛`. Words are compared in changes of up to 100
+lines and 16 KiB, and not on lines longer than 1000 characters, which are cut
+(`…`). Changes longer than 500 lines per side are cut too. `Ctrl-d` / `Ctrl-u`
+scroll the popup; other keys close it.
 
 ## The changes picker
 
