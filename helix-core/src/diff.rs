@@ -173,7 +173,8 @@ pub fn compare_ropes(before: &Rope, after: &Rope) -> Transaction {
 /// ascending order.
 ///
 /// A word is a run of alphanumeric characters and `_`, or a run of whitespace
-/// other than `\n`. Every other character, including `\n`, is a word of its own.
+/// other than `\n` and `\r`. Every other character, including `\n` and `\r`, is
+/// a word of its own, so a line break never joins the whitespace before it.
 pub fn compare_words(before: &str, after: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     let before_words = split_words(before);
     let after_words = split_words(after);
@@ -233,7 +234,7 @@ fn split_words(text: &str) -> Vec<Range<usize>> {
     let class = |ch: char| {
         if ch.is_alphanumeric() || ch == '_' {
             Class::Word
-        } else if ch.is_whitespace() && ch != '\n' {
+        } else if ch.is_whitespace() && ch != '\n' && ch != '\r' {
             Class::Space
         } else {
             Class::Other
@@ -273,12 +274,12 @@ mod tests {
 
     #[test]
     fn split_words_groups_words_and_spaces() {
-        let text = "a_b1  (x)\n\tÄö";
+        let text = "a_b1  (x)\r\n\tÄö";
         let words: Vec<_> = split_words(text)
             .into_iter()
             .map(|range| &text[range])
             .collect();
-        assert_eq!(words, ["a_b1", "  ", "(", "x", ")", "\n", "\t", "Äö"]);
+        assert_eq!(words, ["a_b1", "  ", "(", "x", ")", "\r", "\n", "\t", "Äö"]);
         assert!(split_words("").is_empty());
     }
 
@@ -332,6 +333,11 @@ mod tests {
         assert_eq!(
             changed_words("let a = 1;\nlet b = 2;", "let b = 2;"),
             (vec!["let a = 1;\n"], vec![])
+        );
+        // Trailing whitespace removed from a CRLF line keeps the CR apart.
+        assert_eq!(
+            changed_words("let x = 1;  \r", "let x = 1;\r"),
+            (vec!["  "], vec![])
         );
         // A new last line that ends like the line before it.
         assert_eq!(changed_words("}", "}\nx{}"), (vec![], vec!["\nx{}"]));
