@@ -297,6 +297,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `t`     | Enter [Go test mode](#go-test-mode)                                      | N/A                                        |
 | `G`     | Debug (experimental)                                                    | N/A                                        |
 | `k`     | Show documentation for item under cursor in a [popup](#popup) (**LSP**) | `hover`                                    |
+| `K`     | Show the diff of the change under cursor in a [popup](#popup)          | `diff_peek`                                |
 | `s`     | Open document symbol picker (**LSP** or **TS**)                         | `lsp_or_syntax_symbol_picker`              |
 | `S`     | Open workspace symbol picker (**LSP** or **TS**)                        | `lsp_or_syntax_workspace_symbol_picker`    |
 | `d`     | Open document diagnostics picker (**LSP**)                              | `diagnostics_picker`                       |
