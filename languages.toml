@@ -788,6 +788,73 @@ name = "c-sharp"
 source = { git = "https://github.com/tree-sitter/tree-sitter-c-sharp", rev = "b5eb5742f6a7e9438bee22ce8026d6b927be2cd7" }
 
 [[language]]
+name = "razor"
+scope = "text.aspnetcorerazor"
+injection-regex = "razor"
+file-types = ["razor"]
+roots = ["*.slnx", "*.sln", "*.csproj"]
+language-id = "aspnetcorerazor"
+block-comment-tokens = { start = "@*", end = "*@" }
+indent = { tab-width = 4, unit = "    " }
+language-servers = [ "roslyn-language-server" ]
+
+[language.debugger]
+name = "netcoredbg"
+transport = "tcp"
+command = "netcoredbg"
+args = [ "--interpreter=vscode" ]
+port-arg = "--server={}"
+
+[[language.debugger.templates]]
+name = "launch"
+request = "launch"
+completion = [ { name = "path to dll", completion = "filename" } ]
+args = { type = "coreclr", console = "internalConsole", internalConsoleOptions = "openOnSessionStart", program = "{0}" }
+
+[[language.debugger.templates]]
+name = "attach"
+request = "attach"
+completion = [ "pid" ]
+args = { processId = "{0}" }
+
+[[grammar]]
+name = "razor"
+source = { git = "https://github.com/tris203/tree-sitter-razor", rev = "d4664e409caaea12f73c9525484e3cf88b1cf718" }
+
+[[language]]
+name = "cshtml"
+scope = "text.html.cshtml"
+injection-regex = "cshtml"
+file-types = ["cshtml"]
+roots = ["*.slnx", "*.sln", "*.csproj"]
+language-id = "aspnetcorerazor"
+# The Razor grammar does not parse a document with a doctype or an unclosed
+# void element, which layouts and views are full of.
+grammar = "html"
+block-comment-tokens = { start = "@*", end = "*@" }
+indent = { tab-width = 4, unit = "    " }
+language-servers = [ "roslyn-language-server" ]
+
+[language.debugger]
+name = "netcoredbg"
+transport = "tcp"
+command = "netcoredbg"
+args = [ "--interpreter=vscode" ]
+port-arg = "--server={}"
+
+[[language.debugger.templates]]
+name = "launch"
+request = "launch"
+completion = [ { name = "path to dll", completion = "filename" } ]
+args = { type = "coreclr", console = "internalConsole", internalConsoleOptions = "openOnSessionStart", program = "{0}" }
+
+[[language.debugger.templates]]
+name = "attach"
+request = "attach"
+completion = [ "pid" ]
+args = { processId = "{0}" }
+
+[[language]]
 name = "c3"
 scope = "source.c3"
 injection-regex = "c3"
@@ -1113,7 +1180,7 @@ source = { git = "https://github.com/jimliang/tree-sitter-less", rev = "e5ae6245
 name = "html"
 scope = "text.html.basic"
 injection-regex = "html"
-file-types = ["html", "htm", "shtml", "xhtml", "xht", "jsp", "asp", "aspx", "jshtm", "volt", "rhtml", "cshtml"]
+file-types = ["html", "htm", "shtml", "xhtml", "xht", "jsp", "asp", "aspx", "jshtm", "volt", "rhtml"]
 block-comment-tokens = { start = "<!--", end = "-->" }
 language-servers = [ "vscode-html-language-server", "superhtml" ]
 auto-format = true

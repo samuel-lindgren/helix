@@ -37,6 +37,7 @@
 | cpp | ✓ | ✓ | ✓ | ✓ | ✓ | `clangd` |
 | cross-config | ✓ | ✓ |  |  | ✓ | `taplo`, `tombi` |
 | crystal | ✓ | ✓ | ✓ | ✓ |  | `crystalline`, `ameba-ls` |
+| cshtml | ✓ | ✓ |  |  | ✓ | `roslyn-language-server` |
 | css | ✓ |  | ✓ |  | ✓ | `vscode-css-language-server` |
 | csv | ✓ |  |  |  |  |  |
 | cue | ✓ |  |  |  |  | `cuelsp` |
@@ -233,6 +234,7 @@
 | quint | ✓ |  |  |  |  | `quint-language-server` |
 | r | ✓ |  |  |  |  | `R` |
 | racket | ✓ |  | ✓ |  | ✓ | `racket` |
+| razor | ✓ | ✓ |  | ✓ |  | `roslyn-language-server` |
 | regex | ✓ |  |  |  | ✓ |  |
 | rego | ✓ |  |  |  |  | `regols` |
 | rescript | ✓ | ✓ |  |  |  | `rescript-language-server` |
