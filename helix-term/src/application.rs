@@ -77,6 +77,7 @@ pub struct Application {
     signals: Signals,
     jobs: Jobs,
     lsp_progress: LspProgressMap,
+    razor_html: handlers::razor::HtmlBridge,
 
     theme_mode: Option<theme::Mode>,
 }
@@ -264,6 +265,7 @@ impl Application {
             signals,
             jobs,
             lsp_progress: LspProgressMap::new(),
+            razor_html: Default::default(),
             theme_mode,
         };
 
@@ -957,6 +959,13 @@ impl Application {
             Call::MethodCall(helix_lsp::jsonrpc::MethodCall {
                 method, params, id, ..
             }) => {
+                // Razor leaves HTML to the editor, and gets its reply from there.
+                let Some(params) =
+                    self.razor_html
+                        .handle_call(&mut self.editor, server_id, &method, &id, params)
+                else {
+                    return;
+                };
                 let reply = match MethodCall::parse(&method, params) {
                     Err(helix_lsp::Error::Unhandled) => {
                         error!(
