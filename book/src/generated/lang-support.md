@@ -233,6 +233,7 @@
 | quint | ✓ |  |  |  |  | `quint-language-server` |
 | r | ✓ |  |  |  |  | `R` |
 | racket | ✓ |  | ✓ |  | ✓ | `racket` |
+| razor | ✓ | ✓ |  | ✓ |  | `roslyn-language-server` |
 | regex | ✓ |  |  |  | ✓ |  |
 | rego | ✓ |  |  |  |  | `regols` |
 | rescript | ✓ | ✓ |  |  |  | `rescript-language-server` |
