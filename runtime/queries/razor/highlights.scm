@@ -1,9 +1,20 @@
 ; inherits: c-sharp
 
-; Tag names, attribute names and text are hidden tokens of `element`, so the
-; element as a whole takes the tag colour. The brackets and the Razor and C#
-; nodes inside it keep their own.
-(element) @tag
+(tag_name) @tag
+
+; A component, as opposed to an HTML element.
+((tag_name) @constructor
+  (#match? @constructor "^[A-Z]"))
+
+(erroneous_end_tag) @error
+
+(doctype) @constant
+
+(attribute_name) @attribute
+
+(quoted_attribute_value) @string
+
+(entity) @string.special.symbol
 
 (element
   [
@@ -12,6 +23,12 @@
     "</"
     "/>"
   ] @punctuation.bracket)
+
+(element
+  "=" @punctuation.delimiter)
+
+(razor_html_attribute
+  "=" @punctuation.delimiter)
 
 [
   (razor_comment)

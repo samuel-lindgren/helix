@@ -819,7 +819,7 @@ args = { processId = "{0}" }
 
 [[grammar]]
 name = "razor"
-source = { git = "https://github.com/tris203/tree-sitter-razor", rev = "d4664e409caaea12f73c9525484e3cf88b1cf718" }
+source = { git = "https://github.com/samuel-lindgren/tree-sitter-razor", rev = "b7a05e685945af9b1f87cee8af5bc7dc6a51450a" }
 
 [[language]]
 name = "cshtml"
@@ -828,9 +828,7 @@ injection-regex = "cshtml"
 file-types = ["cshtml"]
 roots = ["*.slnx", "*.sln", "*.csproj"]
 language-id = "aspnetcorerazor"
-# The Razor grammar does not parse a document with a doctype or an unclosed
-# void element, which layouts and views are full of.
-grammar = "html"
+grammar = "razor"
 block-comment-tokens = { start = "@*", end = "*@" }
 indent = { tab-width = 4, unit = "    " }
 language-servers = [ "roslyn-language-server" ]
