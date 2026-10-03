@@ -1,1 +1,1 @@
-; inherits: html
+; inherits: razor
