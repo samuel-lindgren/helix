@@ -37,6 +37,7 @@
 | cpp | ✓ | ✓ | ✓ | ✓ | ✓ | `clangd` |
 | cross-config | ✓ | ✓ |  |  | ✓ | `taplo`, `tombi` |
 | crystal | ✓ | ✓ | ✓ | ✓ |  | `crystalline`, `ameba-ls` |
+| cshtml | ✓ | ✓ |  |  | ✓ | `roslyn-language-server` |
 | css | ✓ |  | ✓ |  | ✓ | `vscode-css-language-server` |
 | csv | ✓ |  |  |  |  |  |
 | cue | ✓ |  |  |  |  | `cuelsp` |
