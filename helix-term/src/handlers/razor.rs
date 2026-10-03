@@ -13,7 +13,9 @@
 //! language server configured for `html` and relays the requests.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use helix_lsp::{jsonrpc, lsp, Client, LanguageServerId};
 use helix_view::Editor;
@@ -23,6 +25,9 @@ use serde_json::Value;
 const UPDATE_HTML: &str = "razor/updateHtml";
 /// Appended to the URI of a Razor document to name its generated HTML.
 const HTML_SUFFIX: &str = "__virtual.html";
+/// The Razor server holds back its own answer until the HTML one has arrived,
+/// so a slow HTML server may not keep it waiting for long.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,8 +50,12 @@ struct HtmlDocument {
     checksum: String,
     text: String,
     version: i32,
-    /// The version each HTML language server has last been sent.
+    /// The version each HTML language server has last been sent. Empty while
+    /// the Razor document is closed.
     synced: HashMap<LanguageServerId, i32>,
+    /// Whether an HTML language server has been looked for since the Razor
+    /// document was opened.
+    looked_for_server: bool,
 }
 
 impl HtmlDocument {
@@ -79,19 +88,31 @@ impl HtmlDocument {
         }
     }
 
-    fn close(&self, editor: &Editor) {
-        for &id in self.synced.keys() {
+    fn close(&mut self, editor: &Editor) {
+        for (id, _) in self.synced.drain() {
             if let Some(server) = editor.language_server_by_id(id) {
                 server.text_document_did_close(lsp::TextDocumentIdentifier::new(self.uri.clone()));
             }
         }
+        self.looked_for_server = false;
     }
 }
 
-/// The generated HTML documents, by the URI of their Razor document.
+/// Why a forwarded request got no answer from an HTML language server.
+enum Unanswered {
+    /// There is no HTML language server to ask.
+    NoServer,
+    /// The server or the generated document is not ready; a later request
+    /// may be answered.
+    NotYet,
+}
+
 #[derive(Default)]
 pub struct HtmlBridge {
+    /// The generated HTML documents, by the URI of their Razor document.
     documents: HashMap<lsp::Url, HtmlDocument>,
+    /// The HTML language server in use.
+    server: Option<LanguageServerId>,
 }
 
 impl HtmlBridge {
@@ -112,35 +133,45 @@ impl HtmlBridge {
             return Some(params);
         };
 
-        let pending = if method == UPDATE_HTML {
+        let id = id.clone();
+        if method == UPDATE_HTML {
             match params.parse::<UpdateHtml>() {
                 Ok(update) => self.update(editor, update),
                 Err(err) => log::error!("Malformed {UPDATE_HTML} request: {err}"),
             }
-            None
-        } else {
-            match params.parse::<ForwardedRequest>() {
-                Ok(forwarded) => self.forward(editor, method, forwarded),
-                Err(err) => {
-                    log::error!("Malformed forwarded {method} request: {err}");
-                    None
-                }
+            reply(&server, id, Value::Null);
+            return None;
+        }
+
+        let pending = match params.parse::<ForwardedRequest>() {
+            Ok(forwarded) => self.forward(editor, &server, method, forwarded),
+            Err(err) => {
+                log::error!("Malformed forwarded {method} request: {err}");
+                Err(Unanswered::NoServer)
             }
         };
-
-        let id = id.clone();
         match pending {
-            Some(response) => {
+            Ok(response) => {
                 let method = method.to_owned();
                 tokio::spawn(async move {
-                    let result = response.await.unwrap_or_else(|err| {
-                        log::warn!("HTML language server failed to answer {method}: {err}");
-                        no_answer(&method)
-                    });
+                    let result = match tokio::time::timeout(FORWARD_TIMEOUT, response).await {
+                        // The HTML server has nothing to say here.
+                        Ok(Ok(Value::Null)) => no_answer(&method, false),
+                        Ok(Ok(result)) => result,
+                        Ok(Err(err)) => {
+                            log::warn!("HTML language server failed to answer {method}: {err}");
+                            no_answer(&method, true)
+                        }
+                        Err(_) => {
+                            log::warn!("HTML language server did not answer {method} in time");
+                            no_answer(&method, true)
+                        }
+                    };
                     reply(&server, id, result);
                 });
             }
-            None => reply(&server, id, no_answer(method)),
+            Err(Unanswered::NotYet) => reply(&server, id, no_answer(method, true)),
+            Err(Unanswered::NoServer) => reply(&server, id, no_answer(method, false)),
         }
         None
     }
@@ -161,50 +192,79 @@ impl HtmlBridge {
                 text: String::new(),
                 version: 0,
                 synced: HashMap::new(),
+                looked_for_server: false,
             });
         document.checksum = update.checksum;
         document.text = update.text;
         document.version += 1;
 
-        // Starting the server now gives it time to initialize before the
-        // first request arrives.
-        html_server(editor, &razor_uri);
+        // Like the servers of an ordinary document, the HTML server is looked
+        // for when a Razor document is opened and not on every request: one
+        // that keeps exiting would otherwise be started over and over.
+        let mut server = self
+            .server
+            .and_then(|id| editor.language_servers.get_by_id(id).cloned());
+        if server.is_none() && !std::mem::replace(&mut document.looked_for_server, true) {
+            server = html_server(editor, &razor_uri);
+        }
+        self.server = server.map(|server| server.id());
     }
 
     fn forward(
         &mut self,
-        editor: &mut Editor,
+        editor: &Editor,
+        razor_server: &Client,
         method: &str,
         forwarded: ForwardedRequest,
-    ) -> Option<impl std::future::Future<Output = helix_lsp::Result<Value>>> {
-        let razor_uri = forwarded.text_document.uri;
+    ) -> Result<impl Future<Output = helix_lsp::Result<Value>>, Unanswered> {
+        let server = self
+            .server
+            .and_then(|id| editor.language_servers.get_by_id(id))
+            .ok_or(Unanswered::NoServer)?;
+        // Notifications to a server that is still starting are dropped, so
+        // the generated document cannot be opened on it yet.
+        if !server.is_initialized() {
+            return Err(Unanswered::NotYet);
+        }
+        // Positions are passed on as they are, so both servers have to count
+        // columns the same way.
+        if server.offset_encoding() != razor_server.offset_encoding() {
+            return Err(Unanswered::NoServer);
+        }
         let document = self
             .documents
-            .get_mut(&razor_uri)
-            .filter(|document| document.checksum == forwarded.checksum)?;
-        // Notifications to a server that is still starting are dropped, so
-        // the document could not be opened on it yet.
-        let server = html_server(editor, &razor_uri).filter(|server| server.is_initialized())?;
-        document.sync(&server);
+            .get_mut(&forwarded.text_document.uri)
+            .filter(|document| document.checksum == forwarded.checksum)
+            .ok_or(Unanswered::NotYet)?;
+        document.sync(server);
 
         let mut request = forwarded.request;
         retarget(&mut request, &document.uri);
-        Some(server.call_raw(method.to_owned(), request))
+        Ok(server.call_raw(method.to_owned(), request))
     }
 
     /// Closes the generated documents whose Razor document is no longer open.
+    ///
+    /// Their text is kept: the Razor server does not send it again when the
+    /// document is reopened unchanged.
     fn close_orphans(&mut self, editor: &Editor, keep: &lsp::Url) {
-        self.documents.retain(|razor_uri, document| {
+        for (razor_uri, document) in &mut self.documents {
+            let closed = document.synced.is_empty() && !document.looked_for_server;
             let open = razor_uri == keep
                 || razor_uri
                     .to_file_path()
                     .is_ok_and(|path| editor.document_by_path(path).is_some());
-            if !open {
+            if !closed && !open {
                 document.close(editor);
             }
-            open
-        });
+        }
     }
+}
+
+/// Whether the URI names HTML generated from a Razor document. What an HTML
+/// language server reports about such a document concerns no file.
+pub fn is_generated_html(uri: &lsp::Url) -> bool {
+    uri.path().ends_with(HTML_SUFFIX)
 }
 
 fn reply(server: &Client, id: jsonrpc::Id, result: Value) {
@@ -216,15 +276,16 @@ fn reply(server: &Client, id: jsonrpc::Id, result: Value) {
     }
 }
 
-/// What to answer when no HTML language server can.
+/// What to answer when no HTML language server does.
 ///
 /// The server drops its own completions (components, directive attributes)
 /// when the HTML ones are missing, so that the client asks again. An empty
-/// list keeps them. Everywhere else, null stands for an empty HTML part.
-fn no_answer(method: &str) -> Value {
+/// list keeps them, and marking it incomplete asks for another request when
+/// one may fare better. Everywhere else, null stands for an empty HTML part.
+fn no_answer(method: &str, retry: bool) -> Value {
     use lsp::request::Request as _;
     if method == lsp::request::Completion::METHOD {
-        serde_json::json!({ "isIncomplete": false, "items": [] })
+        serde_json::json!({ "isIncomplete": retry, "items": [] })
     } else {
         Value::Null
     }
@@ -321,11 +382,25 @@ mod tests {
     #[test]
     fn keeps_the_servers_own_completions_without_an_html_server() {
         assert_eq!(
-            no_answer("textDocument/completion"),
+            no_answer("textDocument/completion", false),
             json!({ "isIncomplete": false, "items": [] })
         );
-        assert_eq!(no_answer("textDocument/hover"), Value::Null);
-        assert_eq!(no_answer("textDocument/formatting"), Value::Null);
+        assert_eq!(
+            no_answer("textDocument/completion", true),
+            json!({ "isIncomplete": true, "items": [] })
+        );
+        assert_eq!(no_answer("textDocument/hover", true), Value::Null);
+        assert_eq!(no_answer("textDocument/formatting", false), Value::Null);
+    }
+
+    #[test]
+    fn tells_generated_documents_from_files() {
+        let razor = lsp::Url::parse("file:///app/Counter.razor").unwrap();
+        assert!(is_generated_html(&html_uri(&razor).unwrap()));
+        assert!(!is_generated_html(&razor));
+        assert!(!is_generated_html(
+            &lsp::Url::parse("file:///app/wwwroot/index.html").unwrap()
+        ));
     }
 
     #[test]

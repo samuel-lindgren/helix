@@ -815,6 +815,9 @@ impl Application {
                         });
                     }
                     Notification::PublishDiagnostics(params) => {
+                        if handlers::razor::is_generated_html(&params.uri) {
+                            return;
+                        }
                         let uri = match helix_core::Uri::try_from(params.uri) {
                             Ok(uri) => uri,
                             Err(err) => {
