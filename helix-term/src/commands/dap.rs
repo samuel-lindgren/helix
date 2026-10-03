@@ -904,7 +904,17 @@ fn debug_parameter_prompt(
 
             let mut value = input.to_owned();
             if value.is_empty() {
-                value = default_val.clone();
+                // A default may use the command line expansions, for example
+                // `%{file_path_absolute}` to stand for the focused document.
+                let token = helix_core::command_line::Token::expand(default_val.as_str());
+                value = match helix_view::expansion::expand(cx.editor, token) {
+                    Ok(value) => value.into_owned(),
+                    Err(err) => {
+                        cx.editor
+                            .set_error(format!("Invalid default '{default_val}': {err}"));
+                        return;
+                    }
+                };
             }
             params.push(value);
 
