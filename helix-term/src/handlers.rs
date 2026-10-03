@@ -19,6 +19,7 @@ pub mod completion;
 pub mod diagnostics;
 mod document_colors;
 mod prompt;
+pub mod razor;
 pub mod recent_files;
 mod signature_help;
 mod snippet;

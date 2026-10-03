@@ -487,6 +487,40 @@ impl Client {
         }
     }
 
+    /// Execute a RPC request whose method is only known at runtime. The
+    /// parameters and the result are passed through as JSON.
+    pub fn call_raw(&self, method: String, params: Value) -> impl Future<Output = Result<Value>> {
+        let id = self.next_request_id();
+        let timeout_secs = self.req_timeout;
+
+        // As in `call_with_timeout`, the request is sent right away so that
+        // the request order stays consistent.
+        let request = jsonrpc::MethodCall {
+            jsonrpc: Some(jsonrpc::Version::V2),
+            id: id.clone(),
+            method,
+            params: Self::value_into_params(params),
+        };
+        let (tx, mut rx) = channel::<Result<Value>>(1);
+        let sent = self
+            .server_tx
+            .send(Payload::Request {
+                chan: tx,
+                value: request,
+            })
+            .map_err(|e| Error::Other(e.into()));
+
+        async move {
+            use std::time::Duration;
+            use tokio::time::timeout;
+            sent?;
+            timeout(Duration::from_secs(timeout_secs), rx.recv())
+                .await
+                .map_err(|_| Error::Timeout(id))?
+                .ok_or(Error::StreamClosed)?
+        }
+    }
+
     /// Send a RPC notification to the language server.
     pub fn notify<R: lsp::notification::Notification>(&self, params: R::Params)
     where
