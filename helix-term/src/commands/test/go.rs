@@ -246,7 +246,7 @@ pub(super) async fn run(
             dir,
         ));
     }
-    if execution.truncated() {
+    if execution.truncated {
         output.push_str(TRUNCATED);
     }
     let status = match execution.exit {

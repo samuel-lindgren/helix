@@ -30,7 +30,10 @@ pub(crate) mod dotnet;
 pub(crate) mod go;
 
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024; // per stream; keep draining after the cap
-const TRUNCATED: &str = "\n[Output limit reached: retained at most 2 MiB per stream.]\n";
+const TRUNCATED: &str =
+    "\n[Output limit reached: retained the first and the last MiB of each stream.]\n";
+/// Stands where the middle of a stream was left out.
+const GAP: &str = "\n[… output left out here …]\n";
 /// The status of a run that was stopped on request.
 const CANCELLED: &str = "CANCELLED";
 
@@ -411,7 +414,8 @@ struct ProcessGroup(Option<u32>);
 /// when it exits. A run that is cancelled or times out is always stopped whole.
 enum Leftovers {
     Killed,
-    /// They are the tool's build servers, which make the next run faster.
+    /// Among them are the tool's build servers, which make the next run
+    /// faster. A process that a test started and left behind stays as well.
     Kept,
 }
 impl Drop for ProcessGroup {
@@ -425,22 +429,66 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// What is kept of a stream: all of it up to the limit, else its beginning
+/// and its end. The beginning says what ran and the end how it went; a tool's
+/// results come last.
+#[derive(Default)]
+struct Kept {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    left_out: bool,
+}
+
+impl Kept {
+    const HALF: usize = OUTPUT_LIMIT / 2;
+
+    fn push(&mut self, piece: &[u8]) {
+        let head = piece.len().min(Self::HALF - self.head.len());
+        self.head.extend_from_slice(&piece[..head]);
+        self.tail.extend_from_slice(&piece[head..]);
+        // Not on every piece: moving the tail is what costs.
+        if self.tail.len() > 2 * Self::HALF {
+            self.trim();
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.tail.len() > Self::HALF {
+            self.tail.drain(..self.tail.len() - Self::HALF);
+            self.left_out = true;
+        }
+    }
+
+    /// The stream, with a mark where its middle was left out, and whether it was.
+    fn finish(mut self) -> (Vec<u8>, bool) {
+        self.trim();
+        let mut bytes = self.head;
+        let mut tail = self.tail.as_slice();
+        if self.left_out {
+            // Resume at the start of a line.
+            if let Some(end) = tail.iter().position(|byte| *byte == b'\n') {
+                tail = &tail[end + 1..];
+            }
+            bytes.extend_from_slice(GAP.as_bytes());
+        }
+        bytes.extend_from_slice(tail);
+        (bytes, self.left_out)
+    }
+}
+
 /// `seen` is shown each piece of the stream as it arrives, kept or not.
 async fn capture(
     mut reader: impl AsyncRead + Unpin,
-    bytes: &mut Vec<u8>,
+    kept: &mut Kept,
     mut seen: impl FnMut(&[u8]),
-) -> std::io::Result<bool> {
-    let mut truncated = false;
+) -> std::io::Result<()> {
     let mut chunk = [0; 8192];
     loop {
         let len = reader.read(&mut chunk).await?;
         if len == 0 {
-            return Ok(truncated);
+            return Ok(());
         }
-        let keep = len.min(OUTPUT_LIMIT - bytes.len());
-        bytes.extend_from_slice(&chunk[..keep]);
-        truncated |= keep < len;
+        kept.push(&chunk[..len]);
         seen(&chunk[..len]);
     }
 }
@@ -452,6 +500,8 @@ struct Execution {
     /// Both streams when they were merged.
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// Whether the middle of a stream was left out.
+    truncated: bool,
 }
 
 /// How the two output streams of the process are kept.
@@ -460,12 +510,6 @@ enum Streams {
     /// As one stream, in the order the process wrote: for a tool that splits
     /// one report over both.
     Merged,
-}
-
-impl Execution {
-    fn truncated(&self) -> bool {
-        self.stdout.len() >= OUTPUT_LIMIT || self.stderr.len() >= OUTPUT_LIMIT
-    }
 }
 
 /// The reading end of a pipe that the process writes both of its streams to.
@@ -480,7 +524,8 @@ fn merged_output(command: &mut Command) -> std::io::Result<tokio::fs::File> {
 }
 
 /// Runs the command to its end, to cancellation or to the deadline, whichever
-/// comes first, and stops its whole process group. Fails only when the process
+/// comes first, and stops its whole process group, unless `leftovers` keeps
+/// what a tool that has exited left running. Fails only when the process
 /// cannot be started. `seen` follows the standard output as it arrives.
 async fn execute(
     mut command: Command,
@@ -506,11 +551,11 @@ async fn execute(
     // The command holds the writing ends of a merged pipe, which would keep
     // it open after the process has gone.
     drop(command);
-    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (mut out, mut err) = (Kept::default(), Kept::default());
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let output = async {
         match (merged, stdout, stderr) {
-            (Some(merged), ..) => capture(merged, &mut out, seen).await.map(|_| ()),
+            (Some(merged), ..) => capture(merged, &mut out, seen).await,
             (None, Some(stdout), Some(stderr)) => tokio::try_join!(
                 capture(stdout, &mut out, seen),
                 capture(stderr, &mut err, |_| {})
@@ -538,10 +583,12 @@ async fn execute(
     if exit.is_err() {
         let _ = child.kill().await;
     }
+    let ((stdout, cut_out), (stderr, cut_err)) = (out.finish(), err.finish());
     Ok(Execution {
         exit,
-        stdout: out,
-        stderr: err,
+        stdout,
+        stderr,
+        truncated: cut_out || cut_err,
     })
 }
 
@@ -724,17 +771,45 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn capture_drains_but_bounds_output() {
-        let data = vec![b'x'; OUTPUT_LIMIT + 123];
-        let mut saved = Vec::new();
+    async fn capture_drains_and_keeps_both_ends() {
+        // Short output is kept as it is.
+        let mut kept = Kept::default();
         let mut shown = 0;
-        assert!(
-            capture(data.as_slice(), &mut saved, |piece| shown += piece.len())
-                .await
-                .unwrap()
-        );
-        assert_eq!(saved.len(), OUTPUT_LIMIT);
+        capture(&b"first\nsecond\n"[..], &mut kept, |piece| {
+            shown += piece.len()
+        })
+        .await
+        .unwrap();
+        assert_eq!(kept.finish(), (b"first\nsecond\n".to_vec(), false));
+        assert_eq!(shown, 13);
+
+        // Too much: the results at the end outlast what came before them.
+        let filler = "a line of test output\n".repeat(OUTPUT_LIMIT / 10);
+        let data = format!("Test run for Shop.Tests.dll\n{filler}Total tests: 3\n");
+        assert!(data.len() > 2 * OUTPUT_LIMIT);
+        let mut kept = Kept::default();
+        let mut shown = 0;
+        capture(data.as_bytes(), &mut kept, |piece| shown += piece.len())
+            .await
+            .unwrap();
         // What is not kept is still shown.
         assert_eq!(shown, data.len());
+        let (bytes, left_out) = kept.finish();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(left_out);
+        assert!(text.len() <= OUTPUT_LIMIT + GAP.len());
+        assert!(text.starts_with("Test run for Shop.Tests.dll\n"));
+        assert!(text.ends_with("a line of test output\nTotal tests: 3\n"));
+        // The end resumes with a whole line.
+        let (_, after) = text.split_once(GAP).unwrap();
+        assert!(after.starts_with("a line of test output\n"));
+
+        // Exactly the limit is not too much.
+        let mut kept = Kept::default();
+        capture(vec![b'x'; OUTPUT_LIMIT].as_slice(), &mut kept, |_| {})
+            .await
+            .unwrap();
+        let (bytes, left_out) = kept.finish();
+        assert_eq!((bytes.len(), left_out), (OUTPUT_LIMIT, false));
     }
 }
