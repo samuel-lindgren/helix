@@ -1,4 +1,4 @@
-use super::{Context, Editor};
+use super::{test::Debugger as TestDebugger, Context, Editor};
 use crate::{
     compositor::{self, Compositor},
     dap_display::{load_byte_collection, DecodedBytes},
@@ -11,7 +11,7 @@ use helix_core::{Selection, Transaction};
 use helix_dap::{self as dap, requests::TerminateArguments};
 use helix_lsp::block_on;
 use helix_view::{
-    editor::{Breakpoint, LastDebugLaunch},
+    editor::{Breakpoint, LastDebugLaunch, TestRun},
     DocumentId, ViewId,
 };
 
@@ -149,11 +149,13 @@ fn dap_callback<T, F>(
     jobs.callback(callback);
 }
 
+/// `for_test`: the debuggee is the process of a test run, which waits for a
+/// debugger and has to be stopped if none comes.
 fn dap_start_callback(
-    jobs: &mut Jobs,
     id: dap::registry::DebugAdapterId,
     request_type: String,
     call: impl Future<Output = helix_dap::Result<serde_json::Value>> + 'static + Send,
+    for_test: bool,
 ) {
     let callback = Box::pin(async move {
         let result = call.await;
@@ -162,6 +164,11 @@ fn dap_start_callback(
                 editor.set_status(format!("Debug {} request accepted", request_type));
             }
             Err(err) => {
+                if let Some(cancel) = editor.test_cancel.as_ref().filter(|_| for_test) {
+                    let _ = cancel.send(true);
+                    editor.test_cancel_reason =
+                        Some(format!("the debugger did not attach ({err})"));
+                }
                 editor.stop_debug_output_tails(id);
                 editor.debug_adapters.remove_client(id);
                 if editor
@@ -178,7 +185,8 @@ fn dap_start_callback(
         Ok(call)
     });
 
-    jobs.callback(callback);
+    // Not through the jobs: a test run starts its debugger from a callback.
+    crate::job::spawn_callback(callback);
 }
 
 fn redirected_output_paths(args: &Value) -> Vec<(PathBuf, &'static str, bool)> {
@@ -298,13 +306,40 @@ pub fn dap_start_impl(
 
     start_debug_launch(
         cx.editor,
-        cx.jobs,
         LastDebugLaunch {
             config,
             template_name: resolved.template_name,
             request_type: resolved.request_type,
             socket,
             args: resolved.args,
+            test: None,
+        },
+    )
+}
+
+/// Attaches the debugger of a template to the process that a test run has
+/// started and that waits for it. The process id is the template's only
+/// parameter.
+pub(super) fn attach_to_test(
+    editor: &mut Editor,
+    config: DebugAdapterConfig,
+    template: &str,
+    pid: u32,
+    test: TestRun,
+) -> Result<(), anyhow::Error> {
+    if editor.debug_adapters.get_active_client().is_some() {
+        bail!("Debugger is already running");
+    }
+    let resolved = resolve_debug_launch(&config, Some(template), Some(&[pid.to_string()]))?;
+    start_debug_launch(
+        editor,
+        LastDebugLaunch {
+            config,
+            template_name: resolved.template_name,
+            request_type: resolved.request_type,
+            socket: None,
+            args: resolved.args,
+            test: Some(test),
         },
     )
 }
@@ -349,11 +384,7 @@ fn resolve_debug_launch(
     })
 }
 
-fn start_debug_launch(
-    editor: &mut Editor,
-    jobs: &mut Jobs,
-    launch: LastDebugLaunch,
-) -> Result<(), anyhow::Error> {
+fn start_debug_launch(editor: &mut Editor, launch: LastDebugLaunch) -> Result<(), anyhow::Error> {
     match launch.request_type.as_str() {
         "launch" | "attach" => {}
         request => bail!("Unsupported request '{}'", request),
@@ -382,11 +413,11 @@ fn start_debug_launch(
     match launch.request_type.as_str() {
         "launch" => {
             let call = debugger.launch(args);
-            dap_start_callback(jobs, id, "launch".to_owned(), call);
+            dap_start_callback(id, "launch".to_owned(), call, false);
         }
         "attach" => {
             let call = debugger.attach(args);
-            dap_start_callback(jobs, id, "attach".to_owned(), call);
+            dap_start_callback(id, "attach".to_owned(), call, launch.test.is_some());
         }
         _ => unreachable!("validated request type"),
     };
@@ -746,6 +777,7 @@ pub fn dap_launch(cx: &mut Context) {
     };
 
     let templates = config.templates.clone();
+    let adapter = config.clone();
 
     let columns = [ui::PickerColumn::new(
         "template",
@@ -757,13 +789,25 @@ pub fn dap_launch(cx: &mut Context) {
         0,
         templates,
         (),
-        |cx, template, _action| {
+        move |cx, template, _action| {
             // Detect the custom `go-test-function` completion type and route
             // to a test-name picker instead of the generic parameter prompt.
             let first_completion_kind = template.completion.first().and_then(|c| match c {
                 DebugConfigCompletion::Advanced(cfg) => cfg.completion.as_deref(),
                 _ => None,
             });
+            // A .NET test runs in a process of the test platform's own. The
+            // test runner starts it and attaches this template to it.
+            if let Some(kind @ ("dotnet-test-function" | "dotnet-test-project")) =
+                first_completion_kind
+            {
+                let debugger = TestDebugger {
+                    config: adapter.clone(),
+                    template: template.name.clone(),
+                };
+                super::test::debug_dotnet(cx, kind == "dotnet-test-project", debugger);
+                return;
+            }
             if first_completion_kind == Some("go-test-function") {
                 let name = template.name.clone();
                 let completions = template.completion.clone();
@@ -853,7 +897,22 @@ pub(crate) fn rerun_last_debug_launch(editor: &mut Editor, jobs: &mut Jobs) {
         return;
     };
 
-    if let Err(err) = start_debug_launch(editor, jobs, launch) {
+    // The process a test run was debugged in is gone: run the test again.
+    if let Some(test) = launch.test {
+        let debugger = TestDebugger {
+            config: launch.config,
+            template: launch.template_name,
+        };
+        let mut cx = compositor::Context {
+            editor,
+            jobs,
+            scroll: None,
+        };
+        super::test::debug(&mut cx, test, debugger);
+        return;
+    }
+
+    if let Err(err) = start_debug_launch(editor, launch) {
         editor.set_error(err.to_string());
     }
 }

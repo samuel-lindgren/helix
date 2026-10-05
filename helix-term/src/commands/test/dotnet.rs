@@ -16,8 +16,8 @@ use once_cell::sync::Lazy;
 use tokio::{process::Command, sync::watch};
 
 use super::{
-    check_idle, check_workspace_saved, execute, jump_to_location, pick_location, start_run,
-    Leftovers, RunResult, SourceLocation, Streams, TRUNCATED,
+    check_idle, check_workspace_saved, execute, jump_to_location, pick_location, start, Attach,
+    Debugger, Leftovers, RunResult, SourceLocation, Streams, TRUNCATED,
 };
 use crate::{
     compositor,
@@ -97,14 +97,15 @@ fn saved_project(editor: &Editor) -> anyhow::Result<PathBuf> {
     Ok(project)
 }
 
-pub(super) fn package(cx: &mut compositor::Context) {
+pub(super) fn package(cx: &mut compositor::Context, debugger: Option<Debugger>) {
     match saved_project(cx.editor) {
-        Ok(project) => start_run(cx, TestRun::Dotnet(project_selection(&project))),
+        Ok(project) => start(cx, TestRun::Dotnet(project_selection(&project)), debugger),
         Err(err) => cx.editor.set_error(err.to_string()),
     }
 }
 
-pub(super) fn pick(cx: &mut compositor::Context) {
+/// With a debugger, the chosen test runs under it.
+pub(super) fn pick(cx: &mut compositor::Context, debugger: Option<Debugger>) {
     let project = match check_idle(cx.editor).and_then(|()| saved_project(cx.editor)) {
         Ok(project) => project,
         Err(err) => {
@@ -154,7 +155,8 @@ pub(super) fn pick(cx: &mut compositor::Context) {
                     tests,
                     dir,
                     move |cx, test, _| {
-                        start_run(cx, TestRun::Dotnet(selection(&project, test, None)))
+                        let target = TestRun::Dotnet(selection(&project, test, None));
+                        start(cx, target, debugger.clone())
                     },
                 )
                 .with_preview(|_, test| {
@@ -186,7 +188,7 @@ pub(super) fn nearest(cx: &mut compositor::Context) {
         Ok(selection(&project, test, note))
     })();
     match target {
-        Ok(target) => start_run(cx, TestRun::Dotnet(target)),
+        Ok(target) => start(cx, TestRun::Dotnet(target), None),
         Err(err) => cx.editor.set_error(err.to_string()),
     }
 }
@@ -245,8 +247,12 @@ fn project_selection(project: &Path) -> DotnetTestRun {
     }
 }
 
+/// The test host prints its process id and waits until a debugger is attached,
+/// which it then does not break into by itself.
+const HOST_DEBUG: [(&str, &str); 2] = [("VSTEST_HOST_DEBUG", "1"), ("VSTEST_DEBUG_NOBP", "1")];
+
 /// The lines above the result in the output buffer.
-pub(super) fn header(target: &DotnetTestRun) -> String {
+pub(super) fn header(target: &DotnetTestRun, debug: bool) -> String {
     let notice = target
         .selection_note
         .as_ref()
@@ -257,9 +263,21 @@ pub(super) fn header(target: &DotnetTestRun) -> String {
         .as_ref()
         .map(|filter| format!(" --filter {filter:?}"))
         .unwrap_or_default();
+    let (environment, debugger) = if debug {
+        let environment: String = HOST_DEBUG
+            .iter()
+            .map(|(name, value)| format!("{name}={value} "))
+            .collect();
+        (
+            environment,
+            "The debugger attaches when the test host has started; the results follow when it is done.\n",
+        )
+    } else {
+        Default::default()
+    };
     format!(
-        "{TITLE}{}\nProject: {}\nCommand: dotnet test {:?} --nologo --logger {LOGGER:?}{filter}\n\
-         Tests read saved files from disk. Save and rerun after edits.\n\
+        "{TITLE}{}\nProject: {}\nCommand: {environment}dotnet test {:?} --nologo --logger {LOGGER:?}{filter}\n\
+         Tests read saved files from disk. Save and rerun after edits.\n{debugger}\
          Space t f: go to this line's test or source | Space t r: results | Space t c: cancel\n{notice}\n",
         target.name,
         target.project.display(),
@@ -267,11 +285,56 @@ pub(super) fn header(target: &DotnetTestRun) -> String {
     )
 }
 
+/// Watches the output of a run for test hosts that wait for a debugger:
+/// `Process Id: 12345, Name: dotnet`. A project with several target
+/// frameworks starts one host after the other.
+struct HostWatch {
+    attach: Attach,
+    /// Up to here the output has been read. Only whole lines are: more of a
+    /// number may still be on its way.
+    read: usize,
+    last: Option<u32>,
+}
+
+static HOST: Lazy<Regex> = Lazy::new(|| Regex::new(r"^Process Id: ([0-9]+), Name: ").unwrap());
+
+impl HostWatch {
+    fn new(attach: Attach) -> Self {
+        Self {
+            attach,
+            read: 0,
+            last: None,
+        }
+    }
+
+    fn see(&mut self, output: &[u8]) {
+        let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
+            return;
+        };
+        if end < self.read {
+            return;
+        }
+        let lines = String::from_utf8_lossy(&output[self.read..=end]).into_owned();
+        self.read = end + 1;
+        for line in lines.lines() {
+            let pid = HOST.captures(line).and_then(|host| host[1].parse().ok());
+            // A host repeats its announcement while it waits.
+            if pid.is_some() && pid != self.last {
+                self.last = pid;
+                (self.attach)(pid.unwrap());
+            }
+        }
+    }
+}
+
+/// With `attach`, the tests wait for a debugger, and `attach` is given the
+/// process to attach it to.
 pub(super) async fn run(
     program: &Path,
     target: &DotnetTestRun,
     cancel: watch::Receiver<bool>,
     deadline: Duration,
+    attach: Option<Attach>,
 ) -> RunResult {
     let mut command = Command::new(program);
     command
@@ -288,10 +351,26 @@ pub(super) async fn run(
         .env("DOTNET_NOLOGO", "1")
         // The terminal logger redraws lines instead of printing them.
         .env("MSBUILDTERMINALLOGGER", "off");
+    let mut hosts = attach.map(HostWatch::new);
+    if hosts.is_some() {
+        command.envs(HOST_DEBUG);
+    }
     // Results go to one stream and failure announcements to the other: only
     // together, in the order written, do they read as one report. The compiler
     // server that the build leaves running saves the next run its start.
-    let execution = execute(command, cancel, deadline, Streams::Merged, Leftovers::Kept).await;
+    let execution = execute(
+        command,
+        cancel,
+        deadline,
+        Streams::Merged,
+        Leftovers::Kept,
+        |output| {
+            if let Some(hosts) = &mut hosts {
+                hosts.see(output);
+            }
+        },
+    )
+    .await;
     let execution = match execution {
         Ok(execution) => execution,
         Err(err) => {
@@ -928,6 +1007,7 @@ Total tests: 4
             &project_selection(&project),
             rx,
             RUN_TIMEOUT,
+            None,
         )
         .await;
         assert!(!result.success && !result.started);
@@ -944,7 +1024,7 @@ Total tests: 4
             "/src/Shop.Tests/CalcTests.cs",
             3,
         );
-        let header = header(&selection(project, &method, Some("a note".into())));
+        let header = header(&selection(project, &method, Some("a note".into())), false);
         assert!(header.starts_with(
             ".NET test: Shop.Tests.CalcTests.Adds\nProject: /src/Shop.Tests/Shop.Tests.csproj\n"
         ));
@@ -952,10 +1032,46 @@ Total tests: 4
             "Command: dotnet test \"Shop.Tests.csproj\" --nologo --logger \"console;verbosity=normal\" --filter \"FullyQualifiedName=Shop.Tests.CalcTests.Adds\"\n"
         ));
         assert!(header.ends_with("Original selection: a note\n\n"));
-        let all = super::header(&project_selection(project));
+        let all = super::header(&project_selection(project), false);
         assert!(all.starts_with(".NET test: All tests in project\n"));
         assert!(all.contains("--logger \"console;verbosity=normal\"\n"));
         assert_eq!(project_file(&lines(&all)), Some(project.to_owned()));
+        // A debugged run shows what makes the test host wait.
+        let debugged = super::header(&project_selection(project), true);
+        assert!(debugged.contains(
+            "Command: VSTEST_HOST_DEBUG=1 VSTEST_DEBUG_NOBP=1 dotnet test \"Shop.Tests.csproj\""
+        ));
+        assert!(debugged.contains("The debugger attaches when the test host has started"));
+        assert_eq!(project_file(&lines(&debugged)), Some(project.to_owned()));
+    }
+
+    #[test]
+    fn waiting_test_hosts_are_announced_once_each() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut hosts = HostWatch::new(Box::new(move |pid| tx.send(pid).unwrap()));
+        let output =
+            "Test run for /src/bin/Debug/net8.0/Shop.Tests.dll (.NETCoreApp,Version=v8.0)\n\
+            Host debugging is enabled. Please attach debugger to testhost process to continue.\n\
+            Process Id: 3279490, Name: dotnet\n\
+            Waiting for debugger attach...\n\
+            Process Id: 3279490, Name: dotnet\n\
+              Passed Shop.Tests.CalcTests.Adds [7 ms]\n\
+            The test printed Process Id: 1, Name: nothing\n\
+            Process Id: 3279777, Name: dotnet\n";
+        // The output arrives in pieces that end anywhere, and is shown whole each time.
+        let bytes = output.as_bytes();
+        let mut seen = Vec::new();
+        for end in (0..=bytes.len()).step_by(7).chain([bytes.len()]) {
+            hosts.see(&bytes[..end]);
+            seen.extend(rx.try_iter());
+            let announced = output[..end].contains("Process Id: 3279490, Name: dotnet\n");
+            assert_eq!(seen.contains(&3279490), announced, "after {end} bytes");
+        }
+        assert_eq!(seen, [3279490, 3279777]);
+        // Without a line end there is nothing to read yet.
+        let mut hosts = HostWatch::new(Box::new(|_| panic!("no whole line")));
+        hosts.see(b"Process Id: 12");
+        hosts.see(b"Process Id: 1234, Name: dotnet");
     }
 
     /// An xUnit project below a solution directory, in a path with spaces.
@@ -1060,7 +1176,7 @@ public class SlowTests
 
     async fn run_dotnet(target: &DotnetTestRun) -> RunResult {
         let (_tx, rx) = watch::channel(false);
-        run(Path::new("dotnet"), target, rx, RUN_TIMEOUT).await
+        run(Path::new("dotnet"), target, rx, RUN_TIMEOUT, None).await
     }
 
     #[tokio::test]
@@ -1180,7 +1296,9 @@ public class SlowTests
         let target = selection(&project, &slow, None);
         let (tx, rx) = watch::channel(false);
         let task =
-            tokio::spawn(async move { run(Path::new("dotnet"), &target, rx, RUN_TIMEOUT).await });
+            tokio::spawn(
+                async move { run(Path::new("dotnet"), &target, rx, RUN_TIMEOUT, None).await },
+            );
         let pid_path = root.join("pid");
         // The test host is a grandchild of `dotnet test`, started after the build.
         tokio::time::timeout(Duration::from_secs(180), async {
@@ -1216,6 +1334,55 @@ public class SlowTests
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::tests::{dotnet_fixture, fixture_project};
+    use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "requires the .NET SDK and the xunit packages; checks that a debugged run waits in the test host"]
+    async fn real_dotnet_test_host_waits_for_the_debugger() {
+        let fixture = dotnet_fixture();
+        let project = fixture_project(&fixture);
+        let adds = DotnetTest {
+            class: "Shop.Tests.CalcTests".into(),
+            method: Some("Adds".into()),
+            file: project.with_file_name("CalcTests.cs"),
+            line: 5,
+        };
+        let target = selection(&project, &adds, None);
+        let (cancel, rx) = watch::channel(false);
+        let (tx, mut hosts) = tokio::sync::mpsc::unbounded_channel();
+        let attach: Attach = Box::new(move |pid| tx.send(pid).unwrap());
+        let task = tokio::spawn(async move {
+            run(Path::new("dotnet"), &target, rx, RUN_TIMEOUT, Some(attach)).await
+        });
+        let pid = tokio::time::timeout(Duration::from_secs(180), hosts.recv())
+            .await
+            .expect("the test host announces itself")
+            .unwrap();
+        // The announced process is the one that will run the tests, and it is
+        // still there: nothing ran while no debugger came.
+        let command = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&command).contains("testhost"),
+            "{}",
+            String::from_utf8_lossy(&command)
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!task.is_finished());
+        cancel.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, "CANCELLED");
+        assert!(result.output.contains("Waiting for debugger attach"));
+        assert!(!result.output.contains("CHOSEN TEST"), "{}", result.output);
     }
 }
 
