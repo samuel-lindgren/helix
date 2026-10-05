@@ -327,7 +327,9 @@ pub(super) fn attach_to_test(
     pid: u32,
     test: TestRun,
 ) -> Result<(), anyhow::Error> {
-    if editor.debug_adapters.get_active_client().is_some() {
+    // Not only an active one: test hosts can announce themselves in quick
+    // succession, and a second debugger would start while the first still is.
+    if !editor.debug_adapters.is_empty() {
         bail!("Debugger is already running");
     }
     let resolved = resolve_debug_launch(&config, Some(template), Some(&[pid.to_string()]))?;

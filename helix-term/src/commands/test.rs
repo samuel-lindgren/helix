@@ -254,7 +254,7 @@ fn start(cx: &mut compositor::Context, target: TestRun, debugger: Option<Debugge
         cx.editor.set_error(err.to_string());
         return;
     }
-    if debugger.is_some() && cx.editor.debug_adapters.get_active_client().is_some() {
+    if debugger.is_some() && !cx.editor.debug_adapters.is_empty() {
         cx.editor.set_error("Debugger is already running");
         return;
     }
@@ -425,7 +425,7 @@ impl Drop for ProcessGroup {
     }
 }
 
-/// `seen` is shown all that has been kept, each time there is more of it.
+/// `seen` is shown each piece of the stream as it arrives, kept or not.
 async fn capture(
     mut reader: impl AsyncRead + Unpin,
     bytes: &mut Vec<u8>,
@@ -441,9 +441,7 @@ async fn capture(
         let keep = len.min(OUTPUT_LIMIT - bytes.len());
         bytes.extend_from_slice(&chunk[..keep]);
         truncated |= keep < len;
-        if keep > 0 {
-            seen(bytes);
-        }
+        seen(&chunk[..len]);
     }
 }
 
@@ -729,15 +727,14 @@ mod tests {
     async fn capture_drains_but_bounds_output() {
         let data = vec![b'x'; OUTPUT_LIMIT + 123];
         let mut saved = Vec::new();
-        let mut shown = Vec::new();
+        let mut shown = 0;
         assert!(
-            capture(data.as_slice(), &mut saved, |all| shown.push(all.len()))
+            capture(data.as_slice(), &mut saved, |piece| shown += piece.len())
                 .await
                 .unwrap()
         );
         assert_eq!(saved.len(), OUTPUT_LIMIT);
-        // Shown as it grows, and not again once nothing more is kept.
-        assert!(shown.windows(2).all(|pair| pair[0] < pair[1]));
-        assert_eq!(shown.last(), Some(&OUTPUT_LIMIT));
+        // What is not kept is still shown.
+        assert_eq!(shown, data.len());
     }
 }

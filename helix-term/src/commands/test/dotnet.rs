@@ -263,20 +263,21 @@ pub(super) fn header(target: &DotnetTestRun, debug: bool) -> String {
         .as_ref()
         .map(|filter| format!(" --filter {filter:?}"))
         .unwrap_or_default();
-    let (environment, debugger) = if debug {
+    let (environment, sequential, debugger) = if debug {
         let environment: String = HOST_DEBUG
             .iter()
             .map(|(name, value)| format!("{name}={value} "))
             .collect();
         (
             environment,
+            " -p:TestTfmsInParallel=false",
             "The debugger attaches when the test host has started; the results follow when it is done.\n",
         )
     } else {
         Default::default()
     };
     format!(
-        "{TITLE}{}\nProject: {}\nCommand: {environment}dotnet test {:?} --nologo --logger {LOGGER:?}{filter}\n\
+        "{TITLE}{}\nProject: {}\nCommand: {environment}dotnet test {:?} --nologo --logger {LOGGER:?}{filter}{sequential}\n\
          Tests read saved files from disk. Save and rerun after edits.\n{debugger}\
          Space t f: go to this line's test or source | Space t r: results | Space t c: cancel\n{notice}\n",
         target.name,
@@ -290,9 +291,8 @@ pub(super) fn header(target: &DotnetTestRun, debug: bool) -> String {
 /// frameworks starts one host after the other.
 struct HostWatch {
     attach: Attach,
-    /// Up to here the output has been read. Only whole lines are: more of a
-    /// number may still be on its way.
-    read: usize,
+    /// The start of a line whose end has not arrived yet.
+    partial: Vec<u8>,
     last: Option<u32>,
 }
 
@@ -302,27 +302,29 @@ impl HostWatch {
     fn new(attach: Attach) -> Self {
         Self {
             attach,
-            read: 0,
+            partial: Vec::new(),
             last: None,
         }
     }
 
-    fn see(&mut self, output: &[u8]) {
-        let Some(end) = output.iter().rposition(|byte| *byte == b'\n') else {
-            return;
-        };
-        if end < self.read {
-            return;
-        }
-        let lines = String::from_utf8_lossy(&output[self.read..=end]).into_owned();
-        self.read = end + 1;
-        for line in lines.lines() {
-            let pid = HOST.captures(line).and_then(|host| host[1].parse().ok());
+    /// Takes the next piece of the output.
+    fn see(&mut self, piece: &[u8]) {
+        for byte in piece {
+            if *byte != b'\n' {
+                // An announcement is short: more than this is not one.
+                if self.partial.len() < 256 {
+                    self.partial.push(*byte);
+                }
+                continue;
+            }
+            let line = String::from_utf8_lossy(&self.partial);
+            let pid = HOST.captures(&line).and_then(|host| host[1].parse().ok());
             // A host repeats its announcement while it waits.
             if pid.is_some() && pid != self.last {
                 self.last = pid;
                 (self.attach)(pid.unwrap());
             }
+            self.partial.clear();
         }
     }
 }
@@ -353,7 +355,9 @@ pub(super) async fn run(
         .env("MSBUILDTERMINALLOGGER", "off");
     let mut hosts = attach.map(HostWatch::new);
     if hosts.is_some() {
-        command.envs(HOST_DEBUG);
+        // One debugger at a time: the test hosts of a project with several
+        // target frameworks would otherwise all wait at once.
+        command.arg("-p:TestTfmsInParallel=false").envs(HOST_DEBUG);
     }
     // Results go to one stream and failure announcements to the other: only
     // together, in the order written, do they read as one report. The compiler
@@ -1058,20 +1062,21 @@ Total tests: 4
               Passed Shop.Tests.CalcTests.Adds [7 ms]\n\
             The test printed Process Id: 1, Name: nothing\n\
             Process Id: 3279777, Name: dotnet\n";
-        // The output arrives in pieces that end anywhere, and is shown whole each time.
-        let bytes = output.as_bytes();
+        // The output arrives in pieces that end anywhere.
         let mut seen = Vec::new();
-        for end in (0..=bytes.len()).step_by(7).chain([bytes.len()]) {
-            hosts.see(&bytes[..end]);
+        let mut shown = 0;
+        for piece in output.as_bytes().chunks(7) {
+            hosts.see(piece);
+            shown += piece.len();
             seen.extend(rx.try_iter());
-            let announced = output[..end].contains("Process Id: 3279490, Name: dotnet\n");
-            assert_eq!(seen.contains(&3279490), announced, "after {end} bytes");
+            let announced = output[..shown].contains("Process Id: 3279490, Name: dotnet\n");
+            assert_eq!(seen.contains(&3279490), announced, "after {shown} bytes");
         }
         assert_eq!(seen, [3279490, 3279777]);
-        // Without a line end there is nothing to read yet.
-        let mut hosts = HostWatch::new(Box::new(|_| panic!("no whole line")));
+        // Without a line end there is nothing to read yet, and a long line is no announcement.
+        let mut hosts = HostWatch::new(Box::new(|_| panic!("not an announcement")));
         hosts.see(b"Process Id: 12");
-        hosts.see(b"Process Id: 1234, Name: dotnet");
+        hosts.see(format!("{}Process Id: 99, Name: dotnet\n", "x".repeat(300)).as_bytes());
     }
 
     /// An xUnit project below a solution directory, in a path with spaces.
