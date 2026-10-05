@@ -25,8 +25,10 @@ use crate::{
     ui::{overlay::overlaid, Picker, PickerColumn},
 };
 
+mod corresponding;
 mod discovery;
 
+pub(in crate::commands) use corresponding::corresponding_tests;
 use discovery::DotnetTest;
 
 pub(super) const BUFFER_NAME: &str = "[dotnet-test]";

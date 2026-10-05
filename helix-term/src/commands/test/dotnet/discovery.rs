@@ -120,11 +120,8 @@ pub(super) fn parse(grammar: Grammar, source: &str, file: &Path) -> Vec<Declared
 /// and build output are left out.
 pub(in crate::commands) fn project_tests(dir: &Path) -> anyhow::Result<Vec<DotnetTest>> {
     let grammar = grammar()?;
-    let mut files = Vec::new();
-    source_files(dir, true, &mut files);
-    files.sort();
     let mut tests = Vec::new();
-    for file in files {
+    for file in source_files(dir, Below::Project) {
         let Ok(source) = std::fs::read_to_string(&file) else {
             continue;
         };
@@ -140,12 +137,29 @@ pub(in crate::commands) fn project_tests(dir: &Path) -> anyhow::Result<Vec<Dotne
 }
 
 /// Cheap to check, and wrong only towards parsing a file without tests.
-static MAY_DECLARE_TESTS: Lazy<Regex> = Lazy::new(|| {
+pub(super) static MAY_DECLARE_TESTS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:Fact|Theory|Test|TestCase|TestCaseSource|TestMethod)(?:Attribute)?\s*[\](,<]")
         .unwrap()
 });
 
-fn source_files(dir: &Path, root: bool, files: &mut Vec<PathBuf>) {
+/// How far a search for sources goes below a directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Below {
+    /// Not into directories that have a project file of their own.
+    Project,
+    /// Into every project.
+    Workspace,
+}
+
+/// The C# files below `dir`, apart from build output.
+pub(super) fn source_files(dir: &Path, below: Below) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_sources(dir, below, true, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_sources(dir: &Path, below: Below, root: bool, files: &mut Vec<PathBuf>) {
     let entries: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -155,7 +169,7 @@ fn source_files(dir: &Path, root: bool, files: &mut Vec<PathBuf>) {
         entry.path().extension().is_some_and(|e| e == wanted)
     };
     // Sources below another project file belong to that project.
-    if !root && entries.iter().any(|entry| extension(entry, "csproj")) {
+    if below == Below::Project && !root && entries.iter().any(|entry| extension(entry, "csproj")) {
         return;
     }
     for entry in entries {
@@ -167,7 +181,7 @@ fn source_files(dir: &Path, root: bool, files: &mut Vec<PathBuf>) {
         let name = name.to_string_lossy();
         if kind.is_dir() {
             if !matches!(name.as_ref(), "bin" | "obj" | "node_modules") && !name.starts_with('.') {
-                source_files(&entry.path(), false, files);
+                collect_sources(&entry.path(), below, false, files);
             }
         } else if kind.is_file() && extension(&entry, "cs") {
             files.push(entry.path());
@@ -304,7 +318,7 @@ fn is_test_attribute(name: &str) -> bool {
             .any(|suffix| name.ends_with(suffix))
 }
 
-fn field<'a>(node: &Node<'a>, name: &str) -> Option<Node<'a>> {
+pub(super) fn field<'a>(node: &Node<'a>, name: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
     if !cursor.goto_first_child() {
         return None;
