@@ -1,6 +1,7 @@
 //! Test runs without a debugger. A language backend selects what to run and
 //! reads the results; the process, the output buffer and the way from output
-//! back to source are shared.
+//! back to source are shared. The file in the focused view decides the
+//! language.
 use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -25,6 +26,7 @@ use crate::{
     ui::{overlay::overlaid, Picker, PickerColumn},
 };
 
+pub(crate) mod dotnet;
 pub(crate) mod go;
 
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024; // per stream; keep draining after the cap
@@ -96,16 +98,44 @@ pub fn go_test_cancel(cx: &mut Context) {
     test_cancel(cx);
 }
 
+enum Language {
+    Go,
+    Dotnet,
+}
+
+fn language(editor: &Editor) -> Option<Language> {
+    let extension = doc!(editor).path()?.extension()?;
+    match extension.to_str()? {
+        "go" => Some(Language::Go),
+        "cs" | "csproj" => Some(Language::Dotnet),
+        _ => None,
+    }
+}
+
+const UNSUPPORTED: &str = "Open a saved Go or C# file to run its tests";
+
 pub(super) fn pick(cx: &mut compositor::Context) {
-    go::pick(cx);
+    match language(cx.editor) {
+        Some(Language::Go) => go::pick(cx),
+        Some(Language::Dotnet) => dotnet::pick(cx),
+        None => cx.editor.set_error(UNSUPPORTED),
+    }
 }
 
 pub(super) fn package(cx: &mut compositor::Context) {
-    go::package(cx);
+    match language(cx.editor) {
+        Some(Language::Go) => go::package(cx),
+        Some(Language::Dotnet) => dotnet::package(cx),
+        None => cx.editor.set_error(UNSUPPORTED),
+    }
 }
 
 pub(super) fn nearest(cx: &mut compositor::Context) {
-    go::nearest(cx);
+    match language(cx.editor) {
+        Some(Language::Go) => go::nearest(cx),
+        Some(Language::Dotnet) => dotnet::nearest(cx),
+        None => cx.editor.set_error(UNSUPPORTED),
+    }
 }
 
 pub(super) fn rerun(cx: &mut compositor::Context) {
@@ -130,9 +160,16 @@ pub(super) fn show_results(cx: &mut compositor::Context) {
 /// line. Elsewhere, or on a line without either, pick from all reported
 /// locations and failed tests.
 pub(super) fn show_locations(cx: &mut compositor::Context) {
-    match results(cx.editor) {
-        Some(id) => go::show_locations(cx, id),
-        None => cx.editor.set_error("No retained test output"),
+    let Some(id) = results(cx.editor) else {
+        cx.editor.set_error("No retained test output");
+        return;
+    };
+    // The output says whose it is.
+    let title = cx.editor.documents[&id].text().line(0).to_string();
+    if title.starts_with(dotnet::TITLE) {
+        dotnet::show_locations(cx, id);
+    } else {
+        go::show_locations(cx, id);
     }
 }
 
@@ -189,6 +226,7 @@ fn start_run(cx: &mut compositor::Context, target: TestRun) {
     let origin = view!(cx.editor).id;
     let (buffer_name, header) = match &target {
         TestRun::Go(run) => (go::BUFFER_NAME, go::header(run)),
+        TestRun::Dotnet(run) => (dotnet::BUFFER_NAME, dotnet::header(run)),
     };
     let id = result_buffer(cx.editor, buffer_name);
     replace_output(cx.editor, id, format!("{header}RUNNING\n"));
@@ -199,6 +237,9 @@ fn start_run(cx: &mut compositor::Context, target: TestRun) {
     cx.jobs.callback(async move {
         let result = match &target {
             TestRun::Go(run) => go::run(Path::new("go"), run, rx, go::RUN_TIMEOUT).await,
+            TestRun::Dotnet(run) => {
+                dotnet::run(Path::new("dotnet"), run, rx, dotnet::RUN_TIMEOUT).await
+            }
         };
         let output = format!("{header}{}\n\n{}", result.status, result.output);
         Ok(Callback::Editor(Box::new(move |editor| {
@@ -289,6 +330,14 @@ fn replace_output(editor: &mut Editor, id: DocumentId, output: String) {
 // stops the test executable and compiler children on Unix. kill_on_drop covers
 // the tool itself on all platforms. The group is private to this invocation.
 struct ProcessGroup(Option<u32>);
+
+/// What becomes of the processes a tool has started and not stopped itself
+/// when it exits. A run that is cancelled or times out is always stopped whole.
+enum Leftovers {
+    Killed,
+    /// They are the tool's build servers, which make the next run faster.
+    Kept,
+}
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -318,14 +367,34 @@ async fn capture(mut reader: impl AsyncRead + Unpin, bytes: &mut Vec<u8>) -> std
 struct Execution {
     /// The reason instead, when the process was stopped before it exited.
     exit: Result<ExitStatus, String>,
+    /// Both streams when they were merged.
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+/// How the two output streams of the process are kept.
+enum Streams {
+    Separate,
+    /// As one stream, in the order the process wrote: for a tool that splits
+    /// one report over both.
+    Merged,
 }
 
 impl Execution {
     fn truncated(&self) -> bool {
         self.stdout.len() >= OUTPUT_LIMIT || self.stderr.len() >= OUTPUT_LIMIT
     }
+}
+
+/// The reading end of a pipe that the process writes both of its streams to.
+fn merged_output(command: &mut Command) -> std::io::Result<tokio::fs::File> {
+    let (reader, writer) = std::io::pipe()?;
+    command.stdout(writer.try_clone()?).stderr(writer);
+    #[cfg(unix)]
+    let reader = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+    #[cfg(windows)]
+    let reader = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
+    Ok(tokio::fs::File::from_std(reader))
 }
 
 /// Runs the command to its end, to cancellation or to the deadline, whichever
@@ -335,6 +404,8 @@ async fn execute(
     mut command: Command,
     mut cancel: watch::Receiver<bool>,
     deadline: Duration,
+    streams: Streams,
+    leftovers: Leftovers,
 ) -> std::io::Result<Execution> {
     command
         .stdin(Stdio::null())
@@ -343,22 +414,40 @@ async fn execute(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    let merged = match streams {
+        Streams::Separate => None,
+        Streams::Merged => Some(merged_output(&mut command)?),
+    };
     let mut child = command.spawn()?;
-    let group = ProcessGroup(child.id());
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let mut group = ProcessGroup(child.id());
+    // The command holds the writing ends of a merged pipe, which would keep
+    // it open after the process has gone.
+    drop(command);
     let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let output = async {
+        match (merged, stdout, stderr) {
+            (Some(merged), ..) => capture(merged, &mut out).await.map(|_| ()),
+            (None, Some(stdout), Some(stderr)) => {
+                tokio::try_join!(capture(stdout, &mut out), capture(stderr, &mut err)).map(|_| ())
+            }
+            _ => Ok(()),
+        }
+    };
     let exit = tokio::select! {
         biased;
         _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err("CANCELLED".to_owned()),
         result = tokio::time::timeout(deadline, async {
-            tokio::try_join!(child.wait(), capture(stdout, &mut out), capture(stderr, &mut err))
+            tokio::try_join!(child.wait(), output)
         }) => match result {
-            Ok(Ok((exit, _, _))) => Ok(exit),
+            Ok(Ok((exit, ()))) => Ok(exit),
             Ok(Err(err)) => Err(format!("PROCESS ERROR: {err}")),
             Err(_) => Err("TIMED OUT (including build time)".into()),
         }
     };
+    if exit.is_ok() && matches!(leftovers, Leftovers::Kept) {
+        group.0 = None;
+    }
     // Drop first to stop descendants before waiting for the immediate child.
     drop(group);
     if exit.is_err() {
@@ -454,6 +543,95 @@ fn source_view(editor: &Editor) -> Option<helix_view::ViewId> {
         .filter(|view| Some(view.doc) != editor.test_doc_id)
         .max_by_key(|view| editor.documents[&view.doc].focused_at)
         .map(|view| view.id)
+}
+
+/// Drives an editor through the commands, for the tests of the backends.
+#[cfg(all(test, feature = "integration"))]
+mod harness {
+    use std::path::{Path, PathBuf};
+
+    use helix_core::Selection;
+
+    use super::*;
+    use crate::{application::Application, args::Args, config::Config};
+
+    pub(in crate::commands::test) async fn keys(app: &mut Application, input: &str) {
+        #[cfg(windows)]
+        use crossterm::event::{Event, KeyEvent};
+        #[cfg(not(windows))]
+        use termina::event::{Event, KeyEvent};
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for key in helix_view::input::parse_macro(input).unwrap() {
+            tx.send(Ok(Event::Key(KeyEvent::from(key)))).unwrap();
+        }
+        let mut stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(30),
+            app.event_loop_until_idle(&mut stream)
+        )
+        .await
+        .unwrap());
+    }
+
+    pub(in crate::commands::test) fn test_app(path: &Path) -> Application {
+        let mut args = Args::default();
+        args.files
+            .insert(path.to_owned(), vec![helix_core::Position::new(0, 0)]);
+        let mut config = Config::default();
+        config.editor.lsp.enable = false;
+        let syntax = helix_core::syntax::Loader::new(
+            helix_loader::config::default_lang_config()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        Application::new(args, config, syntax).unwrap()
+    }
+
+    pub(in crate::commands::test) async fn finished_output(app: &mut Application) -> String {
+        // A first .NET build restores its packages.
+        tokio::time::timeout(Duration::from_secs(180), async {
+            while app.editor.test_cancel.is_some() {
+                keys(app, "").await;
+            }
+        })
+        .await
+        .unwrap();
+        let id = app.editor.test_doc_id.unwrap();
+        app.editor.documents[&id].text().to_string()
+    }
+
+    /// Put the cursor on the first output line containing `needle` and run
+    /// Space t f, as a user reading the results would.
+    pub(in crate::commands::test) async fn follow(app: &mut Application, needle: &str) {
+        let id = app.editor.test_doc_id.unwrap();
+        focus_results(&mut app.editor, id);
+        let (view, doc) = current!(app.editor);
+        let line = doc
+            .text()
+            .lines()
+            .position(|line| line.to_string().contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not in output:\n{}", doc.text()));
+        doc.set_selection(view.id, Selection::point(doc.text().line_to_char(line)));
+        keys(app, "<space>tf").await;
+    }
+
+    /// The focused file and 1-based cursor line.
+    pub(in crate::commands::test) fn position(app: &Application) -> (PathBuf, usize) {
+        let (view, doc) = current_ref!(app.editor);
+        let line = doc
+            .selection(view.id)
+            .primary()
+            .cursor_line(doc.text().slice(..));
+        (doc.path().cloned().unwrap_or_default(), line + 1)
+    }
+
+    pub(in crate::commands::test) fn status(app: &Application) -> String {
+        app.editor
+            .get_status()
+            .map(|(status, _)| status.to_string())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

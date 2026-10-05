@@ -17,7 +17,7 @@ use tokio::{process::Command, sync::watch};
 
 use super::{
     check_idle, check_workspace_saved, execute, jump_to_location, pick_location, start_run,
-    RunResult, SourceLocation, TRUNCATED,
+    Leftovers, RunResult, SourceLocation, Streams, TRUNCATED,
 };
 use crate::{
     commands::dap::{find_go_tests_in_dir, go_test_run_regex, GoTestEntry},
@@ -216,7 +216,15 @@ pub(super) async fn run(
         command.args(["-run", pattern]);
     }
     command.arg(".").current_dir(dir);
-    let execution = match execute(command, cancel, deadline).await {
+    let execution = match execute(
+        command,
+        cancel,
+        deadline,
+        Streams::Separate,
+        Leftovers::Killed,
+    )
+    .await
+    {
         Ok(execution) => execution,
         Err(err) => {
             return RunResult {
@@ -893,6 +901,7 @@ func TestExternal(t *testing.T) {
 
 #[cfg(all(test, feature = "integration"))]
 mod editor_tests {
+    use super::super::harness::*;
     use super::super::{focus_results, replace_output, result_buffer};
     use super::*;
     use crate::{application::Application, args::Args, config::Config};
@@ -978,24 +987,6 @@ mod editor_tests {
         assert!(app.close().await.is_empty());
     }
 
-    async fn keys(app: &mut Application, input: &str) {
-        #[cfg(windows)]
-        use crossterm::event::{Event, KeyEvent};
-        #[cfg(not(windows))]
-        use termina::event::{Event, KeyEvent};
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        for key in helix_view::input::parse_macro(input).unwrap() {
-            tx.send(Ok(Event::Key(KeyEvent::from(key)))).unwrap();
-        }
-        let mut stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-        assert!(tokio::time::timeout(
-            Duration::from_secs(30),
-            app.event_loop_until_idle(&mut stream)
-        )
-        .await
-        .unwrap());
-    }
-
     fn rerun_fixture() -> tempfile::TempDir {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1033,33 +1024,6 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         fixture
     }
 
-    fn test_app(path: &Path) -> Application {
-        let mut args = Args::default();
-        args.files
-            .insert(path.to_owned(), vec![helix_core::Position::new(0, 0)]);
-        let mut config = Config::default();
-        config.editor.lsp.enable = false;
-        let syntax = helix_core::syntax::Loader::new(
-            helix_loader::config::default_lang_config()
-                .try_into()
-                .unwrap(),
-        )
-        .unwrap();
-        Application::new(args, config, syntax).unwrap()
-    }
-
-    async fn finished_output(app: &mut Application) -> String {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while app.editor.test_cancel.is_some() {
-                keys(app, "").await;
-            }
-        })
-        .await
-        .unwrap();
-        let id = app.editor.test_doc_id.unwrap();
-        app.editor.documents[&id].text().to_string()
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn package_command_rejects_unsaved_and_non_go_buffers() {
         let fixture = tests::package_fixture();
@@ -1070,7 +1034,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             .get_status()
             .unwrap()
             .0
-            .contains("Open a saved Go file"));
+            .contains("Open a saved Go or C# file"));
         assert!(app.editor.test_doc_id.is_none());
         app.editor
             .open(&fixture.path().join("nested/sample.go"), Action::Replace)
@@ -1455,38 +1419,6 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             .0
             .contains("Save modified files"));
         assert!(app.close().await.is_empty());
-    }
-
-    /// Put the cursor on the first output line containing `needle` and run
-    /// Space t f, as a user reading the results would.
-    async fn follow(app: &mut Application, needle: &str) {
-        let id = app.editor.test_doc_id.unwrap();
-        focus_results(&mut app.editor, id);
-        let (view, doc) = current!(app.editor);
-        let line = doc
-            .text()
-            .lines()
-            .position(|line| line.to_string().contains(needle))
-            .unwrap_or_else(|| panic!("{needle:?} not in output:\n{}", doc.text()));
-        doc.set_selection(view.id, Selection::point(doc.text().line_to_char(line)));
-        keys(app, "<space>tf").await;
-    }
-
-    /// The focused file and 1-based cursor line.
-    fn position(app: &Application) -> (PathBuf, usize) {
-        let (view, doc) = current_ref!(app.editor);
-        let line = doc
-            .selection(view.id)
-            .primary()
-            .cursor_line(doc.text().slice(..));
-        (doc.path().cloned().unwrap_or_default(), line + 1)
-    }
-
-    fn status(app: &Application) -> String {
-        app.editor
-            .get_status()
-            .map(|(status, _)| status.to_string())
-            .unwrap_or_default()
     }
 
     #[tokio::test(flavor = "multi_thread")]

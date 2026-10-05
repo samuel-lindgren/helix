@@ -3878,7 +3878,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "test-package",
         aliases: &["go-test-package"],
-        doc: "Run all tests in the current file's package.",
+        doc: "Run all tests in the current file's Go package or .NET project.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
                 super::test::package(cx);
@@ -3910,7 +3910,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "test-last",
         aliases: &["go-test-last"],
-        doc: "Rerun the last started test selection in its original package.",
+        doc: "Rerun the last started test selection in its original package or project.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
                 super::test::rerun(cx);
