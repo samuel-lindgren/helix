@@ -3860,12 +3860,12 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "go-test",
-        aliases: &[],
-        doc: "Select and run a saved Go test without debugging.",
+        name: "test",
+        aliases: &["go-test"],
+        doc: "Select and run a saved test without debugging.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
-                super::go_test::pick(cx);
+                super::test::pick(cx);
             }
             Ok(())
         },
@@ -3876,12 +3876,12 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "go-test-package",
-        aliases: &[],
-        doc: "Run all tests in the current Go file's package, including external package tests.",
+        name: "test-package",
+        aliases: &["go-test-package"],
+        doc: "Run all tests in the current file's package.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
-                super::go_test::package(cx);
+                super::test::package(cx);
             }
             Ok(())
         },
@@ -3892,12 +3892,12 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "go-test-nearest",
-        aliases: &[],
-        doc: "Run the saved Go test or static subtest at the cursor without debugging.",
+        name: "test-nearest",
+        aliases: &["go-test-nearest"],
+        doc: "Run the saved test at the cursor without debugging.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
-                super::go_test::nearest(cx);
+                super::test::nearest(cx);
             }
             Ok(())
         },
@@ -3908,12 +3908,12 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "go-test-last",
-        aliases: &[],
-        doc: "Rerun the last started Go test selection in its original package.",
+        name: "test-last",
+        aliases: &["go-test-last"],
+        doc: "Rerun the last started test selection in its original package.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
-                super::go_test::rerun(cx);
+                super::test::rerun(cx);
             }
             Ok(())
         },
@@ -3924,12 +3924,12 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "go-test-results",
-        aliases: &[],
-        doc: "Show retained output from the most recent Go test run.",
+        name: "test-results",
+        aliases: &["go-test-results"],
+        doc: "Show retained output from the most recent test run.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
-                super::go_test::show_results(cx);
+                super::test::show_results(cx);
             }
             Ok(())
         },
@@ -3940,12 +3940,12 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "go-test-locations",
-        aliases: &[],
-        doc: "In Go test output, go to the source location or test on the cursor line. Elsewhere, pick a reported location or failed test.",
+        name: "test-locations",
+        aliases: &["go-test-locations"],
+        doc: "In test output, go to the source location or test on the cursor line. Elsewhere, pick a reported location or failed test.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
-                super::go_test::show_locations(cx);
+                super::test::show_locations(cx);
             }
             Ok(())
         },
@@ -3956,12 +3956,12 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "go-test-cancel",
-        aliases: &[],
-        doc: "Cancel the running Go test.",
+        name: "test-cancel",
+        aliases: &["go-test-cancel"],
+        doc: "Cancel the running test.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
-                super::go_test::cancel(cx);
+                super::test::cancel(cx);
             }
             Ok(())
         },

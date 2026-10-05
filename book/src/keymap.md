@@ -294,7 +294,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `b`     | Open buffer picker                                                      | `buffer_picker`                            |
 | `j`     | Open jumplist picker                                                    | `jumplist_picker`                          |
 | `g`     | Open changed file picker                                                | `changed_file_picker`                      |
-| `t`     | Enter [Go test mode](#go-test-mode)                                      | N/A                                        |
+| `t`     | Enter [test mode](#test-mode)                                           | N/A                                        |
 | `G`     | Debug (experimental)                                                    | N/A                                        |
 | `k`     | Show documentation for item under cursor in a [popup](#popup) (**LSP**) | `hover`                                    |
 | `K`     | Show the diff of the change under cursor in a [popup](#popup)          | `diff_peek`                                |
@@ -320,9 +320,11 @@ This layer is a kludge of mappings, mostly pickers.
 
 > 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file.
 
-##### Go test mode
+##### Test mode
 
-From any saved Go file, press `Space t t` (or `:go-test`) and choose a test
+Runs tests without a debugger. Go is the supported language.
+
+From any saved Go file, press `Space t t` (or `:test`) and choose a test
 or a statically discovered subtest in the current package. Selecting a parent
 runs all of its subtests. This uses the same discovery as the Go debug picker,
 but runs `go test` asynchronously without a debugger. Go must be on `PATH`.
@@ -330,16 +332,17 @@ Save modified files in the Go module/workspace first.
 
 | Key | Description | Command |
 | --- | --- | --- |
-| `t` | Select and run a Go test | `go_test_picker` |
-| `n` | Run the test at the cursor | `go_test_nearest` |
-| `p` | Run all tests in the current package | `go_test_package` |
-| `l` | Rerun the last started test selection | `go_test_last` |
-| `r` | Show retained test output | `go_test_results` |
-| `f` | Go to the source or test on an output line, or pick one | `go_test_locations` |
-| `c` | Cancel the current run | `go_test_cancel` |
+| `t` | Select and run a test | `test_picker` |
+| `n` | Run the test at the cursor | `test_nearest` |
+| `p` | Run all tests in the current package | `test_package` |
+| `l` | Rerun the last started test selection | `test_last` |
+| `r` | Show retained test output | `test_results` |
+| `f` | Go to the source or test on an output line, or pick one | `test_locations` |
+| `c` | Cancel the current run | `test_cancel` |
 
-The corresponding typed commands are `:go-test`, `:go-test-nearest`, `:go-test-package`, `:go-test-last`,
-`:go-test-results`, `:go-test-locations`, and `:go-test-cancel`. The `[go-test]` buffer opens in a
+The corresponding typed commands are `:test`, `:test-nearest`, `:test-package`, `:test-last`,
+`:test-results`, `:test-locations`, and `:test-cancel`. The commands were named `go_test_…` and
+`:go-test…` before; those names still work. The `[go-test]` buffer opens in a
 split while the source keeps focus. It shows the selected test, package, command,
 result and test/build output after completion. Its contents remain available
 until the next run or until you close the buffer. Reported line numbers
@@ -373,7 +376,7 @@ stop the `go` process but may leave its children running.
 The picker uses the existing debug picker's Go test and simple subtest patterns.
 Dynamic/nested names may require selecting the parent.
 
-From any saved Go source or test file, `Space t p` (or `:go-test-package`)
+From any saved Go source or test file, `Space t p` (or `:test-package`)
 runs all tests in that file's directory, including tests declared in the external
 `<package>_test` package and dynamically generated subtests. It runs
 `go test -json -count=1 -timeout=2m .` in that directory without a test-name
@@ -381,7 +384,7 @@ filter or static discovery. Sibling packages and subdirectories are excluded.
 Normal Go build constraints apply. A package with no runnable tests is reported
 as not run; if all observed tests skip, the result is reported as skipped.
 
-From a saved `*_test.go` file, `Space t n` (or `:go-test-nearest`) runs the
+From a saved `*_test.go` file, `Space t n` (or `:test-nearest`) runs the
 `Test` function containing the primary cursor. It requires the Go syntax grammar
 and does not search for a nearby test when the cursor is outside a test function.
 On a direct `t.Run("name", ...)` call or in its callback, it selects that subtest
@@ -395,7 +398,7 @@ subtest runs with all its children, with an explicit notice. Indirect calls and
 runtime-generated names are not resolved. Use the picker when you want to choose
 a different case explicitly.
 
-`Space t l` (or `:go-test-last`) reruns the last started selection from the
+`Space t l` (or `:test-last`) reruns the last started selection from the
 picker, cursor or package command, with its original package and test scope.
 It works after moving the cursor, switching files/workspaces, or opening the
 result buffer. A parent selection still runs that parent and its children;

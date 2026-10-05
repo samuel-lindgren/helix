@@ -292,13 +292,20 @@
 | `goto_prev_entry` | Goto previous pairing | normal: `` [e ``, select: `` [e `` |
 | `goto_next_paragraph` | Goto next paragraph | normal: `` ]p ``, select: `` ]p `` |
 | `goto_prev_paragraph` | Goto previous paragraph | normal: `` [p ``, select: `` [p `` |
-| `go_test_last` | Rerun the last started Go test selection | normal: `` <space>tl ``, select: `` <space>tl `` |
-| `go_test_nearest` | Run the Go test at the cursor without debugging | normal: `` <space>tn ``, select: `` <space>tn `` |
-| `go_test_package` | Run all tests in the current Go package without debugging | normal: `` <space>tp ``, select: `` <space>tp `` |
-| `go_test_picker` | Select and run a Go test without debugging | normal: `` <space>tt ``, select: `` <space>tt `` |
-| `go_test_results` | Show retained Go test output | normal: `` <space>tr ``, select: `` <space>tr `` |
-| `go_test_locations` | Go to the source or test on a Go test output line, or pick one | normal: `` <space>tf ``, select: `` <space>tf `` |
-| `go_test_cancel` | Cancel the running Go test | normal: `` <space>tc ``, select: `` <space>tc `` |
+| `test_last` | Rerun the last started test selection | normal: `` <space>tl ``, select: `` <space>tl `` |
+| `test_nearest` | Run the test at the cursor without debugging | normal: `` <space>tn ``, select: `` <space>tn `` |
+| `test_package` | Run all tests in the current package without debugging | normal: `` <space>tp ``, select: `` <space>tp `` |
+| `test_picker` | Select and run a test without debugging | normal: `` <space>tt ``, select: `` <space>tt `` |
+| `test_results` | Show retained test output | normal: `` <space>tr ``, select: `` <space>tr `` |
+| `test_locations` | Go to the source or test on a test output line, or pick one | normal: `` <space>tf ``, select: `` <space>tf `` |
+| `test_cancel` | Cancel the running test | normal: `` <space>tc ``, select: `` <space>tc `` |
+| `go_test_last` | Rerun the last started test selection (same as test_last) |  |
+| `go_test_nearest` | Run the test at the cursor without debugging (same as test_nearest) |  |
+| `go_test_package` | Run all tests in the current package without debugging (same as test_package) |  |
+| `go_test_picker` | Select and run a test without debugging (same as test_picker) |  |
+| `go_test_results` | Show retained test output (same as test_results) |  |
+| `go_test_locations` | Go to the source or test on a test output line, or pick one (same as test_locations) |  |
+| `go_test_cancel` | Cancel the running test (same as test_cancel) |  |
 | `dap_launch` | Launch debug target | normal: `` <space>Gl ``, select: `` <space>Gl `` |
 | `dap_rerun_last` | Rerun last debug target | normal: `` <F2> ``, `` <space>GR ``, `` <space>G<F2> ``, select: `` <F2> ``, `` <space>GR ``, `` <space>G<F2> `` |
 | `dap_restart` | Restart debugging session | normal: `` <space>Gr ``, select: `` <space>Gr `` |

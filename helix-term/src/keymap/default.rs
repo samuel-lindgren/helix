@@ -245,14 +245,14 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "o" => recent_files_picker,
             "a" => code_action,
             "'" => last_picker,
-            "t" => { "Tests (Go)"
-                "t" => go_test_picker,
-                "n" => go_test_nearest,
-                "p" => go_test_package,
-                "l" => go_test_last,
-                "r" => go_test_results,
-                "f" => go_test_locations,
-                "c" => go_test_cancel,
+            "t" => { "Tests"
+                "t" => test_picker,
+                "n" => test_nearest,
+                "p" => test_package,
+                "l" => test_last,
+                "r" => test_results,
+                "f" => test_locations,
+                "c" => test_cancel,
             },
             "G" => { "Debug (experimental)" sticky=true
                 "l" => dap_launch,

@@ -1,12 +1,11 @@
 pub(crate) mod dap;
-pub(crate) mod go_test;
 pub(crate) mod lsp;
 pub(crate) mod syntax;
+pub(crate) mod test;
 pub(crate) mod typed;
 
 pub use dap::*;
 use futures_util::FutureExt;
-pub use go_test::*;
 use helix_event::status;
 use helix_stdx::{
     path::{self, find_paths},
@@ -15,6 +14,7 @@ use helix_stdx::{
 use helix_vcs::{BlameLine, DiffHandle, FileChange, Hunk};
 pub use lsp::*;
 pub use syntax::*;
+pub use test::*;
 use tui::{
     text::{Span, Spans},
     widgets::Cell,
@@ -597,13 +597,20 @@ impl MappableCommand {
         goto_prev_entry, "Goto previous pairing",
         goto_next_paragraph, "Goto next paragraph",
         goto_prev_paragraph, "Goto previous paragraph",
-        go_test_last, "Rerun the last started Go test selection",
-        go_test_nearest, "Run the Go test at the cursor without debugging",
-        go_test_package, "Run all tests in the current Go package without debugging",
-        go_test_picker, "Select and run a Go test without debugging",
-        go_test_results, "Show retained Go test output",
-        go_test_locations, "Go to the source or test on a Go test output line, or pick one",
-        go_test_cancel, "Cancel the running Go test",
+        test_last, "Rerun the last started test selection",
+        test_nearest, "Run the test at the cursor without debugging",
+        test_package, "Run all tests in the current package without debugging",
+        test_picker, "Select and run a test without debugging",
+        test_results, "Show retained test output",
+        test_locations, "Go to the source or test on a test output line, or pick one",
+        test_cancel, "Cancel the running test",
+        go_test_last, "Rerun the last started test selection (same as test_last)",
+        go_test_nearest, "Run the test at the cursor without debugging (same as test_nearest)",
+        go_test_package, "Run all tests in the current package without debugging (same as test_package)",
+        go_test_picker, "Select and run a test without debugging (same as test_picker)",
+        go_test_results, "Show retained test output (same as test_results)",
+        go_test_locations, "Go to the source or test on a test output line, or pick one (same as test_locations)",
+        go_test_cancel, "Cancel the running test (same as test_cancel)",
         dap_launch, "Launch debug target",
         dap_rerun_last, "Rerun last debug target",
         dap_restart, "Restart debugging session",
