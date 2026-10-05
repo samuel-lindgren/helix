@@ -75,9 +75,9 @@
 | `:review-insert-commit` | Pick a recent branch commit and insert its id at the cursors. |
 | `:review-yank-commit` | Yank the commit suggested for the selected discussion to register h and the clipboard. |
 | `:test`, `:go-test` | Select and run a saved test without debugging. |
-| `:test-package`, `:go-test-package` | Run all tests in the current file's package. |
+| `:test-package`, `:go-test-package` | Run all tests in the current file's Go package or .NET project. |
 | `:test-nearest`, `:go-test-nearest` | Run the saved test at the cursor without debugging. |
-| `:test-last`, `:go-test-last` | Rerun the last started test selection in its original package. |
+| `:test-last`, `:go-test-last` | Rerun the last started test selection in its original package or project. |
 | `:test-results`, `:go-test-results` | Show retained output from the most recent test run. |
 | `:test-locations`, `:go-test-locations` | In test output, go to the source location or test on the cursor line. Elsewhere, pick a reported location or failed test. |
 | `:test-cancel`, `:go-test-cancel` | Cancel the running test. |

@@ -294,14 +294,14 @@
 | `goto_prev_paragraph` | Goto previous paragraph | normal: `` [p ``, select: `` [p `` |
 | `test_last` | Rerun the last started test selection | normal: `` <space>tl ``, select: `` <space>tl `` |
 | `test_nearest` | Run the test at the cursor without debugging | normal: `` <space>tn ``, select: `` <space>tn `` |
-| `test_package` | Run all tests in the current package without debugging | normal: `` <space>tp ``, select: `` <space>tp `` |
+| `test_package` | Run all tests in the current package or project without debugging | normal: `` <space>tp ``, select: `` <space>tp `` |
 | `test_picker` | Select and run a test without debugging | normal: `` <space>tt ``, select: `` <space>tt `` |
 | `test_results` | Show retained test output | normal: `` <space>tr ``, select: `` <space>tr `` |
 | `test_locations` | Go to the source or test on a test output line, or pick one | normal: `` <space>tf ``, select: `` <space>tf `` |
 | `test_cancel` | Cancel the running test | normal: `` <space>tc ``, select: `` <space>tc `` |
 | `go_test_last` | Rerun the last started test selection (same as test_last) |  |
 | `go_test_nearest` | Run the test at the cursor without debugging (same as test_nearest) |  |
-| `go_test_package` | Run all tests in the current package without debugging (same as test_package) |  |
+| `go_test_package` | Run all tests in the current package or project without debugging (same as test_package) |  |
 | `go_test_picker` | Select and run a test without debugging (same as test_picker) |  |
 | `go_test_results` | Show retained test output (same as test_results) |  |
 | `go_test_locations` | Go to the source or test on a test output line, or pick one (same as test_locations) |  |

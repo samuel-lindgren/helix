@@ -322,19 +322,15 @@ This layer is a kludge of mappings, mostly pickers.
 
 ##### Test mode
 
-Runs tests without a debugger. Go is the supported language.
-
-From any saved Go file, press `Space t t` (or `:test`) and choose a test
-or a statically discovered subtest in the current package. Selecting a parent
-runs all of its subtests. This uses the same discovery as the Go debug picker,
-but runs `go test` asynchronously without a debugger. Go must be on `PATH`.
-Save modified files in the Go module/workspace first.
+Runs tests without a debugger: Go tests with `go test`, .NET tests with
+`dotnet test`. The file in the focused view decides which. The tool must be on
+`PATH`.
 
 | Key | Description | Command |
 | --- | --- | --- |
 | `t` | Select and run a test | `test_picker` |
 | `n` | Run the test at the cursor | `test_nearest` |
-| `p` | Run all tests in the current package | `test_package` |
+| `p` | Run all tests in the current Go package or .NET project | `test_package` |
 | `l` | Rerun the last started test selection | `test_last` |
 | `r` | Show retained test output | `test_results` |
 | `f` | Go to the source or test on an output line, or pick one | `test_locations` |
@@ -342,14 +338,46 @@ Save modified files in the Go module/workspace first.
 
 The corresponding typed commands are `:test`, `:test-nearest`, `:test-package`, `:test-last`,
 `:test-results`, `:test-locations`, and `:test-cancel`. The commands were named `go_test_…` and
-`:go-test…` before; those names still work. The `[go-test]` buffer opens in a
-split while the source keeps focus. It shows the selected test, package, command,
+`:go-test…` before; those names still work.
+
+The output buffer (`[go-test]` or `[dotnet-test]`) opens in a split while the
+source keeps focus. It shows the selected test, package or project, command,
 result and test/build output after completion. Its contents remain available
 until the next run or until you close the buffer. Reported line numbers
-refer to the tested files on disk; save and rerun after further edits.
+refer to the tested files on disk; save and rerun after further edits. Tests
+read saved files, so modified buffers in the workspace have to be saved first.
 
-In the `[go-test]` buffer, `Space t f` follows the cursor line into the source,
-in the split beside the output so the output stays visible:
+In the output buffer, `Space t f` follows the cursor line into the source, in
+the split beside the output so the output stays visible: a source location
+opens that line, a test name opens the test, and any other output line opens
+the test whose output it is. On a line without either, or when invoked outside
+the output, `Space t f` opens a picker of every reported location and failed
+test, with preview, normal picker split actions and `Space '` to reopen it.
+
+`Space t l` (or `:test-last`) reruns the last started selection from the
+picker, cursor or package command, with its original package or project and
+test scope. It works after moving the cursor, switching files/workspaces, or
+opening the result buffer. A parent selection still runs that parent and its
+children; a failed test can be rerun too. Save modified buffers in the original
+workspace first. Picker cancellation, blocked starts and process startup
+failures keep the previous selection. Closing the result buffer does not clear
+it. This history lasts only for the current editor session; without a previous
+run, the command reports that there is no selection to rerun.
+
+Only one run is allowed at a time. Output is capped at 2 MiB per stream and
+marked when truncated. Cancellation and editor exit stop the process group on
+Unix; other platforms stop the tool's own process but may leave its children
+running.
+
+###### Go
+
+From any saved Go file, `Space t t` lists the tests and the statically
+discovered subtests of the current package. Selecting a parent runs all of its
+subtests. This uses the same discovery as the Go debug picker. Dynamic/nested
+names may require selecting the parent. The workspace whose buffers have to be
+saved is the Go module or workspace.
+
+In the `[go-test]` buffer, `Space t f` understands:
 
 - A `file.go:line` location (an assertion, compiler error, stack frame, or
   testify `Error Trace:`) opens that line.
@@ -357,24 +385,14 @@ in the split beside the output so the output stays visible:
   test. For a subtest, it opens the line naming the case: a `t.Run("…")` call,
   a table row's name field, a map key or the first value of a row. testify
   suite methods (`TestSuite/TestMethod`) open the method.
-- Any other output line opens the test whose output it is.
 
 Names built at runtime (for example with `fmt.Sprintf`) have no source line, so
 the closest enclosing test opens instead and the status line says so. When
 several lines name the same case, a picker lists them; for Go's repeated-name
-suffixes (`#01`) the matching occurrence comes first. On other lines, or when
-invoked outside the output, `Space t f` opens a picker of every reported
-location and failed subtest, with preview, normal picker split actions and
-`Space '` to reopen it.
+suffixes (`#01`) the matching occurrence comes first.
 
 Runs bypass Go's test cache. Tests time out after two minutes; the whole command,
-including compilation, is limited to three minutes. Output is capped at 2 MiB
-per stream and marked when truncated. Only one run is allowed at a time.
-Cancellation and editor exit stop the process group on Unix; other platforms
-stop the `go` process but may leave its children running.
-
-The picker uses the existing debug picker's Go test and simple subtest patterns.
-Dynamic/nested names may require selecting the parent.
+including compilation, is limited to three minutes.
 
 From any saved Go source or test file, `Space t p` (or `:test-package`)
 runs all tests in that file's directory, including tests declared in the external
@@ -398,18 +416,59 @@ subtest runs with all its children, with an explicit notice. Indirect calls and
 runtime-generated names are not resolved. Use the picker when you want to choose
 a different case explicitly.
 
-`Space t l` (or `:test-last`) reruns the last started selection from the
-picker, cursor or package command, with its original package and test scope.
-It works after moving the cursor, switching files/workspaces, or opening the
-result buffer. A parent selection still runs that parent and its children;
-a failed test can be rerun too. Save modified buffers in the original workspace
-first. Picker cancellation, blocked starts and process startup failures keep the
-previous selection. Closing the result buffer does not clear it. This history
-lasts only for the current editor session; without a previous run, the command
-reports that there is no selection to rerun.
-
 A test excluded by build tags or an unmatched subtest is reported as not run,
 and skipped tests are reported separately from passing tests.
+
+###### .NET
+
+A C# file belongs to the project file (`*.csproj`) in the nearest directory
+above it, and that project is what runs: `dotnet test <project> --nologo
+--logger "console;verbosity=normal"`, with a `--filter` for a selection. xUnit,
+NUnit and MSTest projects that run through VSTest, which is what `dotnet test`
+uses unless a project opts out, are supported. The workspace whose buffers have
+to be saved is the directory of the solution file above the project, else the
+Git repository, else the project's own directory.
+
+Tests are found by parsing the project's C# sources, which requires the C#
+grammar: a test is a method with a test attribute (`[Fact]`, `[Theory]`,
+`[Test]`, `[TestCase]`, `[TestCaseSource]`, `[TestMethod]`, `[DataTestMethod]`,
+or an attribute whose name ends in `Fact`, `Theory` or `TestMethod`). The unit
+of selection is the method, with all of its data rows, or a class with all of
+its methods:
+
+- `Space t t` lists every class and method of the project, with a preview.
+- `Space t n` runs the method around the cursor. Elsewhere in a class with
+  tests it runs the class, and the output says so.
+- `Space t p` runs the project of the focused C# or project file, without
+  discovery. A project without tests is reported as not run.
+
+A method is selected as `FullyQualifiedName=Namespace.Class.Method`, a class as
+`FullyQualifiedName~Namespace.Class.`; a nested class is `Outer+Inner`. What
+only exists at run time is not known: a single data row cannot be selected, and
+a test declared in a base class runs under the names of the derived classes,
+so selecting it in the base class is reported as not run. Select the derived
+class instead.
+
+In the `[dotnet-test]` buffer, `Space t f` understands:
+
+- A stack frame (`at … in /path/File.cs:line 12`) or a compiler or analyzer
+  diagnostic (`/path/File.cs(12,5): error …`) opens that line. Frames of the
+  frameworks, whose files are not on this machine, open the test instead.
+- A result (`Passed`, `Failed` or `Skipped` with a name) and xUnit's `[FAIL]`
+  announcement open the declaration of the test. NUnit and MSTest report the
+  method name alone; when several classes declare it, a picker lists them. A
+  test with a display name of its own is not found by it.
+
+The result line counts what ran, for example `FAILED (1 failed, 3 passed)`. A
+build that fails is `BUILD FAILED`, a selection that matched nothing is not run,
+and a run in which nothing passed and nothing failed is skipped. The whole
+command, including package restore and the build, is limited to ten minutes;
+there is no limit per test. The compiler server that the build starts is left
+running after a finished run, as `dotnet build` leaves it, so the next build is
+quick. A cancelled run is stopped with everything it started.
+
+Projects that run on Microsoft.Testing.Platform instead of VSTest take other
+arguments and are not supported.
 
 ##### Popup
 

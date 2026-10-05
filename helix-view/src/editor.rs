@@ -1208,16 +1208,31 @@ pub struct GoTestRun {
     pub selection_note: Option<String>,
 }
 
+/// A .NET test selection admitted to the runner. Kept only for this editor session.
+#[derive(Debug, Clone)]
+pub struct DotnetTestRun {
+    /// The project file handed to `dotnet test`.
+    pub project: PathBuf,
+    pub workspace: PathBuf,
+    /// Fully qualified test or class name, or a display label for a project run.
+    pub name: String,
+    /// VSTest filter expression. None runs the project.
+    pub filter: Option<String>,
+    pub selection_note: Option<String>,
+}
+
 /// What the test runner was asked to run, in the terms of the language's own tool.
 #[derive(Debug, Clone)]
 pub enum TestRun {
     Go(GoTestRun),
+    Dotnet(DotnetTestRun),
 }
 
 impl TestRun {
     pub fn name(&self) -> &str {
         match self {
             Self::Go(run) => &run.name,
+            Self::Dotnet(run) => &run.name,
         }
     }
 
@@ -1225,6 +1240,7 @@ impl TestRun {
     pub fn workspace(&self) -> &Path {
         match self {
             Self::Go(run) => &run.workspace,
+            Self::Dotnet(run) => &run.workspace,
         }
     }
 }
