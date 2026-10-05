@@ -64,8 +64,9 @@ fn project_of(path: &Path) -> anyhow::Result<PathBuf> {
     anyhow::bail!("No project file (*.csproj) at or above {}", path.display())
 }
 
-/// Where the projects that a test project builds can be: the solution, else
-/// the repository, else the project alone.
+/// Where the projects that a test project builds can be: the repository,
+/// else the directory of a solution, else the project alone. A solution can
+/// sit beside the tests and name projects that are not below it.
 fn workspace_root(project: &Path) -> PathBuf {
     let dir = project.parent().unwrap_or(project);
     let has_solution = |dir: &&Path| {
@@ -81,8 +82,8 @@ fn workspace_root(project: &Path) -> PathBuf {
             })
     };
     dir.ancestors()
-        .find(has_solution)
-        .or_else(|| dir.ancestors().find(|dir| dir.join(".git").exists()))
+        .find(|dir| dir.join(".git").exists())
+        .or_else(|| dir.ancestors().find(has_solution))
         .unwrap_or(dir)
         .to_owned()
 }
@@ -134,6 +135,7 @@ pub(super) fn pick(cx: &mut compositor::Context, debugger: Option<Debugger>) {
                         return;
                     }
                 };
+                let all = tests.clone();
                 let picker = Picker::new(
                     [
                         PickerColumn::new("test", |t: &DotnetTest, _: &PathBuf| {
@@ -155,7 +157,7 @@ pub(super) fn pick(cx: &mut compositor::Context, debugger: Option<Debugger>) {
                     tests,
                     dir,
                     move |cx, test, _| {
-                        let target = TestRun::Dotnet(selection(&project, test, None));
+                        let target = TestRun::Dotnet(selection(&project, test, None, &all));
                         start(cx, target, debugger.clone())
                     },
                 )
@@ -185,7 +187,12 @@ pub(super) fn nearest(cx: &mut compositor::Context) {
         );
         let declared = discovery::parse(discovery::grammar()?, &source, path);
         let (test, note) = at_cursor(&declared, &source, byte)?;
-        Ok(selection(&project, test, note))
+        // Only a class is selected among the others of the project.
+        let others = match test.method {
+            Some(_) => Vec::new(),
+            None => discovery::project_tests(project.parent().unwrap_or(&project))?,
+        };
+        Ok(selection(&project, test, note, &others))
     })();
     match target {
         Ok(target) => start(cx, TestRun::Dotnet(target), None),
@@ -227,12 +234,18 @@ fn at_cursor<'a>(
     Ok((class, Some(note)))
 }
 
-fn selection(project: &Path, test: &DotnetTest, note: Option<String>) -> DotnetTestRun {
+/// `tests` are those of the project, among which a class has to be told apart.
+fn selection(
+    project: &Path,
+    test: &DotnetTest,
+    note: Option<String>,
+    tests: &[DotnetTest],
+) -> DotnetTestRun {
     DotnetTestRun {
         project: project.to_owned(),
         workspace: workspace_root(project),
         name: test.name(),
-        filter: Some(test.filter()),
+        filter: Some(test.filter(tests.iter().map(|test| test.class.as_str()))),
         selection_note: note,
     }
 }
@@ -351,8 +364,10 @@ pub(super) async fn run(
         // The results are read from the English output.
         .env("DOTNET_CLI_UI_LANGUAGE", "en")
         .env("DOTNET_NOLOGO", "1")
-        // The terminal logger redraws lines instead of printing them.
-        .env("MSBUILDTERMINALLOGGER", "off");
+        // The terminal logger redraws lines instead of printing them, and
+        // colours would stand before the words that the results are read by.
+        .env("MSBUILDTERMINALLOGGER", "off")
+        .env_remove("DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION");
     let mut hosts = attach.map(HostWatch::new);
     if hosts.is_some() {
         // One debugger at a time: the test hosts of a project with several
@@ -388,7 +403,7 @@ pub(super) async fn run(
     };
     let mut output = String::from_utf8_lossy(&execution.stdout).into_owned();
     let summary = Summary::read(&output);
-    if execution.truncated() {
+    if execution.truncated {
         output.push_str(TRUNCATED);
     }
     let (status, success) = match execution.exit {
@@ -405,7 +420,7 @@ pub(super) async fn run(
         }
         Ok(_) if summary.total == 0 => {
             let status = if target.filter.is_some() {
-                "NOT RUN: selected test was not observed (renamed, excluded from the build, or declared in a base class)"
+                "NOT RUN: selected test was not observed (renamed, excluded from the build, declared in a base class, or in a generic or parameterized class)"
             } else {
                 "NOT RUN: no tests were observed (is this a test project?)"
             };
@@ -432,23 +447,56 @@ struct Summary {
     build_errors: bool,
 }
 
-static COUNT: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\s*(Total tests|Passed|Failed|Skipped): ([0-9]+)\s*$").unwrap());
+/// What `dotnet test` prints after each test assembly:
+///
+/// ```text
+/// Total tests: 7
+///      Passed: 3
+///      Failed: 3
+///     Skipped: 1
+///  Total time: 1.6186 Seconds
+/// ```
+///
+/// Only a whole block counts: a test can print a line that looks like one of these.
+static TOTALS_BLOCK: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?m)^Total tests: ([0-9]+)\r?\n(?: +Passed: ([0-9]+)\r?\n)?(?: +Failed: ([0-9]+)\r?\n)?(?: +Skipped: ([0-9]+)\r?\n)? *Total time: ",
+    )
+    .unwrap()
+});
+/// An error of the compiler, of MSBuild or of the package restore:
+/// `File.cs(1,2): error CS0103: …`, `Shop.csproj : error NU1101: …`.
+static BUILD_ERROR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?m)(?:^|\s)error [A-Z]+[0-9]+: ").unwrap());
 
 impl Summary {
     fn read(output: &str) -> Self {
-        let mut summary = Self::default();
-        for line in output.lines() {
-            if let Some(count) = COUNT.captures(line) {
-                let number = count[2].parse::<usize>().unwrap_or(0);
-                match &count[1] {
-                    "Total tests" => summary.total += number,
-                    "Passed" => summary.passed += number,
-                    "Failed" => summary.failed += number,
-                    _ => summary.skipped += number,
+        let mut summary = Self {
+            build_errors: BUILD_ERROR.is_match(output),
+            ..Self::default()
+        };
+        for block in TOTALS_BLOCK.captures_iter(output) {
+            let number = |group| {
+                block
+                    .get(group)
+                    .and_then(|number| number.as_str().parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            summary.total += number(1);
+            summary.passed += number(2);
+            summary.failed += number(3);
+            summary.skipped += number(4);
+        }
+        if summary.total == 0 {
+            // No totals follow a run in which nothing passed or failed, or one
+            // that was cut short. The results it listed are what there is.
+            for result in output.lines().filter_map(|line| RESULT.captures(line)) {
+                summary.total += 1;
+                match &result[1] {
+                    "Passed" => summary.passed += 1,
+                    "Failed" => summary.failed += 1,
+                    _ => summary.skipped += 1,
                 }
-            } else if let Some(diagnostic) = DIAGNOSTIC.captures(line) {
-                summary.build_errors |= diagnostic[3].starts_with("error ");
             }
         }
         summary
@@ -715,7 +763,9 @@ Total tests: 4
             }
         );
         assert_eq!(summary.to_string(), "2 failed, 1 passed, 1 skipped");
-        let twice = Summary::read(&format!("{XUNIT}\nTotal tests: 3\n     Passed: 3\n"));
+        let twice = Summary::read(&format!(
+            "{XUNIT}\nTotal tests: 3\n     Passed: 3\n Total time: 0.9 Seconds\n"
+        ));
         assert_eq!((twice.total, twice.passed, twice.failed), (7, 4, 2));
         assert_eq!(
             Summary {
@@ -726,13 +776,31 @@ Total tests: 4
             .to_string(),
             "3 passed"
         );
-        let broken = Summary::read(
+        // Errors of the compiler and of the restore, which names no line.
+        for error in [
             "/src/A.cs(54,42): error CS0103: The name 'x' does not exist [/src/A.csproj]\n",
+            "/src/A.csproj : error NU1101: Unable to find package Nope. [/src/A.csproj]\n",
+            "MSBUILD : error MSB1009: Project file does not exist.\n",
+        ] {
+            let broken = Summary::read(error);
+            assert!(broken.build_errors && broken.total == 0, "{error}");
+        }
+        assert!(!Summary::read("  Failed Shop.Tests.Parses_error_codes [1 ms]\n").build_errors);
+        // What a test prints is not a total: only the whole block is.
+        let printed = Summary::read(&XUNIT.replace(
+            "console output line\n",
+            "Total tests: 100\n     Failed: 7\nTotal tests: 5\n",
+        ));
+        assert_eq!((printed.total, printed.failed), (4, 2));
+        // Without totals the listed results count: NUnit prints none for a
+        // run in which nothing passed or failed.
+        let inconclusive = Summary::read("  Skipped Inconclusive [23 ms]\n\n");
+        assert_eq!((inconclusive.total, inconclusive.skipped), (1, 1));
+        let cut_short = Summary::read("  Passed A [1 ms]\n  Failed B [2 ms]\nThe active test run was aborted.\nTotal tests: Unknown\n");
+        assert_eq!(
+            (cut_short.total, cut_short.passed, cut_short.failed),
+            (2, 1, 1)
         );
-        assert!(broken.build_errors && broken.total == 0);
-        // A result line is not a total, and a test may be named like one.
-        let named = Summary::read("  Passed Passed: 3 [1 ms]\n  Failed Total tests: 9\n");
-        assert_eq!(named, Summary::default());
     }
 
     #[test]
@@ -993,12 +1061,15 @@ Total tests: 4
             .unwrap_err()
             .to_string()
             .contains("No project file"));
+        // Without a repository the solution bounds the workspace, else the project.
         assert_eq!(workspace_root(&project), root);
-        // Without a solution the repository bounds the workspace, else the project.
         std::fs::remove_file(root.join("Shop.sln")).unwrap();
         assert_eq!(workspace_root(&project), root.join("tests/Shop.Tests"));
-        std::fs::create_dir(root.join("tests/.git")).unwrap();
+        // A solution beside the tests does not hide the sources it builds.
+        std::fs::write(root.join("tests/Tests.sln"), "").unwrap();
         assert_eq!(workspace_root(&project), root.join("tests"));
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert_eq!(workspace_root(&project), root);
     }
 
     #[tokio::test]
@@ -1028,7 +1099,10 @@ Total tests: 4
             "/src/Shop.Tests/CalcTests.cs",
             3,
         );
-        let header = header(&selection(project, &method, Some("a note".into())), false);
+        let header = header(
+            &selection(project, &method, Some("a note".into()), &[]),
+            false,
+        );
         assert!(header.starts_with(
             ".NET test: Shop.Tests.CalcTests.Adds\nProject: /src/Shop.Tests/Shop.Tests.csproj\n"
         ));
@@ -1151,6 +1225,18 @@ public class CalcTests
                 .to_owned(),
             ),
             (
+                "tests/Shop.Tests/Collide.cs",
+                r#"namespace MyShop.Tests;
+
+public class CalcTests
+{
+    [Fact]
+    public void Elsewhere() => Console.WriteLine("OTHER NAMESPACE");
+}
+"#
+                .to_owned(),
+            ),
+            (
                 "tests/Shop.Tests/SlowTests.cs",
                 format!(
                     r#"namespace Shop.Tests;
@@ -1196,7 +1282,7 @@ public class SlowTests
                 .iter()
                 .find(|test| test.name() == name)
                 .unwrap_or_else(|| panic!("{name} was not discovered"));
-            selection(&project, test, None)
+            selection(&project, test, None, &tests)
         };
         let report = |result: &RunResult| format!("{}\n{}", result.status, result.output);
 
@@ -1232,8 +1318,14 @@ public class SlowTests
             Some("Shop.Tests.CalcTests.Table(a: 2, b: 2, sum: 5)")
         );
 
-        // A class is its own methods, not those of the classes nested in it.
-        let class = run_dotnet(&select("Shop.Tests.CalcTests")).await;
+        // A class is its own methods: not those of the classes nested in it,
+        // and not those of a class whose longer name ends in its own.
+        let class = select("Shop.Tests.CalcTests");
+        assert_eq!(
+            class.filter.as_deref(),
+            Some("FullyQualifiedName~Shop.Tests.CalcTests.&FullyQualifiedName!~MyShop.Tests.CalcTests.")
+        );
+        let class = run_dotnet(&class).await;
         assert_eq!(
             class.status,
             "FAILED (2 failed, 2 passed, 1 skipped)",
@@ -1241,6 +1333,7 @@ public class SlowTests
             report(&class)
         );
         assert!(!class.output.contains("NESTED TEST"));
+        assert!(!class.output.contains("OTHER NAMESPACE"));
         let nested = run_dotnet(&select("Shop.Tests.CalcTests+Nested")).await;
         assert_eq!(nested.status, "PASSED (1 passed)", "{}", report(&nested));
         assert!(nested.output.contains("NESTED TEST"));
@@ -1263,7 +1356,7 @@ public class SlowTests
         let all = run_dotnet(&project_selection(&project)).await;
         assert_eq!(
             all.status,
-            "FAILED (2 failed, 4 passed, 1 skipped)",
+            "FAILED (2 failed, 5 passed, 1 skipped)",
             "{}",
             report(&all)
         );
@@ -1298,7 +1391,7 @@ public class SlowTests
             file: project.with_file_name("SlowTests.cs"),
             line: 5,
         };
-        let target = selection(&project, &slow, None);
+        let target = selection(&project, &slow, None, &[]);
         let (tx, rx) = watch::channel(false);
         let task =
             tokio::spawn(
@@ -1359,7 +1452,7 @@ mod debug_tests {
             file: project.with_file_name("CalcTests.cs"),
             line: 5,
         };
-        let target = selection(&project, &adds, None);
+        let target = selection(&project, &adds, None, &[]);
         let (cancel, rx) = watch::channel(false);
         let (tx, mut hosts) = tokio::sync::mpsc::unbounded_channel();
         let attach: Attach = Box::new(move |pid| tx.send(pid).unwrap());
@@ -1517,7 +1610,7 @@ mod editor_tests {
             "{output}"
         );
         assert!(
-            output.contains("\nFAILED (2 failed, 4 passed, 1 skipped)\n"),
+            output.contains("\nFAILED (2 failed, 5 passed, 1 skipped)\n"),
             "{output}"
         );
         assert!(app.close().await.is_empty());

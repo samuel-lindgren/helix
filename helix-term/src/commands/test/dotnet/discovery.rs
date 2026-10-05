@@ -1,7 +1,8 @@
 //! Test methods found by parsing C# sources. Attributes mark the tests of
-//! xUnit, NUnit, MSTest and TUnit alike. What the attributes do at run time
-//! (data rows, display names, tests inherited from a base class) is not known
-//! here: the unit of selection is the method, or the class with all of them.
+//! xUnit, NUnit and MSTest alike. What exists only at run time is not known
+//! here: data rows, display names, tests inherited from a base class, and
+//! the names of generic and parameterized classes. The unit of selection is
+//! the method, or the class with all of them.
 use std::{
     ops::Range,
     path::{Path, PathBuf},
@@ -37,12 +38,28 @@ impl DotnetTest {
 
     /// The VSTest filter that selects this entry. A method is named exactly,
     /// which includes each of its data rows in all three frameworks. A class
-    /// has no name of its own among the results, so its methods are matched.
-    pub fn filter(&self) -> String {
-        match &self.method {
-            Some(method) => format!("FullyQualifiedName={}.{method}", self.class),
-            None => format!("FullyQualifiedName~{}.", self.class),
-        }
+    /// has no name of its own among the results, so its methods are matched
+    /// by how their names begin. The filter language can only ask whether a
+    /// name contains that, so the `classes` of the project whose longer names
+    /// contain it too are excluded by name.
+    pub fn filter<'a>(&self, classes: impl IntoIterator<Item = &'a str>) -> String {
+        let Some(method) = &self.method else {
+            let own = format!("{}.", self.class);
+            let mut longer: Vec<_> = classes
+                .into_iter()
+                .filter(|class| *class != self.class)
+                .map(|class| format!("{class}."))
+                .filter(|class| class.contains(&own))
+                .collect();
+            longer.sort();
+            longer.dedup();
+            return longer
+                .iter()
+                .fold(format!("FullyQualifiedName~{own}"), |filter, class| {
+                    format!("{filter}&FullyQualifiedName!~{class}")
+                });
+        };
+        format!("FullyQualifiedName={}.{method}", self.class)
     }
 
     pub fn namespace(&self) -> &str {
@@ -124,7 +141,7 @@ pub(in crate::commands) fn project_tests(dir: &Path) -> anyhow::Result<Vec<Dotne
 
 /// Cheap to check, and wrong only towards parsing a file without tests.
 static MAY_DECLARE_TESTS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:Fact|Theory|Test|TestCase|TestCaseSource|TestMethod)(?:Attribute)?\s*[\](,]")
+    Regex::new(r"(?:Fact|Theory|Test|TestCase|TestCaseSource|TestMethod)(?:Attribute)?\s*[\](,<]")
         .unwrap()
 });
 
@@ -349,6 +366,7 @@ mod tests {
             ("[Test, Ignore(\"x\")] void A() {}", true),
             ("[Description(\"x\"), TestMethod] void A() {}", true),
             ("[TestCase(1, 2)]\nvoid A(int a, int b) {}", true),
+            ("[Test<int>] void A() {}", true),
             ("[InlineData(1)] void A() {}", false),
             ("var facts = Tests.Count; [Obsolete] void A() {}", false),
         ] {
@@ -368,7 +386,7 @@ mod tests {
         assert_eq!(method.short_name(), "Calc+Nested.Adds");
         assert_eq!(method.namespace(), "Shop.Tests");
         assert_eq!(
-            method.filter(),
+            method.filter(["Shop.Tests.Calc+Nested", "Other.Shop.Tests.Calc+Nested"]),
             "FullyQualifiedName=Shop.Tests.Calc+Nested.Adds"
         );
         let class = DotnetTest {
@@ -379,7 +397,19 @@ mod tests {
         assert_eq!(class.name(), "Calc");
         assert_eq!(class.short_name(), "Calc");
         assert_eq!(class.namespace(), "");
-        assert_eq!(class.filter(), "FullyQualifiedName~Calc.");
+        assert_eq!(class.filter([]), "FullyQualifiedName~Calc.");
+        // Only names that contain this one are excluded, each once.
+        assert_eq!(
+            class.filter([
+                "Calc",
+                "Deep.FastCalc",
+                "Deep.Calc",
+                "Calc+Nested",
+                "Calculator",
+                "Deep.Calc",
+            ]),
+            "FullyQualifiedName~Calc.&FullyQualifiedName!~Deep.Calc.&FullyQualifiedName!~Deep.FastCalc."
+        );
     }
 
     #[test]

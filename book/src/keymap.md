@@ -364,8 +364,8 @@ failures keep the previous selection. Closing the result buffer does not clear
 it. This history lasts only for the current editor session; without a previous
 run, the command reports that there is no selection to rerun.
 
-Only one run is allowed at a time. Output is capped at 2 MiB per stream and
-marked when truncated. Cancellation and editor exit stop the process group on
+Only one run is allowed at a time. Of a stream of more than 2 MiB, the first
+and the last MiB are kept, with a mark between them and a note at the end. Cancellation and editor exit stop the process group on
 Unix; other platforms stop the tool's own process but may leave its children
 running.
 
@@ -426,8 +426,8 @@ above it, and that project is what runs: `dotnet test <project> --nologo
 --logger "console;verbosity=normal"`, with a `--filter` for a selection. xUnit,
 NUnit and MSTest projects that run through VSTest, which is what `dotnet test`
 uses unless a project opts out, are supported. The workspace whose buffers have
-to be saved is the directory of the solution file above the project, else the
-Git repository, else the project's own directory.
+to be saved is the Git repository, else the directory of the solution file
+above the project, else the project's own directory.
 
 Tests are found by parsing the project's C# sources, which requires the C#
 grammar: a test is a method with a test attribute (`[Fact]`, `[Theory]`,
@@ -443,11 +443,15 @@ its methods:
   discovery. A project without tests is reported as not run.
 
 A method is selected as `FullyQualifiedName=Namespace.Class.Method`, a class as
-`FullyQualifiedName~Namespace.Class.`; a nested class is `Outer+Inner`. What
-only exists at run time is not known: a single data row cannot be selected, and
-a test declared in a base class runs under the names of the derived classes,
-so selecting it in the base class is reported as not run. Select the derived
-class instead.
+`FullyQualifiedName~Namespace.Class.`; a nested class is `Outer+Inner`. The
+filter can only ask whether a name contains that text, so classes of the
+project whose longer names contain it too (`Other.Namespace.Class`) are
+excluded by name. What only exists at run time is not known: a single data row
+cannot be selected, and a test declared in a base class runs under the names of
+the derived classes, so selecting it in the base class is reported as not run.
+Select the derived class instead. The same goes for the tests of a generic
+class and of an NUnit fixture with arguments, whose run-time names differ from
+the ones in the source: run the project.
 
 In the `[dotnet-test]` buffer, `Space t f` understands:
 
