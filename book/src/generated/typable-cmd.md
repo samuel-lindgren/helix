@@ -74,13 +74,13 @@
 | `:review-unresolve` | Reopen the selected resolved review discussion. |
 | `:review-insert-commit` | Pick a recent branch commit and insert its id at the cursors. |
 | `:review-yank-commit` | Yank the commit suggested for the selected discussion to register h and the clipboard. |
-| `:go-test` | Select and run a saved Go test without debugging. |
-| `:go-test-package` | Run all tests in the current Go file's package, including external package tests. |
-| `:go-test-nearest` | Run the saved Go test or static subtest at the cursor without debugging. |
-| `:go-test-last` | Rerun the last started Go test selection in its original package. |
-| `:go-test-results` | Show retained output from the most recent Go test run. |
-| `:go-test-locations` | In Go test output, go to the source location or test on the cursor line. Elsewhere, pick a reported location or failed test. |
-| `:go-test-cancel` | Cancel the running Go test. |
+| `:test`, `:go-test` | Select and run a saved test without debugging. |
+| `:test-package`, `:go-test-package` | Run all tests in the current file's package. |
+| `:test-nearest`, `:go-test-nearest` | Run the saved test at the cursor without debugging. |
+| `:test-last`, `:go-test-last` | Rerun the last started test selection in its original package. |
+| `:test-results`, `:go-test-results` | Show retained output from the most recent test run. |
+| `:test-locations`, `:go-test-locations` | In test output, go to the source location or test on the cursor line. Elsewhere, pick a reported location or failed test. |
+| `:test-cancel`, `:go-test-cancel` | Cancel the running test. |
 | `:debug-start`, `:dbg` | Start a debug session from a given template with given parameters. |
 | `:debug-remote`, `:dbg-tcp` | Connect to a debug adapter by TCP address and start a debugging session from a given template with given parameters. |
 | `:debug-eval` | Evaluate expression in current debug context. |

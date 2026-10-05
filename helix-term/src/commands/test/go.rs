@@ -3,28 +3,24 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
-use helix_core::{regex::Regex, Selection, Transaction};
+use helix_core::regex::Regex;
 use helix_view::{
-    editor::{Action, GoTestRun},
+    editor::{Action, GoTestRun, TestRun},
     DocumentId, Editor,
 };
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::Command,
-    sync::watch,
-};
+use tokio::{process::Command, sync::watch};
 
 use super::{
-    dap::{find_go_tests_in_dir, go_test_run_regex, GoTestEntry},
-    Context,
+    check_idle, check_workspace_saved, execute, jump_to_location, pick_location, start_run,
+    RunResult, SourceLocation, TRUNCATED,
 };
 use crate::{
+    commands::dap::{find_go_tests_in_dir, go_test_run_regex, GoTestEntry},
     compositor,
     job::Callback,
     ui::{overlay::overlaid, Picker, PickerColumn},
@@ -33,24 +29,8 @@ use crate::{
 mod cursor;
 mod names;
 
-const OUTPUT_LIMIT: usize = 2 * 1024 * 1024; // per stream; keep draining after the cap
-const RUN_TIMEOUT: Duration = Duration::from_secs(180); // includes compilation
-
-pub fn go_test_picker(cx: &mut Context) {
-    pick(&mut compositor::Context {
-        editor: cx.editor,
-        jobs: cx.jobs,
-        scroll: None,
-    });
-}
-
-pub fn go_test_package(cx: &mut Context) {
-    package(&mut compositor::Context {
-        editor: cx.editor,
-        jobs: cx.jobs,
-        scroll: None,
-    });
-}
+pub(super) const BUFFER_NAME: &str = "[go-test]";
+pub(super) const RUN_TIMEOUT: Duration = Duration::from_secs(180); // includes compilation
 
 pub(super) fn package(cx: &mut compositor::Context) {
     let Some(path) = doc!(cx.editor)
@@ -62,21 +42,12 @@ pub(super) fn package(cx: &mut compositor::Context) {
         return;
     };
     let dir = path.parent().unwrap().to_owned();
-    start_run(cx, package_selection(&dir));
-}
-
-pub fn go_test_nearest(cx: &mut Context) {
-    nearest(&mut compositor::Context {
-        editor: cx.editor,
-        jobs: cx.jobs,
-        scroll: None,
-    });
+    start_run(cx, TestRun::Go(package_selection(&dir)));
 }
 
 pub(super) fn nearest(cx: &mut compositor::Context) {
-    if cx.editor.go_test_cancel.is_some() {
-        cx.editor
-            .set_error("A Go test is already running (Space t c to cancel)");
+    if let Err(err) = check_idle(cx.editor) {
+        cx.editor.set_error(err.to_string());
         return;
     }
     let target = (|| -> anyhow::Result<_> {
@@ -117,50 +88,6 @@ pub(super) fn nearest(cx: &mut compositor::Context) {
     }
 }
 
-pub fn go_test_last(cx: &mut Context) {
-    rerun(&mut compositor::Context {
-        editor: cx.editor,
-        jobs: cx.jobs,
-        scroll: None,
-    });
-}
-
-pub(super) fn rerun(cx: &mut compositor::Context) {
-    if cx.editor.go_test_cancel.is_some() {
-        cx.editor
-            .set_error("A Go test is already running (Space t c to cancel)");
-    } else if let Some(target) = cx.editor.go_test_last_run.clone() {
-        start_run(cx, target);
-    } else {
-        cx.editor
-            .set_error("No Go test has been started in this session");
-    }
-}
-
-pub fn go_test_results(cx: &mut Context) {
-    show_results(&mut compositor::Context {
-        editor: cx.editor,
-        jobs: cx.jobs,
-        scroll: None,
-    });
-}
-
-pub fn go_test_locations(cx: &mut Context) {
-    show_locations(&mut compositor::Context {
-        editor: cx.editor,
-        jobs: cx.jobs,
-        scroll: None,
-    });
-}
-
-pub fn go_test_cancel(cx: &mut Context) {
-    cancel(&mut compositor::Context {
-        editor: cx.editor,
-        jobs: cx.jobs,
-        scroll: None,
-    });
-}
-
 fn workspace_root(dir: &Path) -> PathBuf {
     dir.ancestors()
         .find(|p| p.join("go.work").is_file())
@@ -173,24 +100,9 @@ fn check_saved(editor: &Editor, dir: &Path) -> anyhow::Result<()> {
     check_workspace_saved(editor, &workspace_root(dir))
 }
 
-fn check_workspace_saved(editor: &Editor, root: &Path) -> anyhow::Result<()> {
-    if let Some(doc) = editor
-        .documents
-        .values()
-        .find(|doc| doc.is_modified() && doc.path().is_some_and(|path| path.starts_with(root)))
-    {
-        anyhow::bail!(
-            "Save modified files before running Go tests: {}",
-            doc.display_name()
-        );
-    }
-    Ok(())
-}
-
 pub(super) fn pick(cx: &mut compositor::Context) {
-    if cx.editor.go_test_cancel.is_some() {
-        cx.editor
-            .set_error("A Go test is already running (Space t c to cancel)");
+    if let Err(err) = check_idle(cx.editor) {
+        cx.editor.set_error(err.to_string());
         return;
     }
     let Some(path) = doc!(cx.editor)
@@ -253,22 +165,11 @@ fn package_selection(dir: &Path) -> GoTestRun {
 }
 
 fn start(cx: &mut compositor::Context, dir: PathBuf, entry: GoTestEntry, note: Option<String>) {
-    start_run(cx, selection(&dir, &entry, note));
+    start_run(cx, TestRun::Go(selection(&dir, &entry, note)));
 }
 
-fn start_run(cx: &mut compositor::Context, target: GoTestRun) {
-    // Pickers can be reopened with last_picker; recheck at the point of launch.
-    if cx.editor.go_test_cancel.is_some() {
-        cx.editor
-            .set_error("A Go test is already running (Space t c to cancel)");
-        return;
-    }
-    if let Err(err) = check_workspace_saved(cx.editor, &target.workspace) {
-        cx.editor.set_error(err.to_string());
-        return;
-    }
-    let origin = view!(cx.editor).id;
-    let id = result_buffer(cx.editor);
+/// The lines above the result in the output buffer.
+pub(super) fn header(target: &GoTestRun) -> String {
     let notice = target
         .selection_note
         .as_ref()
@@ -279,114 +180,13 @@ fn start_run(cx: &mut compositor::Context, target: GoTestRun) {
         .as_ref()
         .map(|pattern| format!("-run {pattern:?} "))
         .unwrap_or_default();
-    let header = format!(
+    format!(
         "Go test: {}\nPackage: {}\nCommand: go test -json -count=1 -timeout=2m {filter}.\n\
          Tests read saved files from disk. Save and rerun after edits.\n\
          Space t f: go to this line's test or source | Space t r: results | Space t c: cancel\n{notice}\n",
         target.name,
         target.directory.display(),
-    );
-    replace_output(cx.editor, id, format!("{header}RUNNING\n"));
-    cx.editor.focus(origin);
-    let (cancel, rx) = watch::channel(false);
-    cx.editor.go_test_cancel = Some(cancel);
-    cx.editor.set_status(format!("Running {}…", target.name));
-    cx.jobs.callback(async move {
-        let result = run(Path::new("go"), &target, rx, RUN_TIMEOUT).await;
-        let output = format!("{header}{}\n\n{}", result.status, result.output);
-        Ok(Callback::Editor(Box::new(move |editor| {
-            editor.go_test_cancel = None;
-            // A cancelled picker, unsaved-file guard, or failed process spawn
-            // must not overwrite a previous runnable selection.
-            if result.started {
-                editor.go_test_last_run = Some(target);
-            }
-            // Closing the buffer explicitly discards it. Do not steal focus or
-            // resurrect it when the process finishes.
-            replace_output(editor, id, output);
-            if result.success {
-                editor.set_status(format!("{} (Space t r for output)", result.status));
-            } else {
-                editor.set_error(format!(
-                    "{} (Space t r: output, Space t f: locations)",
-                    result.status
-                ));
-            }
-        })))
-    });
-}
-
-fn result_buffer(editor: &mut Editor) -> DocumentId {
-    if let Some(id) = editor
-        .go_test_doc_id
-        .filter(|id| editor.documents.contains_key(id))
-    {
-        focus_results(editor, id);
-        return id;
-    }
-    let id = editor.new_file(Action::VerticalSplit);
-    editor.go_test_doc_id = Some(id);
-    let doc = doc_mut!(editor, &id);
-    doc.set_virtual_name(Some("[go-test]".into()));
-    doc.set_soft_wrap_override(Some(true));
-    doc.readonly = true;
-    id
-}
-
-fn focus_results(editor: &mut Editor, id: DocumentId) {
-    let visible = editor
-        .tree
-        .traverse()
-        .find(|(_, view)| view.doc == id)
-        .map(|(id, _)| id);
-    if let Some(view) = visible {
-        editor.focus(view);
-    } else {
-        editor.switch(id, Action::VerticalSplit);
-    }
-}
-
-fn replace_output(editor: &mut Editor, id: DocumentId, output: String) {
-    let view_id = editor
-        .tree
-        .traverse()
-        .find(|(_, v)| v.doc == id)
-        .map(|(id, _)| id)
-        .unwrap_or_else(|| view!(editor).id);
-    let Some(doc) = editor.documents.get_mut(&id) else {
-        return;
-    };
-    // Also update hidden buffers. A view may hold selections/jumps for documents
-    // other than its current one; committing updates only this document's jumps.
-    doc.ensure_view_init(view_id);
-    let transaction = Transaction::change(
-        doc.text(),
-        std::iter::once((0, doc.text().len_chars(), Some(output.into()))),
     )
-    .with_selection(Selection::point(0));
-    doc.apply(&transaction, view_id);
-    doc.append_changes_to_history(editor.tree.get_mut(view_id));
-    doc.reset_modified();
-}
-
-pub(super) fn show_results(cx: &mut compositor::Context) {
-    match cx
-        .editor
-        .go_test_doc_id
-        .filter(|id| cx.editor.documents.contains_key(id))
-    {
-        Some(id) => focus_results(cx.editor, id),
-        None => cx.editor.set_error("No retained Go test output"),
-    }
-}
-
-pub(super) fn cancel(cx: &mut compositor::Context) {
-    if let Some(cancel) = &cx.editor.go_test_cancel {
-        let _ = cancel.send(true);
-        cx.editor.set_status("Cancelling Go test…");
-    } else {
-        cx.editor.set_error("No Go test is running");
-    }
 }
 
 fn test_name(entry: &GoTestEntry) -> String {
@@ -403,46 +203,10 @@ fn test_name(entry: &GoTestEntry) -> String {
     }
 }
 
-struct RunResult {
-    started: bool,
-    status: String,
-    output: String,
-    success: bool,
-}
-
-// Kill the process group as well as `go`, so cancellation/editor exit also stops
-// the test executable and compiler children on Unix. kill_on_drop covers `go`
-// itself on all platforms. The group is private to this invocation.
-struct ProcessGroup(Option<u32>);
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0 {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
-    }
-}
-
-async fn capture(mut reader: impl AsyncRead + Unpin, bytes: &mut Vec<u8>) -> std::io::Result<bool> {
-    let mut truncated = false;
-    let mut chunk = [0; 8192];
-    loop {
-        let len = reader.read(&mut chunk).await?;
-        if len == 0 {
-            return Ok(truncated);
-        }
-        let keep = len.min(OUTPUT_LIMIT - bytes.len());
-        bytes.extend_from_slice(&chunk[..keep]);
-        truncated |= keep < len;
-    }
-}
-
-async fn run(
+pub(super) async fn run(
     program: &Path,
     target: &GoTestRun,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
     deadline: Duration,
 ) -> RunResult {
     let dir = &target.directory;
@@ -451,17 +215,9 @@ async fn run(
     if let Some(pattern) = &target.run_pattern {
         command.args(["-run", pattern]);
     }
-    command
-        .arg(".")
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    command.arg(".").current_dir(dir);
+    let execution = match execute(command, cancel, deadline).await {
+        Ok(execution) => execution,
         Err(err) => {
             return RunResult {
                 started: false,
@@ -471,39 +227,22 @@ async fn run(
             }
         }
     };
-    let group = ProcessGroup(child.id());
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let result = tokio::select! {
-        biased;
-        _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err("CANCELLED".to_owned()),
-        result = tokio::time::timeout(deadline, async {
-            tokio::try_join!(child.wait(), capture(stdout, &mut out), capture(stderr, &mut err))
-        }) => match result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(err)) => Err(format!("PROCESS ERROR: {err}")),
-            Err(_) => Err("TIMED OUT (including build time)".into()),
-        }
-    };
-    // Drop first to stop descendants before waiting for the immediate child.
-    drop(group);
-    if result.is_err() {
-        let _ = child.kill().await;
-    }
     let selected = target.run_pattern.as_ref().map(|_| target.name.as_str());
-    let parsed = parse_output(&out, selected, dir);
+    let parsed = parse_output(&execution.stdout, selected, dir);
     let mut output = parsed.output;
-    if !err.is_empty() {
+    if !execution.stderr.is_empty() {
         output.push_str(&format!("\n{STDERR_SEPARATOR}\n"));
-        output.push_str(&resolve_locations(&String::from_utf8_lossy(&err), dir));
+        output.push_str(&resolve_locations(
+            &String::from_utf8_lossy(&execution.stderr),
+            dir,
+        ));
     }
-    if out.len() >= OUTPUT_LIMIT || err.len() >= OUTPUT_LIMIT {
-        output.push_str("\n[Output limit reached: retained at most 2 MiB per stream.]\n");
+    if execution.truncated() {
+        output.push_str(TRUNCATED);
     }
-    let status = match result {
+    let status = match execution.exit {
         Err(reason) => reason,
-        Ok((exit, _, _)) => {
+        Ok(exit) => {
             if !exit.success() {
                 format!("FAILED ({exit})")
             } else if selected.is_none() {
@@ -576,12 +315,6 @@ fn parse_output(bytes: &[u8], target: Option<&str>, dir: &Path) -> ParsedOutput 
     parsed
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SourceLocation {
-    path: PathBuf,
-    line: usize,
-    message: String,
-}
 // The path may follow tab-separated labels, as in testify's `Error Trace:`.
 static LOCATION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?:[^\t]*\t)*?\s*([^\t]*?\.go):([0-9]+)(?::[0-9]+)?(?::|\s|$)(.*)").unwrap()
@@ -624,18 +357,8 @@ fn resolve_locations(output: &str, dir: &Path) -> String {
     result
 }
 
-/// From the output buffer, jump to the source location or test on the cursor
-/// line. Elsewhere, or on a line without either, pick from all reported
-/// locations and failed tests.
-pub(super) fn show_locations(cx: &mut compositor::Context) {
-    let Some(id) = cx
-        .editor
-        .go_test_doc_id
-        .filter(|id| cx.editor.documents.contains_key(id))
-    else {
-        cx.editor.set_error("No retained Go test output");
-        return;
-    };
+/// The Go reading of [`super::show_locations`].
+pub(super) fn show_locations(cx: &mut compositor::Context, id: DocumentId) {
     let lines: Vec<String> = cx.editor.documents[&id]
         .text()
         .lines()
@@ -754,83 +477,6 @@ fn test_on_line(lines: &[String], line: usize) -> Option<&str> {
         .rev()
         .take_while(|line| *line != STDERR_SEPARATOR)
         .find_map(|line| Some(TEST_NAME.captures(line)?.get(1)?.as_str()))
-}
-
-fn pick_location(cx: &mut compositor::Context, locations: Vec<SourceLocation>) {
-    cx.jobs.callback(async move {
-        Ok(Callback::EditorCompositor(Box::new(
-            move |_, compositor| {
-                let picker = Picker::new(
-                    [
-                        PickerColumn::new("file", |l: &SourceLocation, _| {
-                            l.path.to_string_lossy().into_owned().into()
-                        }),
-                        PickerColumn::new("line", |l: &SourceLocation, _| {
-                            (l.line + 1).to_string().into()
-                        }),
-                        PickerColumn::new("message", |l: &SourceLocation, _| {
-                            l.message.as_str().into()
-                        }),
-                    ],
-                    2,
-                    locations,
-                    (),
-                    |cx, location, action| jump_to_location(cx.editor, location, action),
-                )
-                .with_preview(|_, location| {
-                    Some((
-                        location.path.as_path().into(),
-                        Some((location.line, location.line)),
-                    ))
-                });
-                compositor.push(Box::new(overlaid(picker)));
-            },
-        )))
-    });
-}
-
-fn jump_to_location(editor: &mut Editor, location: &SourceLocation, action: Action) {
-    if !location.path.is_file() {
-        editor.set_error("Reported source file no longer exists");
-        return;
-    }
-    // Keep the output on screen: open sources in the split beside it.
-    if matches!(action, Action::Replace) && Some(view!(editor).doc) == editor.go_test_doc_id {
-        if let Some(view) = source_view(editor) {
-            editor.focus(view);
-        }
-    }
-    let id = match editor.open(&location.path, action) {
-        Ok(id) => id,
-        Err(err) => {
-            editor.set_error(err.to_string());
-            return;
-        }
-    };
-    let view = view_mut!(editor);
-    let doc = doc_mut!(editor, &id);
-    if location.line >= doc.text().len_lines() {
-        editor.set_error("Reported line no longer exists; save and rerun the test");
-        return;
-    }
-    doc.set_selection(
-        view.id,
-        Selection::point(doc.text().line_to_char(location.line)),
-    );
-    if action.align_view(view, id) {
-        super::align_view(doc, view, super::Align::Center);
-    }
-}
-
-/// The most recently focused split that is not showing the test output.
-fn source_view(editor: &Editor) -> Option<helix_view::ViewId> {
-    editor
-        .tree
-        .views()
-        .map(|(view, _)| view)
-        .filter(|view| Some(view.doc) != editor.go_test_doc_id)
-        .max_by_key(|view| editor.documents[&view.doc].focused_at)
-        .map(|view| view.id)
 }
 
 #[cfg(test)]
@@ -996,14 +642,6 @@ mod tests {
         assert_eq!(owner("Test:"), Some("TestSuite/TestCreate/empty_key"));
         assert_eq!(owner("FAIL\texample.com"), None);
         assert_eq!(owner("# example.com"), None);
-    }
-
-    #[tokio::test]
-    async fn capture_drains_but_bounds_output() {
-        let data = vec![b'x'; OUTPUT_LIMIT + 123];
-        let mut saved = Vec::new();
-        assert!(capture(data.as_slice(), &mut saved).await.unwrap());
-        assert_eq!(saved.len(), OUTPUT_LIMIT);
     }
 
     #[tokio::test]
@@ -1255,8 +893,10 @@ func TestExternal(t *testing.T) {
 
 #[cfg(all(test, feature = "integration"))]
 mod editor_tests {
+    use super::super::{focus_results, replace_output, result_buffer};
     use super::*;
     use crate::{application::Application, args::Args, config::Config};
+    use helix_core::{Selection, Transaction};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn saved_buffers_retained_hidden_results_and_navigation() {
@@ -1280,7 +920,7 @@ mod editor_tests {
         let origin = view!(editor).id;
         let source = doc!(editor).id();
         assert!(check_saved(editor, fixture.path()).is_ok());
-        let id = result_buffer(editor);
+        let id = result_buffer(editor, BUFFER_NAME);
         replace_output(editor, id, "RUNNING\n".into());
         assert!(!editor.documents[&id].is_modified());
         assert!(editor.documents[&id].readonly);
@@ -1326,7 +966,7 @@ mod editor_tests {
         doc.apply(&transaction, view.id);
         assert!(check_saved(editor, fixture.path()).is_err());
         // Reusing a result buffer clears old failure text before a new run.
-        assert_eq!(result_buffer(editor), id);
+        assert_eq!(result_buffer(editor, BUFFER_NAME), id);
         replace_output(editor, id, "RUNNING NEXT TEST\n".into());
         assert!(!editor.documents[&id]
             .text()
@@ -1410,13 +1050,13 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
 
     async fn finished_output(app: &mut Application) -> String {
         tokio::time::timeout(Duration::from_secs(30), async {
-            while app.editor.go_test_cancel.is_some() {
+            while app.editor.test_cancel.is_some() {
                 keys(app, "").await;
             }
         })
         .await
         .unwrap();
-        let id = app.editor.go_test_doc_id.unwrap();
+        let id = app.editor.test_doc_id.unwrap();
         app.editor.documents[&id].text().to_string()
     }
 
@@ -1431,7 +1071,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             .unwrap()
             .0
             .contains("Open a saved Go file"));
-        assert!(app.editor.go_test_doc_id.is_none());
+        assert!(app.editor.test_doc_id.is_none());
         app.editor
             .open(&fixture.path().join("nested/sample.go"), Action::Replace)
             .unwrap();
@@ -1442,8 +1082,8 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             .unwrap()
             .0
             .contains("Save modified files"));
-        assert!(app.editor.go_test_doc_id.is_none());
-        assert!(app.editor.go_test_last_run.is_none());
+        assert!(app.editor.test_doc_id.is_none());
+        assert!(app.editor.test_last_run.is_none());
         assert!(app.close().await.is_empty());
     }
 
@@ -1479,7 +1119,9 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
                 assert!(output.contains(expected), "{output}");
             }
             assert!(!output.contains("WRONG"), "{output}");
-            let target = app.editor.go_test_last_run.as_ref().unwrap();
+            let Some(TestRun::Go(target)) = app.editor.test_last_run.as_ref() else {
+                panic!("no Go run recorded");
+            };
             assert_eq!(target.directory, dir);
             assert!(target.run_pattern.is_none());
             assert_eq!(doc!(app.editor).path(), Some(&file));
@@ -1495,13 +1137,13 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         let dir = path.parent().unwrap();
         let mut app = test_app(&path);
         keys(&mut app, ":go-test-last<ret>").await;
-        assert!(app.editor.go_test_doc_id.is_none());
+        assert!(app.editor.test_doc_id.is_none());
         assert!(app
             .editor
             .get_status()
             .unwrap()
             .0
-            .contains("No Go test has been started"));
+            .contains("No test has been started"));
         keys(&mut app, "<space>tt").await;
         // The parent is first, followed by the chosen literal subtest.
         keys(&mut app, "<down><ret>").await;
@@ -1549,7 +1191,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         keys(&mut app, "<space>tr:go-test-last<ret>").await;
         assert!(finished_output(&mut app).await.contains("PASSED"));
         assert_eq!(std::fs::read_to_string(dir.join("runs")).unwrap(), "xxx");
-        let result = app.editor.go_test_doc_id.unwrap();
+        let result = app.editor.test_doc_id.unwrap();
         assert!(app.editor.close_document(result, true).is_ok());
         keys(&mut app, "<space>tl").await;
         assert!(finished_output(&mut app).await.contains("PASSED"));
@@ -1577,7 +1219,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         let sibling = fixture.path().join("sibling/other_test.go");
         let dirty = app.editor.open(&sibling, Action::Replace).unwrap();
         keys(&mut app, "3Gi// unsaved<esc><space>tn").await;
-        assert!(app.editor.go_test_cancel.is_none());
+        assert!(app.editor.test_cancel.is_none());
         assert!(app
             .editor
             .get_status()
@@ -1590,7 +1232,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         std::fs::write(&outside_file, "package outside\n").unwrap();
         app.editor.open(&outside_file, Action::Replace).unwrap();
         keys(&mut app, "<space>tl").await;
-        assert!(app.editor.go_test_cancel.is_none());
+        assert!(app.editor.test_cancel.is_none());
         assert!(app
             .editor
             .get_status()
@@ -1672,7 +1314,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         .unwrap();
         let mut app = Application::new(args, config, syntax).unwrap();
         keys(&mut app, ":go-test-nearest<ret>").await;
-        assert!(app.editor.go_test_doc_id.is_none());
+        assert!(app.editor.test_doc_id.is_none());
         assert!(app
             .editor
             .get_status()
@@ -1698,9 +1340,9 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             let position = doc.text().byte_to_char(source.find(needle).unwrap());
             doc.set_selection(view.id, Selection::point(position));
             keys(&mut app, command).await;
-            let result_id = app.editor.go_test_doc_id.unwrap();
+            let result_id = app.editor.test_doc_id.unwrap();
             tokio::time::timeout(Duration::from_secs(30), async {
-                while app.editor.go_test_cancel.is_some() {
+                while app.editor.test_cancel.is_some() {
                     keys(&mut app, "").await;
                 }
             })
@@ -1737,7 +1379,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             assert!(!repeated.contains("UNSELECTED TEST"), "{repeated}");
         }
         keys(&mut app, "i// unsaved<esc><space>tn").await;
-        assert!(app.editor.go_test_cancel.is_none());
+        assert!(app.editor.test_cancel.is_none());
         assert!(app
             .editor
             .get_status()
@@ -1774,15 +1416,15 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         keys(&mut app, ":go-test<ret>").await;
         keys(&mut app, "<ret>").await;
         assert_eq!(doc!(app.editor).id(), source);
-        let result_id = app.editor.go_test_doc_id.unwrap();
+        let result_id = app.editor.test_doc_id.unwrap();
         tokio::time::timeout(Duration::from_secs(30), async {
-            while app.editor.go_test_cancel.is_some() {
+            while app.editor.test_cancel.is_some() {
                 keys(&mut app, "").await;
             }
         })
         .await
         .unwrap();
-        assert!(app.editor.go_test_cancel.is_none());
+        assert!(app.editor.test_cancel.is_none());
         assert!(app.editor.documents[&result_id]
             .text()
             .to_string()
@@ -1805,7 +1447,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             3
         );
         keys(&mut app, "i// unsaved<esc><space>tt").await;
-        assert!(app.editor.go_test_cancel.is_none());
+        assert!(app.editor.test_cancel.is_none());
         assert!(app
             .editor
             .get_status()
@@ -1818,7 +1460,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
     /// Put the cursor on the first output line containing `needle` and run
     /// Space t f, as a user reading the results would.
     async fn follow(app: &mut Application, needle: &str) {
-        let id = app.editor.go_test_doc_id.unwrap();
+        let id = app.editor.test_doc_id.unwrap();
         focus_results(&mut app.editor, id);
         let (view, doc) = current!(app.editor);
         let line = doc
@@ -1866,7 +1508,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
         .unwrap();
         let mut app = test_app(&path);
         let source_view = view!(app.editor).id;
-        let id = result_buffer(&mut app.editor);
+        let id = result_buffer(&mut app.editor, BUFFER_NAME);
         replace_output(
             &mut app.editor,
             id,

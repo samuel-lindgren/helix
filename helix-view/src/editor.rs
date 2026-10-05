@@ -1208,6 +1208,27 @@ pub struct GoTestRun {
     pub selection_note: Option<String>,
 }
 
+/// What the test runner was asked to run, in the terms of the language's own tool.
+#[derive(Debug, Clone)]
+pub enum TestRun {
+    Go(GoTestRun),
+}
+
+impl TestRun {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Go(run) => &run.name,
+        }
+    }
+
+    /// Modified buffers below this directory have to be saved before the run.
+    pub fn workspace(&self) -> &Path {
+        match self {
+            Self::Go(run) => &run.workspace,
+        }
+    }
+}
+
 use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
@@ -1241,12 +1262,12 @@ pub struct Editor {
     /// working-tree diff. Toggled at runtime via `toggle_branch_diff`.
     pub branch_diff_enabled: bool,
 
-    /// Retained output of the most recent plain Go test run.
-    pub go_test_doc_id: Option<DocumentId>,
+    /// Retained output of the most recent plain test run.
+    pub test_doc_id: Option<DocumentId>,
     /// Present until the running test job has finished, including cancellation.
-    pub go_test_cancel: Option<watch::Sender<bool>>,
-    /// Latest selection for which the Go process started, even if it failed.
-    pub go_test_last_run: Option<GoTestRun>,
+    pub test_cancel: Option<watch::Sender<bool>>,
+    /// Latest selection for which the test process started, even if it failed.
+    pub test_last_run: Option<TestRun>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1411,9 +1432,9 @@ impl Editor {
             branch_diff_enabled: false,
             review: crate::review::State::default(),
             git: crate::git::State::default(),
-            go_test_doc_id: None,
-            go_test_cancel: None,
-            go_test_last_run: None,
+            test_doc_id: None,
+            test_cancel: None,
+            test_last_run: None,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             last_debug_launch: None,
@@ -1977,7 +1998,7 @@ impl Editor {
                     // If the buffer has no path and is not modified, it is an empty scratch buffer.
                     && doc.path().is_none()
                     // Keep test output available after navigating back to source.
-                    && self.go_test_doc_id != Some(doc.id())
+                    && self.test_doc_id != Some(doc.id())
                     // If the buffer we are changing to is not this buffer
                     && id != doc.id
                     // Ensure the buffer is not displayed in any other splits.
