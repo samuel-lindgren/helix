@@ -131,7 +131,7 @@
 | `exit_select_mode` | Exit selection mode | select: `` <esc> `` |
 | `goto_definition` | Goto definition | normal: `` gd ``, select: `` gd `` |
 | `goto_declaration` | Goto declaration | normal: `` gD ``, select: `` gD `` |
-| `goto_corresponding_test` | Goto corresponding Go test | normal: `` gT ``, select: `` gT `` |
+| `goto_corresponding_test` | Goto corresponding test | normal: `` gT ``, select: `` gT `` |
 | `add_newline_above` | Add newline above | normal: `` [<space> ``, select: `` [<space> `` |
 | `add_newline_below` | Add newline below | normal: `` ]<space> ``, select: `` ]<space> `` |
 | `goto_type_definition` | Goto type definition | normal: `` gy ``, select: `` gy `` |

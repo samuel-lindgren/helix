@@ -1250,12 +1250,102 @@ pub fn goto_implementation(cx: &mut Context) {
     );
 }
 
+/// The tests of the C# type or member that the cursor is on or in. On a use
+/// of it, a language server says where it is declared; without one, the
+/// declaration around the cursor is what counts.
+fn goto_corresponding_dotnet_test(cx: &mut Context) {
+    let (view, doc) = current_ref!(cx.editor);
+    let Some(path) = doc.path().cloned() else {
+        cx.editor
+            .set_error("Go to corresponding test requires a file-backed buffer");
+        return;
+    };
+    let text = doc.text().to_string();
+    let cursor = doc.text().char_to_byte(
+        doc.selection(view.id)
+            .primary()
+            .cursor(doc.text().slice(..)),
+    );
+    let definition = doc
+        .language_servers_with_feature(LanguageServerFeature::GotoDefinition)
+        .find_map(|language_server| {
+            let offset_encoding = language_server.offset_encoding();
+            let position = doc.position(view.id, offset_encoding);
+            let request = language_server.goto_definition(doc.identifier(), position, None)?;
+            Some((request, offset_encoding))
+        });
+
+    cx.jobs.callback(async move {
+        let declared = match definition {
+            Some((request, offset_encoding)) => match request.await {
+                Ok(Some(lsp::GotoDefinitionResponse::Scalar(location))) => Some(location),
+                Ok(Some(lsp::GotoDefinitionResponse::Array(locations))) => {
+                    locations.into_iter().next()
+                }
+                Ok(Some(lsp::GotoDefinitionResponse::Link(links))) => links
+                    .into_iter()
+                    .next()
+                    .map(|link| lsp::Location::new(link.target_uri, link.target_selection_range)),
+                Ok(None) | Err(_) => None,
+            }
+            .map(|location| (location, offset_encoding)),
+            None => None,
+        };
+        // Sources of the whole workspace are read: not on the editor's thread.
+        let found = tokio::task::spawn_blocking(move || {
+            // A declaration without a source file, as in a referenced
+            // assembly, has no tests to go to.
+            let declaration = declared.and_then(|(location, offset_encoding)| {
+                let file = location.uri.to_file_path().ok()?;
+                let source = if file == path {
+                    text.clone()
+                } else {
+                    fs::read_to_string(&file).ok()?
+                };
+                let rope = Rope::from(source.as_str());
+                let range = lsp_range_to_range(&rope, location.range, offset_encoding)?;
+                let byte = rope.char_to_byte(range.from());
+                Some((file, source, byte))
+            });
+            let (file, source, byte) = declaration.unwrap_or((path, text, cursor));
+            super::test::dotnet::corresponding_tests(&file, &source, byte)
+        })
+        .await?;
+
+        let call = move |editor: &mut Editor, compositor: &mut Compositor| match found {
+            Err(err) => editor.set_error(err.to_string()),
+            Ok((subject, tests)) if tests.is_empty() => {
+                editor.set_error(format!("No corresponding test found for {subject}."))
+            }
+            Ok((_, tests)) => {
+                let locations = tests
+                    .into_iter()
+                    .map(|test| {
+                        let line = lsp::Position::new(test.line as u32, 0);
+                        Location {
+                            uri: test.file.into(),
+                            range: lsp::Range::new(line, line),
+                            offset_encoding: OffsetEncoding::default(),
+                        }
+                    })
+                    .collect();
+                goto_impl(editor, compositor, locations);
+            }
+        };
+        Ok(Callback::EditorCompositor(Box::new(call)))
+    });
+}
+
 pub fn goto_corresponding_test(cx: &mut Context) {
     let (view, doc) = current_ref!(cx.editor);
 
+    if doc.language_name() == Some("c-sharp") {
+        goto_corresponding_dotnet_test(cx);
+        return;
+    }
     if doc.language_id() != Some("go") {
         cx.editor
-            .set_error("Go to corresponding test is only available for Go files");
+            .set_error("Go to corresponding test is only available for Go and C# files");
         return;
     }
 

@@ -227,7 +227,7 @@ Jumps to various locations.
 | `c`   | Go to the middle of the screen                   | `goto_window_center`       |
 | `b`   | Go to the bottom of the screen                   | `goto_window_bottom`       |
 | `d`   | Go to definition (**LSP**)                       | `goto_definition`          |
-| `T`   | Go to corresponding Go test                      | `goto_corresponding_test`  |
+| `T`   | Go to corresponding test (Go, C#)                | `goto_corresponding_test`  |
 | `y`   | Go to type definition (**LSP**)                  | `goto_type_definition`     |
 | `r`   | Go to references (**LSP**)                       | `goto_reference`           |
 | `i`   | Go to implementation (**LSP**)                   | `goto_implementation`      |
@@ -473,6 +473,18 @@ quick. A cancelled run is stopped with everything it started.
 
 Projects that run on Microsoft.Testing.Platform instead of VSTest take other
 arguments and are not supported.
+
+`g T` goes the other way round, from code to its tests: from a type, or from a
+method or property of it, to the tests written for it. On a use of the type or
+member, the language server says where it is declared; without one, the
+declaration around the cursor counts. Only names tie tests to code: the tests
+of `Calc` are looked for in classes named `CalcTests`, `CalcTest`,
+`CalcUnitTests`, `CalcIntegrationTests`, `CalcSpecs`, `CalcFacts`,
+`CalcShould`, `CalcFixture` or `TestCalc`, in every project below the
+workspace, and the tests of its `Add` are the methods of those classes with
+`Add` at the start of a word in their names (`Add_ReturnsSum`, `AddsNegatives`,
+`ShouldAddNumbers`). When no test names the member, the test classes open
+instead. Several matches are listed in a picker.
 
 To run .NET tests under the debugger, launch a debug target (`Space G l`) in a
 C# file and choose the template `test-func`, which lists the tests of the
