@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use helix_core::{Selection, Transaction};
+use helix_core::{syntax::config::DebugAdapterConfig, Selection, Transaction};
 use helix_view::{
     editor::{Action, TestRun},
     DocumentId, Editor,
@@ -31,6 +31,8 @@ pub(crate) mod go;
 
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024; // per stream; keep draining after the cap
 const TRUNCATED: &str = "\n[Output limit reached: retained at most 2 MiB per stream.]\n";
+/// The status of a run that was stopped on request.
+const CANCELLED: &str = "CANCELLED";
 
 fn compositor_context<'a>(cx: &'a mut Context) -> compositor::Context<'a> {
     compositor::Context {
@@ -117,7 +119,7 @@ const UNSUPPORTED: &str = "Open a saved Go or C# file to run its tests";
 pub(super) fn pick(cx: &mut compositor::Context) {
     match language(cx.editor) {
         Some(Language::Go) => go::pick(cx),
-        Some(Language::Dotnet) => dotnet::pick(cx),
+        Some(Language::Dotnet) => dotnet::pick(cx, None),
         None => cx.editor.set_error(UNSUPPORTED),
     }
 }
@@ -125,9 +127,32 @@ pub(super) fn pick(cx: &mut compositor::Context) {
 pub(super) fn package(cx: &mut compositor::Context) {
     match language(cx.editor) {
         Some(Language::Go) => go::package(cx),
-        Some(Language::Dotnet) => dotnet::package(cx),
+        Some(Language::Dotnet) => dotnet::package(cx, None),
         None => cx.editor.set_error(UNSUPPORTED),
     }
+}
+
+/// The debug adapter, and the template of it, that attach to the process of
+/// a test run.
+#[derive(Clone)]
+pub(super) struct Debugger {
+    pub config: DebugAdapterConfig,
+    pub template: String,
+}
+
+/// A .NET test of the focused file's project under the debugger: the whole
+/// project, or what is chosen from its tests.
+pub(super) fn debug_dotnet(cx: &mut compositor::Context, project: bool, debugger: Debugger) {
+    if project {
+        dotnet::package(cx, Some(debugger));
+    } else {
+        dotnet::pick(cx, Some(debugger));
+    }
+}
+
+/// Runs the test again under the debugger it was debugged with.
+pub(super) fn debug(cx: &mut compositor::Context, target: TestRun, debugger: Debugger) {
+    start(cx, target, Some(debugger));
 }
 
 pub(super) fn nearest(cx: &mut compositor::Context) {
@@ -216,6 +241,12 @@ struct RunResult {
 }
 
 fn start_run(cx: &mut compositor::Context, target: TestRun) {
+    start(cx, target, None);
+}
+
+/// With a debugger, the run waits for it in the process that runs the tests
+/// and goes on once it has attached.
+fn start(cx: &mut compositor::Context, target: TestRun, debugger: Option<Debugger>) {
     // Pickers can be reopened with last_picker; recheck at the point of launch.
     if let Err(err) =
         check_idle(cx.editor).and_then(|()| check_workspace_saved(cx.editor, target.workspace()))
@@ -223,27 +254,44 @@ fn start_run(cx: &mut compositor::Context, target: TestRun) {
         cx.editor.set_error(err.to_string());
         return;
     }
+    if debugger.is_some() && !cx.editor.debug_adapters.is_empty() {
+        cx.editor.set_error("Debugger is already running");
+        return;
+    }
     let origin = view!(cx.editor).id;
     let (buffer_name, header) = match &target {
         TestRun::Go(run) => (go::BUFFER_NAME, go::header(run)),
-        TestRun::Dotnet(run) => (dotnet::BUFFER_NAME, dotnet::header(run)),
+        TestRun::Dotnet(run) => (dotnet::BUFFER_NAME, dotnet::header(run, debugger.is_some())),
     };
     let id = result_buffer(cx.editor, buffer_name);
     replace_output(cx.editor, id, format!("{header}RUNNING\n"));
     cx.editor.focus(origin);
     let (cancel, rx) = watch::channel(false);
     cx.editor.test_cancel = Some(cancel);
-    cx.editor.set_status(format!("Running {}…", target.name()));
+    cx.editor.test_cancel_reason = None;
+    cx.editor.set_status(match debugger {
+        Some(_) => format!("Starting {} for the debugger…", target.name()),
+        None => format!("Running {}…", target.name()),
+    });
     cx.jobs.callback(async move {
         let result = match &target {
             TestRun::Go(run) => go::run(Path::new("go"), run, rx, go::RUN_TIMEOUT).await,
             TestRun::Dotnet(run) => {
-                dotnet::run(Path::new("dotnet"), run, rx, dotnet::RUN_TIMEOUT).await
+                let attach = debugger.map(|debugger| attach(debugger, target.clone()));
+                // Time at a breakpoint is not time the tests take.
+                let deadline = match attach {
+                    Some(_) => DEBUG_TIMEOUT,
+                    None => dotnet::RUN_TIMEOUT,
+                };
+                dotnet::run(Path::new("dotnet"), run, rx, deadline, attach).await
             }
         };
-        let output = format!("{header}{}\n\n{}", result.status, result.output);
         Ok(Callback::Editor(Box::new(move |editor| {
             editor.test_cancel = None;
+            let status = match editor.test_cancel_reason.take() {
+                Some(reason) if result.status == CANCELLED => format!("{CANCELLED}: {reason}"),
+                _ => result.status,
+            };
             // A cancelled picker, unsaved-file guard, or failed process spawn
             // must not overwrite a previous runnable selection.
             if result.started {
@@ -251,17 +299,45 @@ fn start_run(cx: &mut compositor::Context, target: TestRun) {
             }
             // Closing the buffer explicitly discards it. Do not steal focus or
             // resurrect it when the process finishes.
-            replace_output(editor, id, output);
+            replace_output(editor, id, format!("{header}{status}\n\n{}", result.output));
             if result.success {
-                editor.set_status(format!("{} (Space t r for output)", result.status));
+                editor.set_status(format!("{status} (Space t r for output)"));
             } else {
                 editor.set_error(format!(
-                    "{} (Space t r: output, Space t f: locations)",
-                    result.status
+                    "{status} (Space t r: output, Space t f: locations)"
                 ));
             }
         })))
     });
+}
+
+/// Given the id of a process that waits for a debugger.
+type Attach = Box<dyn FnMut(u32) + Send>;
+
+const DEBUG_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Starts the debugger on a process of the run, from the task that reads the
+/// run's output. When no debugger can be started, the run is cancelled: its
+/// process would wait for one for good.
+fn attach(debugger: Debugger, target: TestRun) -> Attach {
+    Box::new(move |pid| {
+        let (debugger, target) = (debugger.clone(), target.clone());
+        tokio::spawn(crate::job::dispatch(move |editor, _| {
+            let attached = super::dap::attach_to_test(
+                editor,
+                debugger.config,
+                &debugger.template,
+                pid,
+                target,
+            );
+            if let Err(err) = attached {
+                if let Some(cancel) = &editor.test_cancel {
+                    let _ = cancel.send(true);
+                    editor.test_cancel_reason = Some(format!("no debugger to attach ({err})"));
+                }
+            }
+        }));
+    })
 }
 
 /// The buffer with the output of the latest run, unless it has been closed.
@@ -349,7 +425,12 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn capture(mut reader: impl AsyncRead + Unpin, bytes: &mut Vec<u8>) -> std::io::Result<bool> {
+/// `seen` is shown each piece of the stream as it arrives, kept or not.
+async fn capture(
+    mut reader: impl AsyncRead + Unpin,
+    bytes: &mut Vec<u8>,
+    mut seen: impl FnMut(&[u8]),
+) -> std::io::Result<bool> {
     let mut truncated = false;
     let mut chunk = [0; 8192];
     loop {
@@ -360,6 +441,7 @@ async fn capture(mut reader: impl AsyncRead + Unpin, bytes: &mut Vec<u8>) -> std
         let keep = len.min(OUTPUT_LIMIT - bytes.len());
         bytes.extend_from_slice(&chunk[..keep]);
         truncated |= keep < len;
+        seen(&chunk[..len]);
     }
 }
 
@@ -399,13 +481,14 @@ fn merged_output(command: &mut Command) -> std::io::Result<tokio::fs::File> {
 
 /// Runs the command to its end, to cancellation or to the deadline, whichever
 /// comes first, and stops its whole process group. Fails only when the process
-/// cannot be started.
+/// cannot be started. `seen` follows the standard output as it arrives.
 async fn execute(
     mut command: Command,
     mut cancel: watch::Receiver<bool>,
     deadline: Duration,
     streams: Streams,
     leftovers: Leftovers,
+    seen: impl FnMut(&[u8]),
 ) -> std::io::Result<Execution> {
     command
         .stdin(Stdio::null())
@@ -427,16 +510,18 @@ async fn execute(
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let output = async {
         match (merged, stdout, stderr) {
-            (Some(merged), ..) => capture(merged, &mut out).await.map(|_| ()),
-            (None, Some(stdout), Some(stderr)) => {
-                tokio::try_join!(capture(stdout, &mut out), capture(stderr, &mut err)).map(|_| ())
-            }
+            (Some(merged), ..) => capture(merged, &mut out, seen).await.map(|_| ()),
+            (None, Some(stdout), Some(stderr)) => tokio::try_join!(
+                capture(stdout, &mut out, seen),
+                capture(stderr, &mut err, |_| {})
+            )
+            .map(|_| ()),
             _ => Ok(()),
         }
     };
     let exit = tokio::select! {
         biased;
-        _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err("CANCELLED".to_owned()),
+        _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err(CANCELLED.to_owned()),
         result = tokio::time::timeout(deadline, async {
             tokio::try_join!(child.wait(), output)
         }) => match result {
@@ -642,7 +727,14 @@ mod tests {
     async fn capture_drains_but_bounds_output() {
         let data = vec![b'x'; OUTPUT_LIMIT + 123];
         let mut saved = Vec::new();
-        assert!(capture(data.as_slice(), &mut saved).await.unwrap());
+        let mut shown = 0;
+        assert!(
+            capture(data.as_slice(), &mut saved, |piece| shown += piece.len())
+                .await
+                .unwrap()
+        );
         assert_eq!(saved.len(), OUTPUT_LIMIT);
+        // What is not kept is still shown.
+        assert_eq!(shown, data.len());
     }
 }

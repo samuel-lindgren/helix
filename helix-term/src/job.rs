@@ -27,6 +27,17 @@ pub async fn dispatch(job: impl FnOnce(&mut Editor, &mut Compositor) + Send + 's
         .await;
 }
 
+/// Runs a future to its callback like [`Jobs::callback`], from where the jobs
+/// are not at hand: inside a callback, which is given the editor alone.
+pub fn spawn_callback<F: Future<Output = anyhow::Result<Callback>> + Send + 'static>(f: F) {
+    tokio::spawn(async move {
+        match f.await {
+            Ok(callback) => dispatch_callback(callback).await,
+            Err(err) => helix_event::status::report(err).await,
+        }
+    });
+}
+
 pub fn dispatch_blocking(job: impl FnOnce(&mut Editor, &mut Compositor) + Send + 'static) {
     let jobs = JOB_QUEUE.wait();
     send_blocking(jobs, Callback::EditorCompositor(Box::new(job)))

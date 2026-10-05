@@ -1194,6 +1194,9 @@ pub struct LastDebugLaunch {
     pub request_type: String,
     pub socket: Option<SocketAddr>,
     pub args: serde_json::Value,
+    /// The test run whose process the debugger attached to. That process is
+    /// gone afterwards: launching again means running the test again.
+    pub test: Option<TestRun>,
 }
 
 /// A Go test selection admitted to the runner. Kept only for this editor session.
@@ -1282,6 +1285,8 @@ pub struct Editor {
     pub test_doc_id: Option<DocumentId>,
     /// Present until the running test job has finished, including cancellation.
     pub test_cancel: Option<watch::Sender<bool>>,
+    /// Why the running test was cancelled, when the user did not ask for it.
+    pub test_cancel_reason: Option<String>,
     /// Latest selection for which the test process started, even if it failed.
     pub test_last_run: Option<TestRun>,
 
@@ -1450,6 +1455,7 @@ impl Editor {
             git: crate::git::State::default(),
             test_doc_id: None,
             test_cancel: None,
+            test_cancel_reason: None,
             test_last_run: None,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),

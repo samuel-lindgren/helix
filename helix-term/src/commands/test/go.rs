@@ -222,6 +222,7 @@ pub(super) async fn run(
         deadline,
         Streams::Separate,
         Leftovers::Killed,
+        |_| {},
     )
     .await
     {

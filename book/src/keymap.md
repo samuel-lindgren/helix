@@ -470,6 +470,27 @@ quick. A cancelled run is stopped with everything it started.
 Projects that run on Microsoft.Testing.Platform instead of VSTest take other
 arguments and are not supported.
 
+To run .NET tests under the debugger, launch a debug target (`Space G l`) in a
+C# file and choose the template `test-func`, which lists the tests of the
+project as `Space t t` does, or `test`, which takes the whole project. The run
+is the one described above with one difference: the test host waits for a
+debugger (`VSTEST_HOST_DEBUG`), and the language's debug adapter is attached to
+it as soon as it has started. Breakpoints in the tests and in the code they
+call are then hit. The results arrive in the `[dotnet-test]` buffer when the
+run is done, and a debugged run has no time limit.
+
+- `Space G R` (rerun last debug target) runs the same selection under the
+  debugger again. `Space t l` runs it without one.
+- Ending the debug session ends the test host, and the run fails with it.
+  `Space t c` cancels the run and the debug session with it.
+- If no debugger can be started, the run is cancelled rather than left waiting.
+
+Such a template has `request = "attach"`, the process id as its only argument
+(`args = { processId = "{0}" }`) and `completion = "dotnet-test-function"` or
+`"dotnet-test-project"` as its first parameter. xUnit v3 runs its tests in a
+process of their own that the test host starts; the debugger is attached to the
+host, so breakpoints in such tests are not hit.
+
 ##### Popup
 
 Displays documentation for item under cursor. Remapping currently not supported.

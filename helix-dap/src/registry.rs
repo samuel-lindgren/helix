@@ -70,6 +70,12 @@ impl Registry {
         self.inner.get_mut(id)
     }
 
+    /// Whether no client exists at all. One that is still starting is not
+    /// the active client yet.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn get_active_client(&self) -> Option<&Client> {
         self.current_client_id.and_then(|id| self.get_client(id))
     }
