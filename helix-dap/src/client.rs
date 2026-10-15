@@ -48,6 +48,26 @@ pub struct Client {
     pub config: Option<DebugAdapterConfig>,
 }
 
+/// A command that starts a debug adapter in a session of its own, without
+/// the editor's terminal. Adapters can hand their terminal to the program
+/// they debug: debugpy makes that program the terminal's foreground process
+/// group, and the editor stops receiving keys until it is killed.
+fn adapter_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(unix)]
+    // SAFETY: setsid is async-signal-safe, which is all `pre_exec` requires.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
 impl Client {
     // Spawn a process and communicate with it by either TCP or stdio
     // The returned stream includes the Client ID so consumers can differentiate between multiple clients
@@ -117,7 +137,7 @@ impl Client {
         // Resolve path to the binary
         let cmd = helix_stdx::env::which(cmd)?;
 
-        let process = Command::new(cmd)
+        let process = adapter_command(cmd)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -168,7 +188,7 @@ impl Client {
     ) -> Result<(Self, UnboundedReceiver<(DebugAdapterId, Payload)>)> {
         let port = Self::get_port().await.unwrap();
 
-        let process = Command::new(cmd)
+        let process = adapter_command(cmd)
             .args(args)
             .args(port_format.replace("{}", &port.to_string()).split(' '))
             // silence messages
@@ -554,5 +574,25 @@ impl Client {
         self.stack_frames
             .get(&self.thread_id?)?
             .get(self.active_frame?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn adapter_runs_in_its_own_session() {
+        let output = super::adapter_command("cat")
+            .arg("/proc/self/stat")
+            .output()
+            .await
+            .unwrap();
+        let stat = String::from_utf8(output.stdout).unwrap();
+        // "pid (comm) state ppid pgrp session ...": the command name can
+        // contain spaces, so the fields are counted after its parenthesis.
+        let (pid, rest) = stat.split_once(" (").unwrap();
+        let (_, fields) = rest.rsplit_once(") ").unwrap();
+        let session = fields.split(' ').nth(3).unwrap();
+        assert_eq!(session, pid);
     }
 }
