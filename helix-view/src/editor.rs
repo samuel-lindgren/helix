@@ -1797,26 +1797,39 @@ impl Editor {
             return Ok(());
         }
         let is_dir = old_path.is_dir();
-        let language_servers: Vec<_> = self
+        // An open document's references are updated by one of its own
+        // language servers, as in a symbol rename: the first that handles
+        // renames and wants to hear about the path. Two servers of the same
+        // document would both edit its imports, and the second edit would
+        // land on text the first one had already changed. Every other
+        // server is still asked, as files can refer to files of other
+        // languages.
+        let (renamers, attached): (Vec<_>, Vec<_>) = match self.document_by_path(old_path) {
+            Some(doc) => (
+                doc.language_servers_with_feature(LanguageServerFeature::RenameSymbol)
+                    .map(|ls| ls.id())
+                    .collect(),
+                doc.language_servers().map(|ls| ls.id()).collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        let renamers: Vec<_> = renamers
+            .into_iter()
+            .filter_map(|id| self.language_servers.get_by_id(id).cloned())
+            .collect();
+        let others: Vec<_> = self
             .language_servers
             .iter_clients()
-            .filter(|client| client.is_initialized())
+            .filter(|client| client.is_initialized() && !attached.contains(&client.id()))
             .cloned()
             .collect();
-        for language_server in language_servers {
-            let Some(request) = language_server.will_rename(old_path, &new_path, is_dir) else {
-                continue;
-            };
-            let edit = match helix_lsp::block_on(request) {
-                Ok(edit) => edit.unwrap_or_default(),
-                Err(err) => {
-                    log::error!("invalid willRename response: {err:?}");
-                    continue;
-                }
-            };
-            if let Err(err) = self.apply_workspace_edit(language_server.offset_encoding(), &edit) {
-                log::error!("failed to apply workspace edit: {err:?}")
+        for language_server in renamers {
+            if self.apply_will_rename(&language_server, old_path, &new_path, is_dir) {
+                break;
             }
+        }
+        for language_server in others {
+            self.apply_will_rename(&language_server, old_path, &new_path, is_dir);
         }
 
         if old_path.exists() {
@@ -1842,6 +1855,32 @@ impl Editor {
             .file_event_handler
             .file_changed(new_path);
         Ok(())
+    }
+
+    /// Asks a language server for the edits that a move of `old_path` needs,
+    /// and applies them. False when the server is not interested in the path
+    /// or its answer is invalid.
+    fn apply_will_rename(
+        &mut self,
+        language_server: &helix_lsp::Client,
+        old_path: &Path,
+        new_path: &Path,
+        is_dir: bool,
+    ) -> bool {
+        let Some(request) = language_server.will_rename(old_path, new_path, is_dir) else {
+            return false;
+        };
+        let edit = match helix_lsp::block_on(request) {
+            Ok(edit) => edit.unwrap_or_default(),
+            Err(err) => {
+                log::error!("invalid willRename response: {err:?}");
+                return false;
+            }
+        };
+        if let Err(err) = self.apply_workspace_edit(language_server.offset_encoding(), &edit) {
+            log::error!("failed to apply workspace edit: {err:?}")
+        }
+        true
     }
 
     pub fn set_doc_path(&mut self, doc_id: DocumentId, path: &Path) {
