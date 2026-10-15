@@ -8,6 +8,7 @@ use crate::events::{
 };
 use crate::{DocumentId, Editor};
 use helix_core::diagnostic::DiagnosticProvider;
+use helix_core::syntax::config::{LanguageConfiguration, LanguageServerFeature};
 use helix_core::Uri;
 use helix_event::register_hook;
 use helix_lsp::util::generate_transaction_from_edits;
@@ -298,6 +299,12 @@ impl Editor {
         version: Option<i32>,
         mut diagnostics: Vec<lsp::Diagnostic>,
     ) {
+        // A document already leaves these out, but the diagnostics pickers
+        // and the statusline read every stored diagnostic.
+        if self.diagnostics_excluded(provider, &uri) {
+            diagnostics.clear();
+        }
+
         let doc = self
             .documents
             .values_mut()
@@ -376,6 +383,37 @@ impl Editor {
 
             let doc = doc.id();
             helix_event::dispatch(DiagnosticsDidChange { editor: self, doc });
+        }
+    }
+
+    /// Whether the language of the file at `uri` lists the language server
+    /// behind `provider` without the diagnostics feature, with
+    /// `only-features` or `except-features`.
+    fn diagnostics_excluded(&self, provider: &DiagnosticProvider, uri: &Uri) -> bool {
+        let Some(language_server) = provider
+            .language_server_id()
+            .and_then(|id| self.language_servers.get_by_id(id))
+        else {
+            return false;
+        };
+        let excluded = |config: &LanguageConfiguration| {
+            config.language_servers.iter().any(|features| {
+                features.name == language_server.name()
+                    && !features.has_feature(LanguageServerFeature::Diagnostics)
+            })
+        };
+        match self
+            .documents
+            .values()
+            .find(|doc| doc.uri().is_some_and(|u| u == *uri))
+        {
+            Some(doc) => doc.language_config().is_some_and(excluded),
+            None => uri.as_path().is_some_and(|path| {
+                let loader = self.syn_loader.load();
+                loader
+                    .language_for_filename(path)
+                    .is_some_and(|language| excluded(loader.language(language).config()))
+            }),
         }
     }
 
