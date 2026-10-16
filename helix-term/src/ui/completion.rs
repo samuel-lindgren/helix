@@ -188,7 +188,6 @@ impl Completion {
                                 view.id,
                                 &item.item,
                                 language_server!(item).offset_encoding(),
-                                trigger_offset,
                                 replace_mode,
                             );
                             doc.apply_temporary(&transaction, view.id)
@@ -234,7 +233,6 @@ impl Completion {
                                 view.id,
                                 &item.item,
                                 encoding,
-                                trigger_offset,
                                 replace_mode,
                             );
                             let add_edits = item.item.additional_text_edits;
@@ -584,7 +582,6 @@ fn lsp_item_to_transaction(
     view_id: ViewId,
     item: &lsp::CompletionItem,
     offset_encoding: OffsetEncoding,
-    trigger_offset: usize,
     replace_mode: bool,
 ) -> (Transaction, Option<RenderedSnippet>) {
     let selection = doc.selection(view_id);
@@ -617,12 +614,9 @@ fn lsp_item_to_transaction(
             .insert_text
             .clone()
             .unwrap_or_else(|| item.label.clone());
-        // If the document changed since the completion was triggered the
-        // cursor may no longer match the trigger offset.  Bail out rather
-        // than applying a transaction against the wrong text.
-        if primary_cursor != trigger_offset {
-            return (Transaction::new(doc.text()), None);
-        }
+        // The cursor is past the trigger offset when the user kept typing
+        // while the request was in flight. That is fine: without an edit
+        // range the word under the cursor is replaced.
         (None, new_text)
     };
 
