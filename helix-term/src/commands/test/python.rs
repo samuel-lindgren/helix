@@ -22,7 +22,7 @@ use tokio::{
 
 use super::{
     check_idle, check_workspace_saved, execute, follow_launched, jump_to_location, pick_location,
-    start, start_in, Debugger, Execution, Leftovers, RunResult, SourceLocation, Spawned, Streams,
+    start, start_in, Debugger, Execution, Leftovers, RunResult, SourceLocation, Started, Streams,
     TRUNCATED,
 };
 use crate::{
@@ -459,11 +459,11 @@ pub(super) fn debug_args(target: &PythonTestRun, args: &mut serde_json::Map<Stri
     args.remove("program");
     args.insert("module".into(), module(target.runner).into());
     args.insert("args".into(), json!(target.args));
-    args.insert("cwd".into(), json!(target.root));
+    args.insert("cwd".into(), json!(target.root.to_string_lossy()));
     args.insert("console".into(), "integratedTerminal".into());
     args.insert("redirectOutput".into(), false.into());
     args.entry("python")
-        .or_insert_with(|| json!(interpreter(&target.directory)));
+        .or_insert_with(|| json!(interpreter(&target.directory).to_string_lossy()));
     let env = args
         .entry("env")
         .or_insert_with(|| json!({}))
@@ -473,13 +473,17 @@ pub(super) fn debug_args(target: &PythonTestRun, args: &mut serde_json::Map<Stri
         if let Some(path) = python_path(target) {
             env.insert("PYTHONPATH".into(), json!(path.to_string_lossy()));
         }
+        // The results are read from plain text: without the editor's colours.
+        for colours in ["FORCE_COLOR", "PY_COLORS", "PYTHON_COLORS"] {
+            env.insert(colours.into(), Value::Null);
+        }
     }
 }
 
 /// A run under the debugger, whose adapter starts the program.
 pub(super) async fn run_launched(
     target: &PythonTestRun,
-    started: oneshot::Receiver<Spawned>,
+    started: oneshot::Receiver<Started>,
     cancel: watch::Receiver<bool>,
     deadline: Duration,
 ) -> RunResult {
@@ -1956,6 +1960,7 @@ class TestCalc:
         assert_eq!(args["justMyCode"], false);
         assert_eq!(args["env"]["DEBUG"], "1");
         assert_eq!(args["env"]["PYTHONUNBUFFERED"], "1");
+        assert_eq!(args["env"]["FORCE_COLOR"], Value::Null);
         assert!(args["env"]["PYTHONPATH"]
             .as_str()
             .unwrap()
@@ -2519,6 +2524,54 @@ mod editor_tests {
             !output.contains("The debugger starts the tests"),
             "{output}"
         );
+        assert!(app.close().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires debugpy (DEBUGPY_PYTHON or python3), python3 and the Python grammar; a debugged run ends with its tests and takes what they left along"]
+    async fn a_debugged_run_ends_with_its_tests_and_their_leftovers() {
+        let fixture = python_fixture();
+        let root = helix_stdx::path::canonicalize(fixture.path());
+        let source = root.join("tests/test_leftover.py");
+        let pid = root.join("leftover-pid");
+        std::fs::write(
+            &source,
+            format!(
+                "import subprocess\nimport unittest\n\n\nclass LeftoverTests(unittest.TestCase):\n    def test_leaves_a_process(self):\n        process = subprocess.Popen([\"sleep\", \"300\"])\n        with open({pid:?}, \"w\") as file:\n            file.write(str(process.pid))\n",
+                pid = pid.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let python = debugpy_python();
+        let mut app = app_with_languages(&source, |languages| {
+            let python_language = languages["language"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|language| language["name"].as_str() == Some("python"))
+                .unwrap();
+            python_language["debugger"]["command"] =
+                toml::Value::String(python.to_string_lossy().into_owned());
+        });
+        keys(&mut app, "<space>Gltest-func<ret>").await;
+        keys(&mut app, "test_leaves_a_process<ret><esc>").await;
+        // The process holds the output open; the run ends all the same.
+        let output = finished_output(&mut app).await;
+        assert!(output.contains("\nPASSED (1 passed)\n"), "{output}");
+        let pid: i32 = std::fs::read_to_string(&pid).unwrap().parse().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|stat| stat.contains(") Z "));
+                if !alive || zombie {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the process the test left is gone");
         assert!(app.close().await.is_empty());
     }
 }

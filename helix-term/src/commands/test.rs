@@ -456,7 +456,51 @@ fn replace_output(editor: &mut Editor, id: DocumentId, output: String) {
 // Kill the process group as well as the tool, so cancellation/editor exit also
 // stops the test executable and compiler children on Unix. kill_on_drop covers
 // the tool itself on all platforms. The group is private to this invocation.
-struct ProcessGroup(Option<u32>);
+struct ProcessGroup {
+    pid: Option<u32>,
+    /// Whether the tool leads a session of its own, whose processes can be
+    /// in groups of their own: debugpy's launcher puts the tests in one.
+    session: bool,
+}
+
+impl ProcessGroup {
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid.take() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            #[cfg(target_os = "linux")]
+            if self.session {
+                kill_session(pid);
+            }
+        }
+    }
+}
+
+/// Every process of a session, also those in process groups of their own.
+#[cfg(target_os = "linux")]
+fn kill_session(session: u32) {
+    let session = session.to_string();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|pid| pid.parse().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // "pid (comm) state ppid pgrp session ...": the command name can
+        // contain spaces, so the fields are counted after its parenthesis.
+        let member = stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.split(' ').nth(3) == Some(session.as_str()));
+        if member {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
 
 /// What becomes of the processes a tool has started and not stopped itself
 /// when it exits. A run that is cancelled or times out is always stopped whole.
@@ -468,12 +512,7 @@ enum Leftovers {
 }
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0 {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
+        self.kill();
     }
 }
 
@@ -621,7 +660,10 @@ fn spawn(mut command: Command, streams: Streams, session: Session) -> std::io::R
         Streams::Merged => Some(merged_output(&mut command)?),
     };
     let mut child = command.spawn()?;
-    let group = ProcessGroup(child.id());
+    let group = ProcessGroup {
+        pid: child.id(),
+        session: matches!(session, Session::Own),
+    };
     // The command holds the writing ends of a merged pipe, which would keep
     // it open after the process has gone.
     drop(command);
@@ -678,19 +720,29 @@ async fn follow(
             _ => Ok(()),
         }
     };
+    let killed = matches!(leftovers, Leftovers::Killed);
+    let exited = async {
+        let exit = child.wait().await?;
+        // What the tool left running goes with it, and so do the ends of
+        // its streams that a leftover would hold open.
+        if killed {
+            group.kill();
+        }
+        Ok(exit)
+    };
     let exit = tokio::select! {
         biased;
         _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err(CANCELLED.to_owned()),
         result = tokio::time::timeout(deadline, async {
-            tokio::try_join!(child.wait(), output)
+            tokio::try_join!(exited, output)
         }) => match result {
             Ok(Ok((exit, ()))) => Ok(exit),
             Ok(Err(err)) => Err(format!("PROCESS ERROR: {err}")),
             Err(_) => Err("TIMED OUT (including build time)".into()),
         }
     };
-    if exit.is_ok() && matches!(leftovers, Leftovers::Kept) {
-        group.0 = None;
+    if exit.is_ok() && !killed {
+        group.pid = None;
     }
     // Drop first to stop descendants before waiting for the immediate child.
     drop(group);
@@ -709,10 +761,13 @@ async fn follow(
 /// How long a debug adapter may take to start the program of a test run.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The program that a debug adapter asked for, or why it could not be started.
+type Started = Result<Spawned, String>;
+
 /// Waits for the program that a debug adapter starts for a test run, then
 /// follows it as [`execute`] does. The reason instead, when no program came.
 async fn follow_launched(
-    started: oneshot::Receiver<Spawned>,
+    started: oneshot::Receiver<Started>,
     mut cancel: watch::Receiver<bool>,
     deadline: Duration,
     leftovers: Leftovers,
@@ -726,7 +781,8 @@ async fn follow_launched(
         started = tokio::time::timeout(LAUNCH_TIMEOUT, started) => started,
     };
     match started {
-        Ok(Ok(spawned)) => Ok(follow(spawned, cancel, deadline, leftovers, seen).await),
+        Ok(Ok(Ok(spawned))) => Ok(follow(spawned, cancel, deadline, leftovers, seen).await),
+        Ok(Ok(Err(reason))) => Err(format!("COULD NOT START {reason}")),
         Ok(Err(_)) => Err("COULD NOT START: the debugger did not start the tests".into()),
         Err(_) => Err("TIMED OUT: the debugger did not start the tests".into()),
     }
@@ -755,7 +811,7 @@ fn requested(arguments: &RunInTerminalArguments) -> anyhow::Result<Command> {
 /// The program of a debugged test run, which its debug adapter starts.
 struct Launched {
     adapter: DebugAdapterId,
-    started: oneshot::Receiver<Spawned>,
+    started: oneshot::Receiver<Started>,
 }
 
 /// Starts the debugger on a Python test run: debugpy starts the runner
@@ -776,14 +832,24 @@ fn launch(editor: &mut Editor, target: &TestRun, debugger: &Debugger) -> anyhow:
     editor.test_terminal = Some(TestTerminal {
         adapter,
         start: Box::new(move |arguments| {
-            let spawned = spawn(requested(arguments)?, Streams::Merged, Session::Own)?;
-            let pid = spawned
-                .child
-                .id()
-                .ok_or_else(|| anyhow::anyhow!("the tests exited at once"))?;
-            // The run may have been cancelled meanwhile; the process then goes.
-            let _ = tx.send(spawned);
-            Ok(pid)
+            let program = arguments.args.first().cloned().unwrap_or_default();
+            let started = requested(arguments).and_then(|command| {
+                spawn(command, Streams::Merged, Session::Own)
+                    .map_err(|err| anyhow::anyhow!("{program}: {err}"))
+            });
+            match started {
+                Ok(spawned) => {
+                    let pid = spawned.child.id().unwrap_or_default();
+                    // The run may have been cancelled meanwhile; the process then goes.
+                    let _ = tx.send(Ok(spawned));
+                    Ok(pid)
+                }
+                // The adapter is told, and the run says why.
+                Err(err) => {
+                    let _ = tx.send(Err(err.to_string()));
+                    Err(err)
+                }
+            }
         }),
     });
     Ok(Launched { adapter, started })
@@ -1035,6 +1101,91 @@ mod tests {
         // contain spaces, so the fields are counted after its parenthesis.
         let (_, fields) = stat.rsplit_once(") ").unwrap();
         (pid, fields.split(' ').nth(3).unwrap().to_owned())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_run_in_a_session_of_its_own_ends_with_its_program_and_its_leftovers() {
+        // With job control, a shell puts what it starts in the background in
+        // a process group of its own, as debugpy's launcher does with the
+        // tests. The job holds the output open.
+        let mut command = Command::new("sh");
+        command.args(["-c", "set -m; sleep 300 & echo $!"]);
+        let spawned = spawn(command, Streams::Merged, Session::Own).unwrap();
+        let (_tx, rx) = watch::channel(false);
+        let run = follow(
+            spawned,
+            rx,
+            Duration::from_secs(120),
+            Leftovers::Killed,
+            |_| {},
+        );
+        let execution = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("the run ends with its program");
+        assert!(execution.exit.is_ok());
+        let pid: i32 = String::from_utf8(execution.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // A killed process may remain a zombie briefly until reaped.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|stat| stat.contains(") Z "));
+                if !alive || zombie {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the leftover is gone");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_could_not_start_says_why() {
+        let (_cancel, rx) = watch::channel(false);
+        let (tx, started) = oneshot::channel();
+        tx.send(Err(
+            "/src/.venv/bin/python: No such file or directory".into()
+        ))
+        .ok()
+        .unwrap();
+        let reason = follow_launched(
+            started,
+            rx,
+            Duration::from_secs(1),
+            Leftovers::Killed,
+            |_| {},
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            reason,
+            "COULD NOT START /src/.venv/bin/python: No such file or directory"
+        );
+        // An adapter that went without asking for the program.
+        let (_cancel, rx) = watch::channel(false);
+        let (tx, started) = oneshot::channel::<Started>();
+        drop(tx);
+        let reason = follow_launched(
+            started,
+            rx,
+            Duration::from_secs(1),
+            Leftovers::Killed,
+            |_| {},
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            reason.starts_with("COULD NOT START: the debugger"),
+            "{reason}"
+        );
     }
 
     #[cfg(target_os = "linux")]

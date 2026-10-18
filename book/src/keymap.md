@@ -580,8 +580,7 @@ limit.
   debugger again. `Space t l` runs it without one.
 - Ending the debug session ends the tests, and the run fails with it.
   `Space t c` cancels the run, and the debug session ends with it.
-- If the debugger has not started the tests after a minute, the run is
-  cancelled.
+- If the debugger cannot start the tests, the run ends and says why.
 
 Such a template has `request = "launch"` and `completion = "python-test-function"`
 or `"python-test-package"` as its first parameter. The run sets `module`,

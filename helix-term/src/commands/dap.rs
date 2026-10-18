@@ -166,8 +166,12 @@ fn dap_start_callback(
             Err(err) => {
                 if let Some(cancel) = editor.test_cancel.as_ref().filter(|_| for_test) {
                     let _ = cancel.send(true);
+                    let what = match request_type.as_str() {
+                        "launch" => "start the tests",
+                        _ => "attach",
+                    };
                     editor.test_cancel_reason =
-                        Some(format!("the debugger did not attach ({err})"));
+                        Some(format!("the debugger did not {what} ({err})"));
                 }
                 editor.stop_debug_output_tails(id);
                 editor.debug_adapters.remove_client(id);
@@ -179,7 +183,10 @@ fn dap_start_callback(
                 {
                     editor.debug_adapters.unset_active_client();
                 }
-                editor.set_error(format!("Failed to start debug session: {}", err));
+                // A test run says why it ended, also when it already has.
+                if !for_test {
+                    editor.set_error(format!("Failed to start debug session: {}", err));
+                }
             }
         }));
         Ok(call)
