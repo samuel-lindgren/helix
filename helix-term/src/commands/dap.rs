@@ -42,6 +42,8 @@ const EVAL_VARIABLE_NODE_LIMIT: usize = 512;
 const GO_EVAL_START_MARKER: &str = "/*__hx_dap_expr_start__*/";
 const GO_EVAL_END_MARKER: &str = "/*__hx_dap_expr_end__*/";
 const GO_EVAL_INDENT: &str = "        ";
+const PYTHON_EVAL_START_MARKER: &str = "# __hx_dap_expr_start__";
+const PYTHON_EVAL_END_MARKER: &str = "# __hx_dap_expr_end__";
 
 struct EvalInputSeed {
     content: String,
@@ -1438,9 +1440,10 @@ fn show_eval_input_buffer(
         }
     }
 
+    // A new document is not empty: it holds a line ending.
     let should_seed = {
         let doc = doc!(editor, &doc_id);
-        !content.is_empty() && doc.text().len_chars() == 0 && !doc.is_modified()
+        !content.is_empty() && !doc.is_modified() && doc.text().chars().all(char::is_whitespace)
     };
 
     let loader = editor.syn_loader.load();
@@ -1502,6 +1505,7 @@ fn current_eval_input_seed(editor: &mut Editor) -> EvalInputSeed {
 
     match language.as_deref() {
         Some("go") => build_go_eval_input_seed(&text.to_string(), prefill, source_path),
+        Some("python") => build_python_eval_input_seed(&text.to_string(), prefill, source_path),
         _ => EvalInputSeed {
             cursor: prefill.chars().count(),
             content: prefill,
@@ -1520,6 +1524,8 @@ fn current_selection_or_buffer(editor: &mut Editor) -> String {
         primary.fragment(text).to_string()
     } else if doc.language_name() == Some("go") {
         extract_go_eval_expression(&text.to_string()).unwrap_or_else(|| text.to_string())
+    } else if doc.language_name() == Some("python") {
+        extract_python_eval_expression(&text.to_string()).unwrap_or_else(|| text.to_string())
     } else {
         text.to_string()
     }
@@ -1648,6 +1654,135 @@ fn extract_go_eval_expression(text: &str) -> Option<String> {
         .join("\n");
 
     Some(dedented.trim_end().to_string())
+}
+
+/// What the language server needs to complete names of the paused module: its
+/// imports, and the module itself for its own names. The expression goes
+/// between the markers; the file is only ever analyzed, never run.
+fn build_python_eval_input_seed(
+    source_text: &str,
+    expression: String,
+    source_path: Option<PathBuf>,
+) -> EvalInputSeed {
+    // Unused imports and the like are the point of this file, not mistakes.
+    let mut content = String::from(
+        "# pyright: basic\n# ruff: noqa\n\
+         # Space G e evaluates the selection, else the lines between the markers, in the paused frame.\n",
+    );
+    let imports = python_imports(source_text);
+    for import in &imports {
+        content.push_str(import);
+        content.push('\n');
+    }
+    // Exported names count as used, unused imports would be marked.
+    let names: Vec<_> = imports
+        .iter()
+        .flat_map(|import| python_imported_names(import))
+        .map(|name| format!("{name:?}"))
+        .collect();
+    if !names.is_empty() {
+        content.push_str(&format!("__all__ = [{}]\n", names.join(", ")));
+    }
+    let module = source_path
+        .as_deref()
+        .and_then(super::test::python::module_of)
+        .map(|(_, module)| module.trim_end_matches(".__init__").to_owned());
+    if let Some(module) = module {
+        content.push_str(&format!("from {module} import *\n"));
+    }
+    content.push('\n');
+    content.push_str(PYTHON_EVAL_START_MARKER);
+    content.push('\n');
+    content.push_str(&expression);
+    if !expression.ends_with('\n') {
+        content.push('\n');
+    }
+    let cursor = content.chars().count() - 1;
+    content.push_str(PYTHON_EVAL_END_MARKER);
+    content.push('\n');
+
+    EvalInputSeed {
+        content,
+        cursor,
+        language: Some("python".to_string()),
+        source_path,
+    }
+}
+
+/// The imports of a module that start a line: `import` and `from`
+/// statements at its top level, with the lines that continue them.
+fn python_imports(source: &str) -> Vec<String> {
+    let lines: Vec<_> = source.lines().collect();
+    // Parentheses that a line leaves open, outside of a comment.
+    let open = |line: &str| {
+        let code = line.split('#').next().unwrap_or(line);
+        code.matches('(').count() as i32 - code.matches(')').count() as i32
+    };
+    let continued = |line: &str| line.trim_end().ends_with('\\');
+    let mut imports = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.starts_with("import ") || line.starts_with("from ") {
+            let start = index;
+            let mut depth = open(line);
+            let mut more = continued(line);
+            while (depth > 0 || more) && index + 1 < lines.len() {
+                index += 1;
+                depth += open(lines[index]);
+                more = continued(lines[index]);
+            }
+            imports.push(lines[start..=index].join("\n"));
+        }
+        index += 1;
+    }
+    imports
+}
+
+/// The names an import statement binds: `import a.b` binds `a`,
+/// `from a import b as c` binds `c`. A star import binds none that are known,
+/// and `__future__` none at all.
+fn python_imported_names(import: &str) -> Vec<String> {
+    let code: String = import
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(['\\', '(', ')'], " ");
+    let code = code.trim();
+    let (items, from) = if let Some(rest) = code.strip_prefix("import ") {
+        (rest, false)
+    } else if let Some((module, items)) = code
+        .strip_prefix("from ")
+        .and_then(|rest| rest.split_once(" import "))
+    {
+        if module.trim() == "__future__" {
+            return Vec::new();
+        }
+        (items, true)
+    } else {
+        return Vec::new();
+    };
+    items
+        .split(',')
+        .filter_map(|item| {
+            let mut words = item.split_whitespace();
+            let name = words.next()?;
+            match (words.next(), words.next()) {
+                (Some("as"), Some(alias)) => Some(alias.to_owned()),
+                _ if name == "*" => None,
+                _ if from => Some(name.to_owned()),
+                _ => name.split('.').next().map(str::to_owned),
+            }
+        })
+        .collect()
+}
+
+/// The lines between the markers of a Python expression buffer.
+fn extract_python_eval_expression(text: &str) -> Option<String> {
+    let start = text.find(PYTHON_EVAL_START_MARKER)? + PYTHON_EVAL_START_MARKER.len();
+    let end = text[start..].find(PYTHON_EVAL_END_MARKER)? + start;
+    Some(text[start..end].trim_matches('\n').trim_end().to_string())
 }
 
 fn current_stack_frame_id(editor: &Editor) -> Result<usize, &'static str> {
@@ -2527,6 +2662,80 @@ func TestReal(t *testing.T) {}
             extract_go_eval_expression(&seed.content),
             Some("os.Getenv(\"HOME\")".to_string())
         );
+    }
+
+    #[test]
+    fn python_eval_seed_has_the_imports_and_names_of_the_module() {
+        let source = "\"\"\"The module.\"\"\"\nfrom __future__ import annotations\n\nimport os\nfrom pathlib import Path\nfrom shop.cart import (\n    total,  # what it costs (with tax)\n    Cart,\n)\nfrom shop.money import Money, \\\n    Currency\n\nif TYPE_CHECKING:\n    import typing\n\n\ndef run():\n    import json\n";
+        assert_eq!(
+            python_imports(source),
+            [
+                "from __future__ import annotations",
+                "import os",
+                "from pathlib import Path",
+                "from shop.cart import (\n    total,  # what it costs (with tax)\n    Cart,\n)",
+                "from shop.money import Money, \\\n    Currency",
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("shop");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("__init__.py"), "").unwrap();
+        let seed = build_python_eval_input_seed(
+            source,
+            "total(cart)".to_string(),
+            Some(package.join("orders.py")),
+        );
+        assert!(seed.content.starts_with("# pyright: basic\n# ruff: noqa\n"));
+        assert!(seed
+            .content
+            .contains("from __future__ import annotations\nimport os\n"));
+        assert!(seed.content.contains("from shop.orders import *\n"));
+        assert!(seed.content.contains(
+            "__all__ = [\"os\", \"Path\", \"total\", \"Cart\", \"Money\", \"Currency\"]\n"
+        ));
+        assert_eq!(
+            extract_python_eval_expression(&seed.content),
+            Some("total(cart)".to_string())
+        );
+        // The cursor is at the end of the expression.
+        let before: String = seed.content.chars().take(seed.cursor).collect();
+        assert!(before.ends_with("total(cart)"), "{before:?}");
+        // A package is its own name.
+        let seed =
+            build_python_eval_input_seed("", String::new(), Some(package.join("__init__.py")));
+        assert!(seed.content.contains("from shop import *\n"));
+        assert_eq!(
+            extract_python_eval_expression(&seed.content),
+            Some(String::new())
+        );
+        // Without a file there is no module to import.
+        let seed = build_python_eval_input_seed("import os\n", "x\ny = 2".to_string(), None);
+        assert!(!seed.content.contains("import *"));
+        assert_eq!(
+            extract_python_eval_expression(&seed.content),
+            Some("x\ny = 2".to_string())
+        );
+    }
+
+    #[test]
+    fn python_imports_bind_their_names() {
+        for (import, names) in [
+            ("import os", vec!["os"]),
+            ("import os.path", vec!["os"]),
+            ("import os.path as p, json", vec!["p", "json"]),
+            ("from a.b import c", vec!["c"]),
+            ("from . import c as d, e", vec!["d", "e"]),
+            (
+                "from a import (\n    b,  # the b (really)\n    c as k,\n)",
+                vec!["b", "k"],
+            ),
+            ("from a import b, \\\n    c", vec!["b", "c"]),
+            ("from a import *", vec![]),
+            ("from __future__ import annotations", vec![]),
+        ] {
+            assert_eq!(python_imported_names(import), names, "{import}");
+        }
     }
 
     #[test]

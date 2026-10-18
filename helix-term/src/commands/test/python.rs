@@ -35,6 +35,7 @@ mod corresponding;
 mod discovery;
 
 pub(in crate::commands) use corresponding::corresponding_tests;
+pub(in crate::commands) use discovery::module_of;
 use discovery::{relative, PythonTest};
 
 pub(super) const BUFFER_NAME: &str = "[python-test]";
