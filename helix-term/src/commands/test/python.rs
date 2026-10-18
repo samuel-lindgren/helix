@@ -14,11 +14,16 @@ use helix_view::{
     DocumentId, Editor,
 };
 use once_cell::sync::Lazy;
-use tokio::{process::Command, sync::watch};
+use serde_json::{json, Value};
+use tokio::{
+    process::Command,
+    sync::{oneshot, watch},
+};
 
 use super::{
-    check_idle, check_workspace_saved, execute, jump_to_location, pick_location, start_in,
-    start_run, Debugger, Execution, Leftovers, RunResult, SourceLocation, Streams, TRUNCATED,
+    check_idle, check_workspace_saved, execute, follow_launched, jump_to_location, pick_location,
+    start, start_in, Debugger, Execution, Leftovers, RunResult, SourceLocation, Started, Streams,
+    TRUNCATED,
 };
 use crate::{
     compositor,
@@ -161,12 +166,13 @@ fn start_found(
     });
 }
 
-/// The tests below the focused file's directory, as the runner finds them there.
-pub(super) fn package(cx: &mut compositor::Context) {
+/// The tests below the focused file's directory, as the runner finds them
+/// there. With a debugger, they run under it.
+pub(super) fn package(cx: &mut compositor::Context, debugger: Option<Debugger>) {
     match saved_file(cx.editor) {
         Ok(path) => {
             let dir = path.parent().unwrap().to_owned();
-            start_found(cx, dir.clone(), None, move |project| {
+            start_found(cx, dir.clone(), debugger, move |project| {
                 Ok(directory_selection(project, &dir))
             });
         }
@@ -174,8 +180,9 @@ pub(super) fn package(cx: &mut compositor::Context) {
     }
 }
 
-/// Every test of the project, to choose one from.
-pub(super) fn pick(cx: &mut compositor::Context) {
+/// Every test of the project, to choose one from. With a debugger, the
+/// chosen test runs under it.
+pub(super) fn pick(cx: &mut compositor::Context, debugger: Option<Debugger>) {
     let path = match check_idle(cx.editor).and_then(|()| saved_file(cx.editor)) {
         Ok(path) => path,
         Err(err) => {
@@ -220,7 +227,8 @@ pub(super) fn pick(cx: &mut compositor::Context) {
                     tests,
                     root,
                     move |cx, test, _| {
-                        start_run(cx, TestRun::Python(selection(&project, test, None)))
+                        let target = TestRun::Python(selection(&project, test, None));
+                        start(cx, target, debugger.clone())
                     },
                 )
                 .with_preview(|_, test| {
@@ -424,20 +432,73 @@ fn command_line(target: &PythonTestRun) -> String {
 }
 
 /// The lines above the result in the output buffer.
-pub(super) fn header(target: &PythonTestRun) -> String {
+pub(super) fn header(target: &PythonTestRun, debug: bool) -> String {
     let notice = target
         .selection_note
         .as_ref()
         .map(|note| format!("Original selection: {note}\n"))
         .unwrap_or_default();
+    let debugger = if debug {
+        "The debugger starts the tests; the results follow when they are done.\n"
+    } else {
+        ""
+    };
     format!(
         "{TITLE}{}\nDirectory: {}\nCommand: {}\n\
-         Tests read saved files from disk. Save and rerun after edits.\n\
+         Tests read saved files from disk. Save and rerun after edits.\n{debugger}\
          Space t f: go to this line's test or source | Space t r: results | Space t c: cancel\n{notice}\n",
         target.name,
         target.root.display(),
         command_line(target),
     )
+}
+
+/// What a debug launch of the run sets in the arguments of its template:
+/// debugpy runs the runner's module in the project's root, through the
+/// editor's terminal so that the run gets the output. The template's own
+/// interpreter is kept; without one, the run's is used.
+pub(super) fn debug_args(target: &PythonTestRun, args: &mut serde_json::Map<String, Value>) {
+    args.remove("program");
+    args.insert("module".into(), module(target.runner).into());
+    args.insert("args".into(), json!(target.args));
+    args.insert("cwd".into(), json!(target.root.to_string_lossy()));
+    args.insert("console".into(), "integratedTerminal".into());
+    args.insert("redirectOutput".into(), false.into());
+    args.entry("python")
+        .or_insert_with(|| json!(interpreter(&target.directory).to_string_lossy()));
+    let env = args
+        .entry("env")
+        .or_insert_with(|| json!({}))
+        .as_object_mut();
+    if let Some(env) = env {
+        env.insert("PYTHONUNBUFFERED".into(), "1".into());
+        if let Some(path) = python_path(target) {
+            env.insert("PYTHONPATH".into(), json!(path.to_string_lossy()));
+        }
+        // The results are read from plain text: without the editor's colours.
+        for colours in ["FORCE_COLOR", "PY_COLORS", "PYTHON_COLORS"] {
+            env.insert(colours.into(), Value::Null);
+        }
+    }
+}
+
+/// A run under the debugger, whose adapter starts the program.
+pub(super) async fn run_launched(
+    target: &PythonTestRun,
+    started: oneshot::Receiver<Started>,
+    cancel: watch::Receiver<bool>,
+    deadline: Duration,
+) -> RunResult {
+    // Tests that start servers or other processes do not always stop them.
+    match follow_launched(started, cancel, deadline, Leftovers::Killed, |_| {}).await {
+        Ok(execution) => outcome(target, execution),
+        Err(status) => RunResult {
+            started: false,
+            status,
+            output: "The debug adapter's messages are in the debug log (:debug-log).\n".into(),
+            success: false,
+        },
+    }
 }
 
 pub(super) async fn run(
@@ -1236,7 +1297,8 @@ mod tests {
             runner: Runner::Unittest,
         };
         let method = test(&root.join("tests/test calc.py"), &["A"], Some("test_a"));
-        let header = header(&selection(&project, &method, Some("a note".into())));
+        let run = selection(&project, &method, Some("a note".into()));
+        let header = header(&run, false);
         assert!(header.starts_with(&format!(
             "Python test: test calc.A.test_a\nDirectory: {}\n",
             root.display()
@@ -1245,7 +1307,10 @@ mod tests {
             "Command: PYTHONPATH=tests .venv/bin/python -m unittest -v \"test calc.A.test_a\"\n"
         ));
         assert!(header.ends_with("Original selection: a note\n\n"));
-        assert_eq!(root_dir(&lines(&header)), Some(root));
+        assert_eq!(root_dir(&lines(&header)), Some(root.clone()));
+        let debugged = super::header(&run, true);
+        assert!(debugged.contains("The debugger starts the tests"));
+        assert_eq!(root_dir(&lines(&debugged)), Some(root));
     }
 
     fn lines(output: &str) -> Vec<String> {
@@ -1878,6 +1943,38 @@ class TestCalc:
         assert!(at("class Plain").is_err());
     }
 
+    #[test]
+    fn a_debug_launch_runs_the_selection_through_the_editor() {
+        let mut run = unittest_run(&["-v", "test_calc.CalcTests.test_add"]);
+        run.import_paths = vec!["/src/tests".into()];
+        let mut args = serde_json::Map::new();
+        args.insert("program".into(), "{0}".into());
+        args.insert("console".into(), "internalConsole".into());
+        args.insert("justMyCode".into(), false.into());
+        args.insert("env".into(), json!({ "DEBUG": "1" }));
+        debug_args(&run, &mut args);
+        assert_eq!(args.get("program"), None);
+        assert_eq!(args["module"], "unittest");
+        assert_eq!(args["args"], json!(["-v", "test_calc.CalcTests.test_add"]));
+        assert_eq!(args["cwd"], "/src");
+        assert_eq!(args["console"], "integratedTerminal");
+        assert_eq!(args["redirectOutput"], false);
+        assert_eq!(args["justMyCode"], false);
+        assert_eq!(args["env"]["DEBUG"], "1");
+        assert_eq!(args["env"]["PYTHONUNBUFFERED"], "1");
+        assert_eq!(args["env"]["FORCE_COLOR"], Value::Null);
+        assert!(args["env"]["PYTHONPATH"]
+            .as_str()
+            .unwrap()
+            .starts_with("/src/tests"));
+        // The run's interpreter, unless the template has one.
+        assert_eq!(args["python"], json!(interpreter(&run.directory)));
+        let mut args = serde_json::Map::new();
+        args.insert("python".into(), "/opt/python".into());
+        debug_args(&run, &mut args);
+        assert_eq!(args["python"], "/opt/python");
+    }
+
     #[tokio::test]
     async fn startup_failure_is_a_retained_result() {
         let dir = tree(&[(".venv/bin/python", "")]);
@@ -2348,6 +2445,157 @@ mod editor_tests {
         );
         // Without the cursor on a location, every failure is offered.
         keys(&mut app, "<space>tf").await;
+        assert!(app.close().await.is_empty());
+    }
+
+    /// An interpreter with debugpy: DEBUGPY_PYTHON, else python3.
+    fn debugpy_python() -> PathBuf {
+        let python = std::env::var_os("DEBUGPY_PYTHON").map_or("python3".into(), PathBuf::from);
+        let found = std::process::Command::new(&python)
+            .args(["-c", "import debugpy"])
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            found,
+            "{} has no debugpy; set DEBUGPY_PYTHON",
+            python.display()
+        );
+        python
+    }
+
+    async fn until(app: &mut Application, what: &str, done: impl Fn(&Application) -> bool) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !done(app) {
+                keys(app, "").await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}: {}", status(app)));
+    }
+
+    fn stopped(app: &Application) -> bool {
+        app.editor
+            .debug_adapters
+            .get_active_client()
+            .is_some_and(|client| client.thread_id.is_some())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires debugpy (DEBUGPY_PYTHON or python3), python3 and the Python grammar; debugs a chosen test to a breakpoint and its result"]
+    async fn a_debugged_test_stops_at_its_breakpoint_and_reports_its_result() {
+        let fixture = python_fixture();
+        let root = helix_stdx::path::canonicalize(fixture.path());
+        let source = root.join("tests/test_calc.py");
+        let python = debugpy_python();
+        let mut app = app_with_languages(&source, |languages| {
+            let python_language = languages["language"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|language| language["name"].as_str() == Some("python"))
+                .unwrap();
+            python_language["debugger"]["command"] =
+                toml::Value::String(python.to_string_lossy().into_owned());
+        });
+        let (view, doc) = current!(app.editor);
+        let text = doc.text().to_string();
+        let breakpoint = text[..text.find("self.assertEqual(double(2), 4)").unwrap()]
+            .chars()
+            .count();
+        doc.set_selection(view.id, helix_core::Selection::point(breakpoint));
+        keys(&mut app, "<space>Gb<esc>").await;
+        assert_eq!(app.editor.breakpoints[&source].len(), 1);
+
+        // The template, then the test.
+        keys(&mut app, "<space>Gltest-func<ret>").await;
+        keys(&mut app, "test_add$<ret><esc>").await;
+        until(&mut app, "the breakpoint", stopped).await;
+        let frame = app.editor.debug_adapters.current_stack_frame().unwrap();
+        assert_eq!(frame.line, 9);
+        // The tests wait at the breakpoint.
+        assert!(app.editor.test_cancel.is_some());
+        keys(&mut app, "<space>Gc<esc>").await;
+        let output = finished_output(&mut app).await;
+        assert!(
+            output.starts_with("Python test: test_calc.CalcTests.test_add\n"),
+            "{output}"
+        );
+        assert!(output.contains("The debugger starts the tests"), "{output}");
+        assert!(output.contains("\nPASSED (1 passed)\n"), "{output}");
+        assert!(output.contains("CHOSEN TEST"), "{output}");
+        assert!(!output.contains("SIBLING TEST"), "{output}");
+        until(&mut app, "the end of the debug session", |app| {
+            app.editor.debug_adapters.is_empty()
+        })
+        .await;
+
+        // Space G R debugs the same test again; cancelling it ends the session.
+        keys(&mut app, "<space>GR<esc>").await;
+        until(&mut app, "the breakpoint again", stopped).await;
+        keys(&mut app, "<space>tc").await;
+        let output = finished_output(&mut app).await;
+        assert!(output.contains("\nCANCELLED"), "{output}");
+        until(&mut app, "the end of the cancelled session", |app| {
+            app.editor.debug_adapters.is_empty()
+        })
+        .await;
+        // Without the debugger, the same selection runs at once.
+        keys(&mut app, "<space>tl").await;
+        let output = finished_output(&mut app).await;
+        assert!(output.contains("\nPASSED (1 passed)\n"), "{output}");
+        assert!(
+            !output.contains("The debugger starts the tests"),
+            "{output}"
+        );
+        assert!(app.close().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires debugpy (DEBUGPY_PYTHON or python3), python3 and the Python grammar; a debugged run ends with its tests and takes what they left along"]
+    async fn a_debugged_run_ends_with_its_tests_and_their_leftovers() {
+        let fixture = python_fixture();
+        let root = helix_stdx::path::canonicalize(fixture.path());
+        let source = root.join("tests/test_leftover.py");
+        let pid = root.join("leftover-pid");
+        std::fs::write(
+            &source,
+            format!(
+                "import subprocess\nimport unittest\n\n\nclass LeftoverTests(unittest.TestCase):\n    def test_leaves_a_process(self):\n        process = subprocess.Popen([\"sleep\", \"300\"])\n        with open({pid:?}, \"w\") as file:\n            file.write(str(process.pid))\n",
+                pid = pid.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let python = debugpy_python();
+        let mut app = app_with_languages(&source, |languages| {
+            let python_language = languages["language"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|language| language["name"].as_str() == Some("python"))
+                .unwrap();
+            python_language["debugger"]["command"] =
+                toml::Value::String(python.to_string_lossy().into_owned());
+        });
+        keys(&mut app, "<space>Gltest-func<ret>").await;
+        keys(&mut app, "test_leaves_a_process<ret><esc>").await;
+        // The process holds the output open; the run ends all the same.
+        let output = finished_output(&mut app).await;
+        assert!(output.contains("\nPASSED (1 passed)\n"), "{output}");
+        let pid: i32 = std::fs::read_to_string(&pid).unwrap().parse().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|stat| stat.contains(") Z "));
+                if !alive || zombie {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the process the test left is gone");
         assert!(app.close().await.is_empty());
     }
 }
