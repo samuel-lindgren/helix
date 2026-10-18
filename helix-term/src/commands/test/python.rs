@@ -17,8 +17,8 @@ use once_cell::sync::Lazy;
 use tokio::{process::Command, sync::watch};
 
 use super::{
-    check_idle, check_workspace_saved, execute, jump_to_location, pick_location, start_run,
-    Execution, Leftovers, RunResult, SourceLocation, Streams, TRUNCATED,
+    check_idle, check_workspace_saved, execute, jump_to_location, pick_location, start_in,
+    start_run, Debugger, Execution, Leftovers, RunResult, SourceLocation, Streams, TRUNCATED,
 };
 use crate::{
     compositor,
@@ -38,8 +38,8 @@ pub(super) const RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The root of the project a directory belongs to, which the tests run in:
 /// the nearest directory with the configuration of a project or of its
-/// tests, else the repository, else the directory itself.
-fn root_of(dir: &Path) -> PathBuf {
+/// tests, else the repository.
+fn root_of(dir: &Path) -> Option<PathBuf> {
     let is_project = |dir: &&Path| {
         discovery::PROJECT_FILES
             .iter()
@@ -48,13 +48,11 @@ fn root_of(dir: &Path) -> PathBuf {
     dir.ancestors()
         .find(is_project)
         .or_else(|| dir.ancestors().find(|dir| dir.join(".git").exists()))
-        .unwrap_or(dir)
-        .to_owned()
+        .map(Path::to_owned)
 }
 
-/// Whether the project says that pytest runs its tests: a configuration of
-/// pytest, or a `conftest.py` on the way from `dir` up to the root.
-fn configured_for_pytest(root: &Path, dir: &Path) -> bool {
+/// Whether the project's configuration says that pytest runs its tests.
+fn configured_for_pytest(root: &Path) -> bool {
     let mentions = |file: &str, section: &str| {
         std::fs::read_to_string(root.join(file)).is_ok_and(|text| text.contains(section))
     };
@@ -63,10 +61,6 @@ fn configured_for_pytest(root: &Path, dir: &Path) -> bool {
         || mentions("pyproject.toml", "[tool.pytest")
         || mentions("setup.cfg", "[tool:pytest]")
         || mentions("tox.ini", "[pytest]")
-        || dir
-            .ancestors()
-            .take_while(|dir| dir.starts_with(root))
-            .any(|dir| dir.join("conftest.py").is_file())
 }
 
 /// A test module written for pytest: it imports pytest, or declares a test
@@ -92,19 +86,32 @@ fn written_for_pytest(file: &Path) -> bool {
 #[derive(Clone)]
 struct Project {
     root: PathBuf,
+    /// Whether the tests below the root are the project's. A directory that
+    /// belongs to no project or repository is only its own files: it may be
+    /// the home directory.
+    below: bool,
     runner: Runner,
 }
 
 impl Project {
+    /// Where the tests of a directory run, found without reading the tree.
+    fn root(dir: &Path) -> (PathBuf, bool) {
+        match root_of(dir) {
+            Some(root) => (root, true),
+            None => (dir.to_owned(), false),
+        }
+    }
+
     /// pytest when the project is set up for it, or when any of its test
     /// modules is written for it; unittest otherwise. pytest runs the tests
-    /// written for unittest as well.
+    /// written for unittest as well. This reads the project's test modules:
+    /// not on the editor's thread.
     fn of(dir: &Path) -> Self {
-        let root = root_of(dir);
-        let pytest = configured_for_pytest(&root, dir)
-            || discovery::test_files(&root)
-                .iter()
-                .any(|file| written_for_pytest(file));
+        let (root, below) = Self::root(dir);
+        let files = discovery::project_files(&root, below);
+        let pytest = files.conftest
+            || configured_for_pytest(&root)
+            || files.tests.iter().any(|file| written_for_pytest(file));
         Self {
             runner: if pytest {
                 Runner::Pytest
@@ -112,6 +119,7 @@ impl Project {
                 Runner::Unittest
             },
             root,
+            below,
         }
     }
 
@@ -121,26 +129,44 @@ impl Project {
     }
 }
 
-/// The saved Python file in the focused view, and its project, once nothing
+/// The saved Python file in the focused view, once nothing in its project
 /// that the tests read is unsaved.
-fn saved_file(editor: &Editor) -> anyhow::Result<(PathBuf, Project)> {
+fn saved_file(editor: &Editor) -> anyhow::Result<PathBuf> {
     let path = doc!(editor)
         .path()
         .filter(|path| path.extension().is_some_and(|e| e == "py"))
         .ok_or_else(|| anyhow::anyhow!("Open a saved Python file to run its tests"))?
         .to_owned();
-    let project = Project::of(path.parent().unwrap_or(Path::new(".")));
-    check_workspace_saved(editor, &project.root)?;
-    Ok((path, project))
+    let (root, _) = Project::root(path.parent().unwrap_or(Path::new(".")));
+    check_workspace_saved(editor, &root)?;
+    Ok(path)
 }
 
-/// The tests of the focused file's directory: the package and the packages
-/// below it, or the directory alone when it is not one.
+/// Finds what runs the project's tests, which reads them, off the editor's
+/// thread, and then starts what `select` makes of it.
+fn start_found(
+    cx: &mut compositor::Context,
+    dir: PathBuf,
+    debugger: Option<Debugger>,
+    select: impl FnOnce(&Project) -> anyhow::Result<PythonTestRun> + Send + 'static,
+) {
+    cx.jobs.callback(async move {
+        let found = tokio::task::spawn_blocking(move || select(&Project::of(&dir))).await?;
+        Ok(Callback::Editor(Box::new(move |editor| match found {
+            Ok(target) => start_in(editor, TestRun::Python(target), debugger),
+            Err(err) => editor.set_error(err.to_string()),
+        })))
+    });
+}
+
+/// The tests below the focused file's directory, as the runner finds them there.
 pub(super) fn package(cx: &mut compositor::Context) {
     match saved_file(cx.editor) {
-        Ok((path, project)) => {
-            let target = directory_selection(&project, path.parent().unwrap());
-            start_run(cx, TestRun::Python(target));
+        Ok(path) => {
+            let dir = path.parent().unwrap().to_owned();
+            start_found(cx, dir.clone(), None, move |project| {
+                Ok(directory_selection(project, &dir))
+            });
         }
         Err(err) => cx.editor.set_error(err.to_string()),
     }
@@ -148,17 +174,22 @@ pub(super) fn package(cx: &mut compositor::Context) {
 
 /// Every test of the project, to choose one from.
 pub(super) fn pick(cx: &mut compositor::Context) {
-    let (_, project) = match check_idle(cx.editor).and_then(|()| saved_file(cx.editor)) {
-        Ok(found) => found,
+    let path = match check_idle(cx.editor).and_then(|()| saved_file(cx.editor)) {
+        Ok(path) => path,
         Err(err) => {
             cx.editor.set_error(err.to_string());
             return;
         }
     };
+    let dir = path.parent().unwrap().to_owned();
     cx.jobs.callback(async move {
-        let scan = project.root.clone();
-        // A large project is many files to parse.
-        let tests = tokio::task::spawn_blocking(move || discovery::tests_below(&scan)).await?;
+        // A large project is many files to read and parse.
+        let (project, tests) = tokio::task::spawn_blocking(move || {
+            let project = Project::of(&dir);
+            let tests = discovery::project_tests(&project.root, project.below);
+            (project, tests)
+        })
+        .await?;
         Ok(Callback::EditorCompositor(Box::new(
             move |editor, compositor| {
                 let tests: Vec<_> = match tests {
@@ -200,9 +231,9 @@ pub(super) fn pick(cx: &mut compositor::Context) {
 }
 
 pub(super) fn nearest(cx: &mut compositor::Context) {
-    let target = (|| -> anyhow::Result<_> {
+    let found = (|| -> anyhow::Result<_> {
         check_idle(cx.editor)?;
-        let (path, project) = saved_file(cx.editor)?;
+        let path = saved_file(cx.editor)?;
         let (view, doc) = current_ref!(cx.editor);
         let source = doc.text().to_string();
         let byte = doc.text().char_to_byte(
@@ -210,17 +241,25 @@ pub(super) fn nearest(cx: &mut compositor::Context) {
                 .primary()
                 .cursor(doc.text().slice(..)),
         );
-        let declared: Vec<_> = discovery::parse(discovery::grammar()?, &source, &path)
+        let declared = discovery::parse(discovery::grammar()?, &source, &path);
+        Ok((path, source, byte, declared))
+    })();
+    let (path, source, byte, declared) = match found {
+        Ok(found) => found,
+        Err(err) => {
+            cx.editor.set_error(err.to_string());
+            return;
+        }
+    };
+    let dir = path.parent().unwrap().to_owned();
+    start_found(cx, dir, None, move |project| {
+        let declared: Vec<_> = declared
             .into_iter()
             .filter(|declared| project.runs(&declared.test))
             .collect();
         let (test, note) = at_cursor(&declared, &source, byte)?;
-        Ok(selection(&project, test, note))
-    })();
-    match target {
-        Ok(target) => start_run(cx, TestRun::Python(target)),
-        Err(err) => cx.editor.set_error(err.to_string()),
-    }
+        Ok(selection(project, test, note))
+    });
 }
 
 /// The test function around the cursor, else the test class around it. A
@@ -237,12 +276,16 @@ fn at_cursor<'a>(
             .bytes()
             .take_while(|b| matches!(b, b' ' | b'\t'))
             .count();
-    // A nested declaration comes after the one it is in.
+    // A nested declaration comes after the one it is in. A declaration ends
+    // before the line break of its last line, where the cursor can be too.
     let innermost = |function: bool| {
         declared
             .iter()
             .rev()
-            .find(|d| d.test.function.is_some() == function && d.bytes.contains(&byte))
+            .find(|d| {
+                d.test.function.is_some() == function
+                    && (d.bytes.start..=d.bytes.end).contains(&byte)
+            })
             .map(|d| &d.test)
     };
     if let Some(test) = innermost(true) {
@@ -459,14 +502,26 @@ fn outcome(target: &PythonTestRun, execution: Execution) -> RunResult {
     }
 }
 
+/// Whether the run is of all tests below a directory, not of a selected one.
+fn is_directory_run(target: &PythonTestRun) -> bool {
+    match target.runner {
+        Runner::Unittest => target.args.first().is_some_and(|arg| arg == "discover"),
+        Runner::Pytest => target
+            .args
+            .last()
+            .is_some_and(|arg| !arg.contains("::") && !arg.ends_with(".py")),
+    }
+}
+
 /// Where a selection that ran nothing was looked for.
 fn not_observed(target: &PythonTestRun) -> String {
-    match target.args.first().map(String::as_str) {
-        Some("discover") => format!(
+    if is_directory_run(target) {
+        format!(
             "NOT RUN: no tests were found in {}",
             relative(&target.directory, &target.root)
-        ),
-        _ => "NOT RUN: the selected test was not observed (renamed, removed, or excluded?)".into(),
+        )
+    } else {
+        "NOT RUN: the selected test was not observed (renamed, removed, or excluded?)".into()
     }
 }
 
@@ -529,9 +584,11 @@ fn unittest_status(target: &PythonTestRun, code: Option<i32>, output: &str) -> (
     if UNITTEST_MISSING.is_match(output) && ran == count("errors") {
         return (not_observed(target), false);
     }
+    // A fixture of a class or module that fails or skips leaves no test run,
+    // and is counted all the same.
     match &summary[2] {
         "NO TESTS RAN" => (not_observed(target), false),
-        _ if ran == 0 => (not_observed(target), false),
+        "OK" if ran == 0 && count("skipped") == 0 => (not_observed(target), false),
         "FAILED" => {
             let failed = numbers(&[
                 ("failures", "failure", "failures"),
@@ -627,9 +684,10 @@ fn exited(code: Option<i32>) -> String {
 static FRAME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"^(?:E\s+)?\s*File "([^"]+)", line ([0-9]+)(?:, in (.+?))?\s*$"#).unwrap()
 });
-/// pytest's place of a failure or of a frame: `tests/test_calc.py:10: AssertionError`.
+/// pytest's place of a failure or of a frame, `tests/test_calc.py:10: AssertionError`,
+/// and of a warning in its summary, indented.
 static PYTEST_LOCATION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^([^\s:][^:]*\.py):([0-9]+): (.*?)\s*$").unwrap());
+    Lazy::new(|| Regex::new(r"^\s*([^\s:][^:]*\.py):([0-9]+): (.*?)\s*$").unwrap());
 
 /// The location an output line names. pytest names files relative to the
 /// directory it runs in; tracebacks name them as they were imported.
@@ -664,10 +722,13 @@ fn source_location(line: &str, root: &Path) -> Option<SourceLocation> {
 /// `setUpClass (test_calc.CalcTests)`.
 static UNITTEST_TEST: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^\s*(?:(?:FAIL|ERROR|UNEXPECTED SUCCESS): )?([A-Za-z_]\w*) \(([A-Za-z_][\w.]*)\)(?: \(.*\))?(?: \.\.\..*)?$",
+        r"^\s*(?:(?:FAIL|ERROR|UNEXPECTED SUCCESS): )?([A-Za-z_][\w.]*) \(([A-Za-z_][\w.]*)\)(?: \[.*?\])?(?: \(.*\))?(?: \.\.\..*)?$",
     )
     .unwrap()
 });
+/// The line that starts the report of a failure, or a section of pytest's
+/// report: what follows it belongs to none of the tests above it.
+static SEPARATOR: Lazy<Regex> = Lazy::new(|| Regex::new(r"^={3,}").unwrap());
 /// The heading of a failure that unittest reports with its traceback.
 static UNITTEST_FAILURE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(?:FAIL|ERROR|UNEXPECTED SUCCESS): ").unwrap());
@@ -749,7 +810,11 @@ fn test_on_line(lines: &[String], line: usize) -> Option<Reported> {
     if REPORT.is_match(&lines[line]) {
         return None;
     }
-    lines[..=line].iter().rev().find_map(|line| reported(line))
+    lines[..=line]
+        .iter()
+        .rev()
+        .take_while(|line| !SEPARATOR.is_match(line))
+        .find_map(|line| reported(line))
 }
 
 fn root_dir(lines: &[String]) -> Option<PathBuf> {
@@ -760,39 +825,38 @@ fn root_dir(lines: &[String]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The directory pytest names its tests relative to, which it says in its
-/// report; its own search for it can end above or below the project's root.
-fn pytest_root(lines: &[String]) -> Option<PathBuf> {
-    lines
-        .iter()
-        .find_map(|line| line.strip_prefix("rootdir: "))
-        .map(PathBuf::from)
-}
-
-/// The test modules of a project, by the names they are imported by.
+/// The test modules of the project that a run was in, read when needed.
 struct Index {
-    /// What pytest's node ids are relative to.
-    node_root: PathBuf,
-    modules: HashMap<String, Vec<PathBuf>>,
-    files: Vec<PathBuf>,
+    /// The directory the run was in, which pytest's node ids are relative to.
+    root: PathBuf,
+    files: Option<Vec<PathBuf>>,
     parsed: HashMap<PathBuf, Vec<PythonTest>>,
 }
 
 impl Index {
-    fn new(root: &Path, node_root: Option<PathBuf>) -> Self {
-        let files = discovery::test_files(root);
-        let mut modules: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        for file in &files {
-            if let Some((_, module)) = discovery::module_of(file) {
-                modules.entry(module).or_default().push(file.clone());
-            }
-        }
+    fn new(root: &Path) -> Self {
         Self {
-            node_root: node_root.unwrap_or_else(|| root.to_owned()),
-            modules,
-            files,
+            root: root.to_owned(),
+            files: None,
             parsed: HashMap::new(),
         }
+    }
+
+    fn files(&mut self) -> &[PathBuf] {
+        let root = &self.root;
+        self.files.get_or_insert_with(|| {
+            let (_, below) = Project::root(root);
+            discovery::test_files(root, below)
+        })
+    }
+
+    /// The test modules imported by a name.
+    fn modules(&mut self, name: &str) -> Vec<PathBuf> {
+        self.files()
+            .iter()
+            .filter(|file| discovery::module_of(file).is_some_and(|(_, module)| module == name))
+            .cloned()
+            .collect()
     }
 
     fn tests(&mut self, file: &Path) -> &[PythonTest] {
@@ -837,8 +901,7 @@ impl Index {
                     .unwrap_or(id);
                 let parts: Vec<_> = id.split('.').collect();
                 for split in (1..=parts.len()).rev() {
-                    let module = parts[..split].join(".");
-                    let files = self.modules.get(&module).cloned().unwrap_or_default();
+                    let files = self.modules(&parts[..split].join("."));
                     let found: Vec<_> = files
                         .iter()
                         .flat_map(|file| self.declared(file, &parts[split..]))
@@ -852,8 +915,7 @@ impl Index {
             Reported::Node(id) => {
                 let id = unparameterized(id);
                 let mut parts = id.split("::");
-                let file =
-                    helix_stdx::path::canonicalize(self.node_root.join(parts.next().unwrap()));
+                let file = helix_stdx::path::canonicalize(self.root.join(parts.next().unwrap()));
                 let names: Vec<_> = parts.collect();
                 if file.is_file() {
                     self.declared(&file, &names)
@@ -864,8 +926,8 @@ impl Index {
             Reported::Heading(name) => {
                 let name = unparameterized(name);
                 let names: Vec<_> = name.split('.').collect();
-                self.files
-                    .clone()
+                self.files()
+                    .to_vec()
                     .iter()
                     .flat_map(|file| self.declared(file, &names))
                     .collect()
@@ -886,7 +948,7 @@ pub(super) fn show_locations(cx: &mut compositor::Context, id: DocumentId) {
             .set_error("The output does not say which directory the tests ran in");
         return;
     };
-    let mut index = Index::new(&root, pytest_root(&lines));
+    let mut index = Index::new(&root);
     let (view, doc) = current_ref!(cx.editor);
     if doc.id() == id {
         let line = doc
@@ -921,26 +983,31 @@ pub(super) fn show_locations(cx: &mut compositor::Context, id: DocumentId) {
     pick_location(cx, locations);
 }
 
-/// Every line of the project that the output names, in the order named, and
-/// where each failed test is declared. Frames of the interpreter and of
-/// installed packages are left out.
+/// Whether a file is part of an interpreter's standard library or of an
+/// installed package: below `lib/python3.12` or a `site-packages`.
+fn installed(path: &Path) -> bool {
+    let parts: Vec<_> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect();
+    parts.windows(2).any(|pair| {
+        let version = pair[1].strip_prefix("python");
+        pair[0] == "lib"
+            && version.is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    }) || parts
+        .iter()
+        .any(|part| part == "site-packages" || part == "dist-packages")
+}
+
+/// Every line of the tested code that the output names, in the order named,
+/// and where each failed test is declared. Frames of the interpreter's
+/// standard library and of installed packages are left out.
 fn reported_locations(lines: &[String], root: &Path, index: &mut Index) -> Vec<SourceLocation> {
-    let installed = |path: &Path| {
-        path.components().any(|part| {
-            matches!(
-                part.as_os_str().to_str(),
-                Some("site-packages" | "dist-packages")
-            )
-        })
-    };
     let mut locations = Vec::new();
     let mut seen = HashSet::new();
     for line in lines {
         let found = if let Some(location) = source_location(line, root) {
-            if location.path.is_file()
-                && location.path.starts_with(root)
-                && !installed(&location.path)
-            {
+            if location.path.is_file() && !installed(&location.path) {
                 vec![location]
             } else {
                 Vec::new()
@@ -1028,8 +1095,8 @@ mod tests {
         assert_eq!(project("app/tests"), (root.join("app"), Runner::Unittest));
         assert_eq!(project("lib/tests"), (root.join("lib"), Runner::Pytest));
         assert_eq!(project("conf/tests"), (root.join("conf"), Runner::Pytest));
-        // A conftest.py below the directory is not on the way up.
-        assert_eq!(project("conf"), (root.join("conf"), Runner::Unittest));
+        // A conftest.py anywhere in the project counts.
+        assert_eq!(project("conf"), (root.join("conf"), Runner::Pytest));
         assert_eq!(project("free"), (root.join("free"), Runner::Pytest));
         assert_eq!(project("bare"), (root.join("bare"), Runner::Pytest));
         // A class named Test… without tests says nothing.
@@ -1098,10 +1165,12 @@ mod tests {
         let root = root(&dir);
         let unittest = Project {
             root: root.clone(),
+            below: true,
             runner: Runner::Unittest,
         };
         let pytest = Project {
             root: root.clone(),
+            below: true,
             runner: Runner::Pytest,
         };
         let method = test(
@@ -1161,6 +1230,7 @@ mod tests {
         let root = root(&dir);
         let project = Project {
             root: root.clone(),
+            below: true,
             runner: Runner::Unittest,
         };
         let method = test(&root.join("tests/test calc.py"), &["A"], Some("test_a"));
@@ -1284,6 +1354,15 @@ FAILED (failures=2, errors=1, skipped=1, expected failures=1)
         assert_eq!(
             status(5, &report(0, "NO TESTS RAN")),
             ("NOT RUN: no tests were found in tests".into(), false)
+        );
+        // A class fixture that fails or skips leaves nothing run.
+        assert_eq!(
+            status(1, &report(0, "FAILED (errors=1)")),
+            ("FAILED (1 error; 0 ran)".into(), false)
+        );
+        assert_eq!(
+            status(0, &report(0, "OK (skipped=1)")),
+            ("SKIPPED (1 skipped)".into(), false)
         );
         // Only the whole block counts, and the last one.
         let printed = format!(
@@ -1415,6 +1494,14 @@ ERROR tests/test_calc.py::test_fixture_error - RuntimeError: fixture boom
         assert!(status(5, "=== no tests ran in 0.01s ===\n")
             .0
             .starts_with("NOT RUN: the selected test was not observed"));
+        let directory = PythonTestRun {
+            args: vec!["-v".into(), "tests".into()],
+            ..pytest_run()
+        };
+        assert_eq!(
+            pytest_status(&directory, Some(5), "=== no tests ran in 0.01s ===\n").0,
+            "NOT RUN: no tests were found in tests"
+        );
         assert!(status(
             4,
             "ERROR: not found: /src/tests/test_calc.py::nope\n(no match in any of [<Module test_calc.py>])\n\n=== no tests ran in 0.01s ===\n"
@@ -1467,6 +1554,12 @@ ERROR tests/test_calc.py::test_fixture_error - RuntimeError: fixture boom
                 "/src/tests/test_calc.py:5: DeprecationWarning: old",
                 "/src/tests/test_calc.py",
                 4,
+                "DeprecationWarning: old",
+            ),
+            (
+                "  /src/tests/test_w.py:8: DeprecationWarning: old",
+                "/src/tests/test_w.py",
+                7,
                 "DeprecationWarning: old",
             ),
         ] {
@@ -1543,9 +1636,21 @@ ERROR tests/test_calc.py::test_fixture_error - RuntimeError: fixture boom
                 "unittest.loader._FailedTest.test_broken",
             ),
             ("UNEXPECTED SUCCESS: test_u (m.C.test_u)", "m.C.test_u"),
+            // A module of a package that did not import, and a subtest with a message.
+            (
+                "ERROR: shop.tests.test_broken (unittest.loader._FailedTest.shop.tests.test_broken)",
+                "unittest.loader._FailedTest.shop.tests.test_broken",
+            ),
+            ("FAIL: test_cases (m.BTests.test_cases) [bad] (n=1)", "m.BTests.test_cases"),
         ] {
             assert_eq!(reported(line), unittest(name), "{line}");
         }
+        // What follows a separator belongs to none of the tests above it.
+        let unknown = lines_of(&format!(
+            "test_a (m.A.test_a) ... ok\n{}\nERROR: something unittest names otherwise\nTraceback (most recent call last):\n",
+            "=".repeat(70)
+        ));
+        assert_eq!(test_on_line(&unknown, 3), None);
 
         let node = |id: &str| Some(Reported::Node(id.to_owned()));
         let lines = lines_of(PYTEST);
@@ -1597,7 +1702,6 @@ ERROR tests/test_calc.py::test_fixture_error - RuntimeError: fixture boom
         assert!(PYTEST_RESULT
             .captures("SUBFAILED(value=1) tests/test_calc.py::CalcTests::test_table - x")
             .is_some_and(|result| &result[1] == "FAILED"));
-        assert_eq!(pytest_root(&lines), Some("/src".into()));
     }
 
     fn lines_of(output: &str) -> Vec<String> {
@@ -1627,6 +1731,7 @@ class TestCalc:
     #[test]
     fn reported_names_resolve_to_declarations() {
         let dir = tree(&[
+            ("pyproject.toml", ""),
             ("tests/test_calc.py", CALC),
             ("tests/test_broken.py", "import missing\n"),
             ("src/shop/__init__.py", ""),
@@ -1634,7 +1739,7 @@ class TestCalc:
         ]);
         let root = root(&dir);
         let calc = root.join("tests/test_calc.py");
-        let mut index = Index::new(&root, None);
+        let mut index = Index::new(&root);
         let mut found = |reported: Reported| -> Vec<(PathBuf, usize)> {
             index
                 .declarations(&reported)
@@ -1682,20 +1787,32 @@ class TestCalc:
             found(Reported::Heading("test_fail[1-2]".into())),
             [(calc.clone(), 11)]
         );
-        // pytest names its tests relative to the directory it says.
-        let mut index = Index::new(&root, Some(root.join("tests")));
-        assert_eq!(
-            index
-                .declarations(&node("test_calc.py::test_fail"))
-                .first()
-                .map(|location| location.line),
-            Some(11)
-        );
+    }
+
+    #[test]
+    fn the_standard_library_and_installed_packages_are_no_tested_code() {
+        for path in [
+            "/usr/lib/python3.12/unittest/case.py",
+            "/nix/store/x-python3-3.12.12/lib/python3.12/json/__init__.py",
+            "/home/u/.local/share/uv/python/cpython-3.14.6-linux-x86_64-gnu/lib/python3.14/os.py",
+            "/src/.venv/lib/python3.12/site-packages/numpy/core.py",
+            "/usr/lib/python3/dist-packages/yaml/__init__.py",
+        ] {
+            assert!(installed(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/src/tests/test_calc.py",
+            "/src/lib/python_helpers/x.py",
+            "/src/../shared/lib/calc.py",
+        ] {
+            assert!(!installed(Path::new(path)), "{path}");
+        }
     }
 
     #[test]
     fn failures_and_frames_of_the_project_are_listed_once() {
         let dir = tree(&[
+            ("pyproject.toml", ""),
             ("tests/test_calc.py", CALC),
             (".venv/lib/python3.12/site-packages/lib.py", "\n\n\n"),
         ]);
@@ -1709,11 +1826,10 @@ class TestCalc:
             calc.display(),
             library.display(),
         );
-        let found: Vec<_> =
-            reported_locations(&lines(&output), &root, &mut Index::new(&root, None))
-                .into_iter()
-                .map(|location| (location.path, location.line, location.message))
-                .collect();
+        let found: Vec<_> = reported_locations(&lines(&output), &root, &mut Index::new(&root))
+            .into_iter()
+            .map(|location| (location.path, location.line, location.message))
+            .collect();
         assert_eq!(
             found,
             [
@@ -1726,11 +1842,10 @@ class TestCalc:
             ]
         );
         let pytest = PYTEST.replace("/src", &root.to_string_lossy());
-        let found: Vec<_> =
-            reported_locations(&lines(&pytest), &root, &mut Index::new(&root, None))
-                .into_iter()
-                .map(|location| location.line)
-                .collect();
+        let found: Vec<_> = reported_locations(&lines(&pytest), &root, &mut Index::new(&root))
+            .into_iter()
+            .map(|location| location.line)
+            .collect();
         // The places of the failures, then the declarations of those the
         // summary repeats, where the places have not named them already.
         assert_eq!(found, [36, 9, 14, 19, 11, 16]);
@@ -1750,6 +1865,9 @@ class TestCalc:
                 .map_err(|err| err.to_string())
         };
         assert_eq!(at("x = 1"), Ok(("T.test_a".into(), false)));
+        // At the end of its last line, where the line break is not its own.
+        assert_eq!(at("\n\n    def helper"), Ok(("T.test_a".into(), false)));
+        assert_eq!(at("\n\nclass Plain"), Ok(("test_free".into(), false)));
         // Indentation before a definition belongs to it.
         assert_eq!(at("    def test_a"), Ok(("T.test_a".into(), false)));
         assert_eq!(at("pass\n\ndef test_free"), Ok(("T".into(), true)));
@@ -1882,7 +2000,7 @@ class SlowTests(unittest.TestCase):
             (project.root.as_path(), project.runner),
             (root.as_path(), Runner::Unittest)
         );
-        let tests = discovery::tests_below(&root).unwrap();
+        let tests = discovery::project_tests(&root, true).unwrap();
         let select = |name: &str| {
             let test = tests
                 .iter()
@@ -1999,7 +2117,7 @@ class SlowTests(unittest.TestCase):
         .unwrap();
         let project = Project::of(&root.join("tests"));
         assert_eq!(project.runner, Runner::Pytest);
-        let tests = discovery::tests_below(&root).unwrap();
+        let tests = discovery::project_tests(&root, true).unwrap();
         let select = |name: &str| {
             let test = tests.iter().find(|test| test.name() == name).unwrap();
             selection(&project, test, None)
@@ -2012,7 +2130,7 @@ class SlowTests(unittest.TestCase):
             report(&param)
         );
         let lines = lines_of(&param.output);
-        let mut index = Index::new(&root, pytest_root(&lines));
+        let mut index = Index::new(&root);
         let failed: Vec<_> = reported_locations(&lines, &root, &mut index)
             .into_iter()
             .map(|location| (location.path, location.line))
@@ -2175,7 +2293,7 @@ mod editor_tests {
         assert_eq!(position(&app), (source.clone(), 11));
 
         // Between the tests of a class the whole class runs, and says why.
-        cursor_on(&mut app, "\n\n    @unittest.skip");
+        cursor_on(&mut app, "\n    @unittest.skip");
         keys(&mut app, "<space>tn").await;
         let output = finished_output(&mut app).await;
         assert!(

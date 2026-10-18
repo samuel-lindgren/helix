@@ -258,34 +258,40 @@ fn start_run(cx: &mut compositor::Context, target: TestRun) {
 /// With a debugger, the run waits for it in the process that runs the tests
 /// and goes on once it has attached.
 fn start(cx: &mut compositor::Context, target: TestRun, debugger: Option<Debugger>) {
+    start_in(cx.editor, target, debugger);
+}
+
+/// [`start`] from where only the editor is at hand: the callback of a job
+/// that found what to run.
+fn start_in(editor: &mut Editor, target: TestRun, debugger: Option<Debugger>) {
     // Pickers can be reopened with last_picker; recheck at the point of launch.
     if let Err(err) =
-        check_idle(cx.editor).and_then(|()| check_workspace_saved(cx.editor, target.workspace()))
+        check_idle(editor).and_then(|()| check_workspace_saved(editor, target.workspace()))
     {
-        cx.editor.set_error(err.to_string());
+        editor.set_error(err.to_string());
         return;
     }
-    if debugger.is_some() && !cx.editor.debug_adapters.is_empty() {
-        cx.editor.set_error("Debugger is already running");
+    if debugger.is_some() && !editor.debug_adapters.is_empty() {
+        editor.set_error("Debugger is already running");
         return;
     }
-    let origin = view!(cx.editor).id;
+    let origin = view!(editor).id;
     let (buffer_name, header) = match &target {
         TestRun::Go(run) => (go::BUFFER_NAME, go::header(run)),
         TestRun::Dotnet(run) => (dotnet::BUFFER_NAME, dotnet::header(run, debugger.is_some())),
         TestRun::Python(run) => (python::BUFFER_NAME, python::header(run)),
     };
-    let id = result_buffer(cx.editor, buffer_name);
-    replace_output(cx.editor, id, format!("{header}RUNNING\n"));
-    cx.editor.focus(origin);
+    let id = result_buffer(editor, buffer_name);
+    replace_output(editor, id, format!("{header}RUNNING\n"));
+    editor.focus(origin);
     let (cancel, rx) = watch::channel(false);
-    cx.editor.test_cancel = Some(cancel);
-    cx.editor.test_cancel_reason = None;
-    cx.editor.set_status(match debugger {
+    editor.test_cancel = Some(cancel);
+    editor.test_cancel_reason = None;
+    editor.set_status(match debugger {
         Some(_) => format!("Starting {} for the debugger…", target.name()),
         None => format!("Running {}…", target.name()),
     });
-    cx.jobs.callback(async move {
+    crate::job::spawn_callback(async move {
         let result = match &target {
             TestRun::Go(run) => go::run(Path::new("go"), run, rx, go::RUN_TIMEOUT).await,
             TestRun::Dotnet(run) => {

@@ -133,16 +133,29 @@ fn is_root(dir: &Path) -> bool {
     dir.join(".git").exists() || PROJECT_FILES.iter().any(|file| dir.join(file).is_file())
 }
 
-/// The test modules of the project in `dir`: not those of the projects below
-/// it, and not those in virtual environments, caches and build output.
-pub(super) fn test_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_test_files(dir, true, &mut files);
-    files.sort();
+/// The test modules of a project, and whether pytest's `conftest.py` is among
+/// its files.
+#[derive(Default)]
+pub(super) struct ProjectFiles {
+    pub tests: Vec<PathBuf>,
+    pub conftest: bool,
+}
+
+/// The files of the project in `dir`: not those of the projects below it, and
+/// not those in virtual environments, caches and build output. Only those of
+/// `dir` itself unless `below`.
+pub(super) fn project_files(dir: &Path, below: bool) -> ProjectFiles {
+    let mut files = ProjectFiles::default();
+    collect(dir, below, true, &mut files);
+    files.tests.sort();
     files
 }
 
-fn collect_test_files(dir: &Path, root: bool, files: &mut Vec<PathBuf>) {
+pub(super) fn test_files(dir: &Path, below: bool) -> Vec<PathBuf> {
+    project_files(dir, below).tests
+}
+
+fn collect(dir: &Path, below: bool, root: bool, files: &mut ProjectFiles) {
     // A virtual environment holds the tests of the packages installed in it.
     if dir.join("pyvenv.cfg").is_file() || !root && is_root(dir) {
         return;
@@ -153,7 +166,7 @@ fn collect_test_files(dir: &Path, root: bool, files: &mut Vec<PathBuf>) {
             continue;
         };
         let path = entry.path();
-        if kind.is_dir() {
+        if kind.is_dir() && below {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let skipped = name.starts_with('.')
@@ -163,19 +176,21 @@ fn collect_test_files(dir: &Path, root: bool, files: &mut Vec<PathBuf>) {
                     "__pycache__" | "node_modules" | "site-packages" | "build" | "dist"
                 );
             if !skipped {
-                collect_test_files(&path, false, files);
+                collect(&path, below, false, files);
             }
         } else if kind.is_file() && is_test_file(&path) {
-            files.push(path);
+            files.tests.push(path);
+        } else if kind.is_file() && entry.file_name() == "conftest.py" {
+            files.conftest = true;
         }
     }
 }
 
-/// Every test in the test modules below `dir`.
-pub(super) fn tests_below(dir: &Path) -> anyhow::Result<Vec<PythonTest>> {
+/// Every test in the test modules of the project in `dir`; see [`project_files`].
+pub(super) fn project_tests(dir: &Path, below: bool) -> anyhow::Result<Vec<PythonTest>> {
     let grammar = grammar()?;
     let mut tests = Vec::new();
-    for file in test_files(dir) {
+    for file in test_files(dir, below) {
         tests.extend(file_tests(grammar, &file));
     }
     Ok(tests)
@@ -637,9 +652,11 @@ except ImportError:
             "pkg.egg-info/test_egg.py",
             "tests/__pycache__/test_a.cpython-312.py",
         ]);
-        let found: Vec<_> = test_files(dir.path())
-            .into_iter()
-            .map(|file| relative(&file, dir.path()))
+        let files = project_files(dir.path(), true);
+        let found: Vec<_> = files
+            .tests
+            .iter()
+            .map(|file| relative(file, dir.path()))
             .collect();
         assert_eq!(
             found,
@@ -651,6 +668,16 @@ except ImportError:
                 "tests/testing.py",
             ]
         );
+        assert!(!files.conftest);
+        // Outside of a project only the directory itself counts: it may be
+        // the home directory.
+        assert_eq!(
+            test_files(dir.path(), false),
+            [dir.path().join("test_root.py")]
+        );
+        std::fs::write(dir.path().join("pkg/tests/conftest.py"), "").unwrap();
+        assert!(project_files(dir.path(), true).conftest);
+        assert!(!project_files(dir.path(), false).conftest);
     }
 
     #[test]

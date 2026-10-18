@@ -510,19 +510,20 @@ host, so breakpoints in such tests are not hit.
 ###### Python
 
 A Python file belongs to the project in the nearest directory above it that has
-a `pyproject.toml`, `setup.py`, `setup.cfg`, `tox.ini`, `pytest.ini` or
-`pyrightconfig.json`, else to the Git repository, else to its own directory.
-The tests run in that root as `python -m unittest` or `python -m pytest`, with
-the interpreter of the active virtual environment (`VIRTUAL_ENV`), else of the
+a `pyproject.toml`, `setup.py`, `setup.cfg`, `tox.ini`, `pytest.ini`,
+`.pytest.ini` or `pyrightconfig.json`, else to the Git repository. The tests
+run in that root as `python -m unittest` or `python -m pytest`, with the
+interpreter of the active virtual environment (`VIRTUAL_ENV`), else of the
 nearest `.venv` above the tests, else `python3`. The workspace whose buffers
-have to be saved is the root.
+have to be saved is the root. A file outside of any project and repository has
+the test modules of its own directory, and none below it.
 
 pytest runs the tests when the project sets it up (`pytest.ini`, a
 `[tool.pytest…]` table in `pyproject.toml`, `[tool:pytest]` in `setup.cfg`,
-`[pytest]` in `tox.ini`, or a `conftest.py` between the tests and the root) or
-when a test module of the project imports pytest or declares a test that only
-pytest runs. Otherwise unittest runs them. pytest runs tests written for
-unittest as well.
+`[pytest]` in `tox.ini`, or a `conftest.py` anywhere in the project) or when a
+test module of the project imports pytest or declares a test that only pytest
+runs. Otherwise unittest runs them. pytest runs tests written for unittest as
+well. Reading the project to decide this happens in the background.
 
 Tests are found by parsing the project's test modules (`test*.py` and
 `*_test.py`, apart from virtual environments, build output and the projects
@@ -536,10 +537,10 @@ all of its parameters and subtests, or a class with all of its tests:
 - `Space t t` lists the tests of the project, with a preview.
 - `Space t n` runs the function or method around the cursor. Elsewhere in a
   test class it runs the class, and the output says so.
-- `Space t p` runs the tests of the focused file's directory as the runner finds
-  them there (`python -m unittest discover -s <directory>`,
-  `python -m pytest <directory>`): those of the package and its subpackages, or
-  of the directory alone when it is not a package.
+- `Space t p` runs the tests below the focused file's directory as the runner
+  finds them there: `python -m unittest discover -s <directory>`, which also
+  looks in the packages below it, or `python -m pytest <directory>`, which
+  looks in every directory below it.
 
 unittest selects a test by its name, `test_calc.CalcTests.test_add`. It imports
 the module from the first directory above it that is not a package, which goes
@@ -554,8 +555,8 @@ In the `[python-test]` buffer, `Space t f` understands:
 - A result (`test_add (test_calc.CalcTests.test_add) ... FAIL`,
   `tests/test_calc.py::test_add FAILED`) and the heading of a failure open the
   declaration of the test. A module that could not be imported opens the module.
-  The picker of every location leaves out the frames of the interpreter and of
-  installed packages.
+  The picker of every location leaves out the frames of the interpreter's
+  standard library and of installed packages.
 
 The result line counts what the runner counts. For unittest that is the
 failures, errors and skips, and the tests that ran: `FAILED (1 failure,
