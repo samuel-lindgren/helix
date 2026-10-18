@@ -335,10 +335,13 @@ impl Client {
     ) -> impl Future<Output = Result<()>> {
         let server_tx = self.server_tx.clone();
         let command = command.to_string();
+        // Replies are numbered with the requests: both are messages of the client.
+        let seq = self.next_request_id();
 
         async move {
             let response = match result {
                 Ok(result) => Response {
+                    seq,
                     request_seq,
                     command,
                     success: true,
@@ -346,6 +349,7 @@ impl Client {
                     body: Some(result),
                 },
                 Err(error) => Response {
+                    seq,
                     request_seq,
                     command,
                     success: false,
@@ -579,6 +583,68 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    use crate::{registry::DebugAdapterId, Payload};
+
+    /// The next message the client sends, as the adapter reads it.
+    async fn sent(adapter: &mut BufReader<tokio::io::DuplexStream>) -> Value {
+        let mut length = 0;
+        loop {
+            let mut header = String::new();
+            adapter.read_line(&mut header).await.unwrap();
+            match header.trim().strip_prefix("Content-Length: ") {
+                Some(value) => length = value.parse().unwrap(),
+                None if header.trim().is_empty() => break,
+                None => {}
+            }
+        }
+        let mut body = vec![0; length];
+        adapter.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn replies_to_the_adapter_are_numbered_as_messages_of_the_client() {
+        let (client_end, adapter_end) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(client_end);
+        let (client, _incoming) = super::Client::streams(
+            Box::new(BufReader::new(read)),
+            Box::new(write),
+            None,
+            DebugAdapterId::default(),
+            None,
+        )
+        .unwrap();
+        let mut adapter = BufReader::new(adapter_end);
+        // A request goes out when its future runs; no response comes.
+        tokio::spawn(client.call::<crate::requests::Threads>(None));
+        assert_eq!(sent(&mut adapter).await["seq"], 1);
+        client
+            .reply(7, "runInTerminal", Ok(json!({ "processId": 42 })))
+            .await
+            .unwrap();
+        let reply = sent(&mut adapter).await;
+        assert_eq!(reply["type"], "response");
+        assert_eq!(reply["seq"], 2);
+        assert_eq!(reply["request_seq"], 7);
+        assert_eq!(reply["success"], true);
+        assert_eq!(reply["body"]["processId"], 42);
+    }
+
+    #[test]
+    fn responses_without_seq_are_read() {
+        let payload: Payload = serde_json::from_value(json!({
+            "type": "response",
+            "request_seq": 3,
+            "success": true,
+            "command": "threads",
+        }))
+        .unwrap();
+        assert!(matches!(payload, Payload::Response(response) if response.request_seq == 3));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn adapter_runs_in_its_own_session() {
