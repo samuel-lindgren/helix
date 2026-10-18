@@ -323,14 +323,14 @@ This layer is a kludge of mappings, mostly pickers.
 ##### Test mode
 
 Runs tests without a debugger: Go tests with `go test`, .NET tests with
-`dotnet test`. The file in the focused view decides which. The tool must be on
-`PATH`.
+`dotnet test`, Python tests with unittest or pytest. The file in the focused
+view decides which. The tool must be on `PATH`.
 
 | Key | Description | Command |
 | --- | --- | --- |
 | `t` | Select and run a test | `test_picker` |
 | `n` | Run the test at the cursor | `test_nearest` |
-| `p` | Run all tests in the current Go package or .NET project | `test_package` |
+| `p` | Run all tests in the current Go package, .NET project or Python directory | `test_package` |
 | `l` | Rerun the last started test selection | `test_last` |
 | `r` | Show retained test output | `test_results` |
 | `f` | Go to the source or test on an output line, or pick one | `test_locations` |
@@ -340,7 +340,7 @@ The corresponding typed commands are `:test`, `:test-nearest`, `:test-package`, 
 `:test-results`, `:test-locations`, and `:test-cancel`. The commands were named `go_test_…` and
 `:go-test…` before; those names still work.
 
-The output buffer (`[go-test]` or `[dotnet-test]`) opens in a split while the
+The output buffer (`[go-test]`, `[dotnet-test]` or `[python-test]`) opens in a split while the
 source keeps focus. It shows the selected test, package or project, command,
 result and test/build output after completion. Its contents remain available
 until the next run or until you close the buffer. Reported line numbers
@@ -506,6 +506,65 @@ Such a template has `request = "attach"`, the process id as its only argument
 `"dotnet-test-project"` as its first parameter. xUnit v3 runs its tests in a
 process of their own that the test host starts; the debugger is attached to the
 host, so breakpoints in such tests are not hit.
+
+###### Python
+
+A Python file belongs to the project in the nearest directory above it that has
+a `pyproject.toml`, `setup.py`, `setup.cfg`, `tox.ini`, `pytest.ini`,
+`.pytest.ini` or `pyrightconfig.json`, else to the Git repository. The tests
+run in that root as `python -m unittest` or `python -m pytest`, with the
+interpreter of the active virtual environment (`VIRTUAL_ENV`), else of the
+nearest `.venv` above the tests, else `python3`. The workspace whose buffers
+have to be saved is the root. A file outside of any project and repository has
+the test modules of its own directory, and none below it.
+
+pytest runs the tests when the project sets it up (`pytest.ini`, a
+`[tool.pytest…]` table in `pyproject.toml`, `[tool:pytest]` in `setup.cfg`,
+`[pytest]` in `tox.ini`, or a `conftest.py` anywhere in the project) or when a
+test module of the project imports pytest or declares a test that only pytest
+runs. Otherwise unittest runs them. pytest runs tests written for unittest as
+well. Reading the project to decide this happens in the background.
+
+Tests are found by parsing the project's test modules (`test*.py` and
+`*_test.py`, apart from virtual environments, build output and the projects
+below the root), which requires the Python grammar. A test is a method named
+`test…` of a class that derives from a base class, such as `unittest.TestCase`
+or a subclass of it in the project. For pytest it is also a function named
+`test…` of a module, or a method of a class named `Test…` that has no
+`__init__`, nested classes included. The unit of selection is a function, with
+all of its parameters and subtests, or a class with all of its tests:
+
+- `Space t t` lists the tests of the project, with a preview.
+- `Space t n` runs the function or method around the cursor. Elsewhere in a
+  test class it runs the class, and the output says so.
+- `Space t p` runs the tests below the focused file's directory as the runner
+  finds them there: `python -m unittest discover -s <directory>`, which also
+  looks in the packages below it, or `python -m pytest <directory>`, which
+  looks in every directory below it.
+
+unittest selects a test by its name, `test_calc.CalcTests.test_add`. It imports
+the module from the first directory above it that is not a package, which goes
+on `PYTHONPATH` unless it is the root. pytest selects a test by its node id,
+`tests/test_calc.py::CalcTests::test_add`.
+
+In the `[python-test]` buffer, `Space t f` understands:
+
+- A frame of a traceback (`File "/path/test_calc.py", line 12, in test_add`)
+  and pytest's place of a failure (`tests/test_calc.py:12: AssertionError`) open
+  that line.
+- A result (`test_add (test_calc.CalcTests.test_add) ... FAIL`,
+  `tests/test_calc.py::test_add FAILED`) and the heading of a failure open the
+  declaration of the test. A module that could not be imported opens the module.
+  The picker of every location leaves out the frames of the interpreter's
+  standard library and of installed packages.
+
+The result line counts what the runner counts. For unittest that is the
+failures, errors and skips, and the tests that ran: `FAILED (1 failure,
+1 skipped; 4 ran)`. For pytest it is its own summary: `FAILED (1 failed,
+3 passed)`. A selection that matched nothing is not run, and a run in which
+nothing passed is skipped. The whole command is limited to ten minutes; there
+is no limit per test. Processes that the tests started and left running are
+stopped with the run.
 
 ##### Popup
 

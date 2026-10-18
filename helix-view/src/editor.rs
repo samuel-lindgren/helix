@@ -1224,11 +1224,38 @@ pub struct DotnetTestRun {
     pub selection_note: Option<String>,
 }
 
+/// The module that runs a project's Python tests: `python -m unittest` or `python -m pytest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonTestRunner {
+    Unittest,
+    Pytest,
+}
+
+/// A Python test selection admitted to the runner. Kept only for this editor session.
+#[derive(Debug, Clone)]
+pub struct PythonTestRun {
+    /// The root of the project, which the tests run in.
+    pub root: PathBuf,
+    /// The directory of the selected tests. The project's interpreter is the
+    /// one of the nearest virtual environment above it.
+    pub directory: PathBuf,
+    pub runner: PythonTestRunner,
+    /// What follows `python -m <runner>`.
+    pub args: Vec<String>,
+    /// Directories that the selected test modules are imported from, which go
+    /// on PYTHONPATH.
+    pub import_paths: Vec<PathBuf>,
+    /// The name of the test as the runner reports it, or a display label.
+    pub name: String,
+    pub selection_note: Option<String>,
+}
+
 /// What the test runner was asked to run, in the terms of the language's own tool.
 #[derive(Debug, Clone)]
 pub enum TestRun {
     Go(GoTestRun),
     Dotnet(DotnetTestRun),
+    Python(PythonTestRun),
 }
 
 impl TestRun {
@@ -1236,6 +1263,7 @@ impl TestRun {
         match self {
             Self::Go(run) => &run.name,
             Self::Dotnet(run) => &run.name,
+            Self::Python(run) => &run.name,
         }
     }
 
@@ -1244,6 +1272,7 @@ impl TestRun {
         match self {
             Self::Go(run) => &run.workspace,
             Self::Dotnet(run) => &run.workspace,
+            Self::Python(run) => &run.root,
         }
     }
 }
