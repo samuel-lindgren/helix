@@ -300,6 +300,7 @@ impl Transport {
                             }
                         }
                     }
+                    break;
                 }
             }
         }

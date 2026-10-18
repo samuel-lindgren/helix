@@ -227,7 +227,7 @@ Jumps to various locations.
 | `c`   | Go to the middle of the screen                   | `goto_window_center`       |
 | `b`   | Go to the bottom of the screen                   | `goto_window_bottom`       |
 | `d`   | Go to definition (**LSP**)                       | `goto_definition`          |
-| `T`   | Go to corresponding test (Go, C#)                | `goto_corresponding_test`  |
+| `T`   | Go to corresponding test (Go, C#, Python)        | `goto_corresponding_test`  |
 | `y`   | Go to type definition (**LSP**)                  | `goto_type_definition`     |
 | `r`   | Go to references (**LSP**)                       | `goto_reference`           |
 | `i`   | Go to implementation (**LSP**)                   | `goto_implementation`      |
@@ -565,6 +565,47 @@ failures, errors and skips, and the tests that ran: `FAILED (1 failure,
 nothing passed is skipped. The whole command is limited to ten minutes; there
 is no limit per test. Processes that the tests started and left running are
 stopped with the run.
+
+`g T` goes the other way round, from code to its tests: from a module, or from
+a class, function or method in it, to the tests written for it. On a use of
+it, the language server says where it is declared; without one, the
+declaration around the cursor counts. Only names tie tests to code. The tests
+of `calc.py` are the test modules `test_calc.py`, `tests_calc.py`,
+`calc_test.py` and `calc_tests.py`, else those named after a part of it, such
+as `test_calc_paths.py`. The tests of a class `Calc` are the classes
+`TestCalc`, `CalcTests`, `CalcTest`, `CalcTestCase` or the like, in any test
+module of the project. The tests of a function or method `add` are those whose
+names contain `add` as a word: `test_add`, `test_add_twice`, `test_calc_add`,
+`testAdd`, but not `test_address`. For a method or class, the tests in the
+class's test classes come first, else those classes, else the tests in the
+module's test modules that name the method or class, else those modules. For a
+function, the module's tests that name it come first, else the tests named
+exactly after it (`test_add`) anywhere in the project, else the module's test
+modules. Several matches are listed in a picker.
+
+To run Python tests under the debugger, launch a debug target (`Space G l`) in a
+Python file and choose the template `test-func`, which lists the tests of the
+project as `Space t t` does, or `test`, which takes the tests below the file's
+directory as `Space t p` does. The run is the one described above, with one
+difference: debugpy starts it, in a terminal that the editor provides (the
+debug adapter's `runInTerminal` request), and the output still arrives in the
+`[python-test]` buffer. Breakpoints in the tests and in the code they call are
+hit. The results arrive when the run is done, and a debugged run has no time
+limit.
+
+- `Space G R` (rerun last debug target) runs the same selection under the
+  debugger again. `Space t l` runs it without one.
+- Ending the debug session ends the tests, and the run fails with it.
+  `Space t c` cancels the run, and the debug session ends with it.
+- If the debugger cannot start the tests, the run ends and says why.
+
+Such a template has `request = "launch"` and `completion = "python-test-function"`
+or `"python-test-package"` as its first parameter. The run sets `module`,
+`args`, `cwd`, `env` (`PYTHONPATH`, `PYTHONUNBUFFERED`), `console =
+"integratedTerminal"` and `redirectOutput = false` in its arguments; the others,
+such as `justMyCode`, are the template's. The interpreter is the template's
+`python`, else the one the run uses without the debugger. The default
+configuration starts debugpy as `python3 -m debugpy.adapter`.
 
 ##### Popup
 

@@ -215,6 +215,13 @@ fn debug_output_prefix(category: Option<&str>) -> Option<(String, bool)> {
 }
 
 impl Editor {
+    /// Whether the debug session is that of a test run.
+    fn debugging_test(&self) -> bool {
+        self.last_debug_launch
+            .as_ref()
+            .is_some_and(|launch| launch.test.is_some())
+    }
+
     pub async fn handle_debugger_message(
         &mut self,
         id: DebugAdapterId,
@@ -470,9 +477,12 @@ impl Editor {
                             Some(Value::Bool(false)) | None => {
                                 self.debug_adapters.remove_client(id);
                                 self.debug_adapters.unset_active_client();
-                                self.set_status(
-                                    "Terminated debugging session and disconnected debugger.",
-                                );
+                                // A test run says how it ended once it has.
+                                if !self.debugging_test() {
+                                    self.set_status(
+                                        "Terminated debugging session and disconnected debugger.",
+                                    );
+                                }
 
                                 // Go through all breakpoints and set verfified to false
                                 // this should update the UI to show the breakpoints are no longer connected
@@ -510,7 +520,8 @@ impl Editor {
                     }
                     Event::Exited(resp) => {
                         let exit_code = resp.exit_code;
-                        if exit_code != 0 {
+                        // Tests that fail make the program of a test run fail.
+                        if exit_code != 0 && !self.debugging_test() {
                             self.set_error(format!(
                                 "Debuggee failed to exit successfully (exit code: {exit_code})."
                             ));
@@ -534,6 +545,23 @@ impl Editor {
             Payload::Response(_) => unreachable!(),
             Payload::Request(request) => {
                 let reply = match Request::parse(&request.command, request.arguments) {
+                    // The program of a debugged test run is the test runner's.
+                    Ok(Request::RunInTerminal(arguments))
+                        if self
+                            .test_terminal
+                            .as_ref()
+                            .is_some_and(|terminal| terminal.adapter == id) =>
+                    {
+                        let terminal = self.test_terminal.take().unwrap();
+                        (terminal.start)(&arguments)
+                            .map(|pid| {
+                                json!(dap::requests::RunInTerminalResponse {
+                                    process_id: Some(pid),
+                                    shell_process_id: None,
+                                })
+                            })
+                            .map_err(dap::Error::Other)
+                    }
                     Ok(Request::RunInTerminal(arguments)) => {
                         let config = self.config();
                         let Some(config) = config.terminal.as_ref() else {

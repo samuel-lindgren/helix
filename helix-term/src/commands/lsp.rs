@@ -33,7 +33,14 @@ use crate::{
     ui::{self, overlay::overlaid, FileLocation, Picker, Popup, PromptEvent},
 };
 
-use std::{cmp::Ordering, collections::HashSet, fmt::Display, fs, future::Future, path::Path};
+use std::{
+    cmp::Ordering,
+    collections::HashSet,
+    fmt::Display,
+    fs,
+    future::Future,
+    path::{Path, PathBuf},
+};
 
 /// Gets the first language server that is attached to a document which supports a specific feature.
 /// If there is no configured language server that supports the feature, this displays a status message.
@@ -1250,10 +1257,36 @@ pub fn goto_implementation(cx: &mut Context) {
     );
 }
 
-/// The tests of the C# type or member that the cursor is on or in. On a use
-/// of it, a language server says where it is declared; without one, the
-/// declaration around the cursor is what counts.
-fn goto_corresponding_dotnet_test(cx: &mut Context) {
+/// How a language finds the tests of the declaration at a byte of a source
+/// file: what it looked for, and the file and line of each test.
+type CorrespondingTests = fn(&Path, &str, usize) -> anyhow::Result<(String, Vec<(PathBuf, usize)>)>;
+
+fn dotnet_corresponding_tests(
+    file: &Path,
+    source: &str,
+    byte: usize,
+) -> anyhow::Result<(String, Vec<(PathBuf, usize)>)> {
+    let (subject, tests) = super::test::dotnet::corresponding_tests(file, source, byte)?;
+    let tests = tests
+        .into_iter()
+        .map(|test| (test.file, test.line))
+        .collect();
+    Ok((subject.to_string(), tests))
+}
+
+fn python_corresponding_tests(
+    file: &Path,
+    source: &str,
+    byte: usize,
+) -> anyhow::Result<(String, Vec<(PathBuf, usize)>)> {
+    let (subject, tests) = super::test::python::corresponding_tests(file, source, byte)?;
+    Ok((subject.to_string(), tests))
+}
+
+/// The tests of what the cursor is on or in, which only names tie to it. On
+/// a use of it, a language server says where it is declared; without one,
+/// the declaration around the cursor is what counts.
+fn goto_corresponding_test_by_name(cx: &mut Context, find: CorrespondingTests) {
     let (view, doc) = current_ref!(cx.editor);
     let Some(path) = doc.path().cloned() else {
         cx.editor
@@ -1308,7 +1341,7 @@ fn goto_corresponding_dotnet_test(cx: &mut Context) {
                 Some((file, source, byte))
             });
             let (file, source, byte) = declaration.unwrap_or((path, text, cursor));
-            super::test::dotnet::corresponding_tests(&file, &source, byte)
+            find(&file, &source, byte)
         })
         .await?;
 
@@ -1320,10 +1353,10 @@ fn goto_corresponding_dotnet_test(cx: &mut Context) {
             Ok((_, tests)) => {
                 let locations = tests
                     .into_iter()
-                    .map(|test| {
-                        let line = lsp::Position::new(test.line as u32, 0);
+                    .map(|(file, line)| {
+                        let line = lsp::Position::new(line as u32, 0);
                         Location {
-                            uri: test.file.into(),
+                            uri: file.into(),
                             range: lsp::Range::new(line, line),
                             offset_encoding: OffsetEncoding::default(),
                         }
@@ -1339,13 +1372,14 @@ fn goto_corresponding_dotnet_test(cx: &mut Context) {
 pub fn goto_corresponding_test(cx: &mut Context) {
     let (view, doc) = current_ref!(cx.editor);
 
-    if doc.language_name() == Some("c-sharp") {
-        goto_corresponding_dotnet_test(cx);
-        return;
+    match doc.language_name() {
+        Some("c-sharp") => return goto_corresponding_test_by_name(cx, dotnet_corresponding_tests),
+        Some("python") => return goto_corresponding_test_by_name(cx, python_corresponding_tests),
+        _ => {}
     }
     if doc.language_id() != Some("go") {
         cx.editor
-            .set_error("Go to corresponding test is only available for Go and C# files");
+            .set_error("Go to corresponding test is only available for Go, C# and Python files");
         return;
     }
 
