@@ -28,6 +28,7 @@ use crate::{
 
 mod discovery;
 
+pub(in crate::commands) use discovery::module_of;
 use discovery::{relative, PythonTest};
 
 pub(super) const BUFFER_NAME: &str = "[python-test]";
