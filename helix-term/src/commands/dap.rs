@@ -315,6 +315,7 @@ pub fn dap_start_impl(
             test: None,
         },
     )
+    .map(|_| ())
 }
 
 /// Attaches the debugger of a template to the process that a test run has
@@ -333,6 +334,40 @@ pub(super) fn attach_to_test(
         bail!("Debugger is already running");
     }
     let resolved = resolve_debug_launch(&config, Some(template), Some(&[pid.to_string()]))?;
+    start_debug_launch(
+        editor,
+        LastDebugLaunch {
+            config,
+            template_name: resolved.template_name,
+            request_type: resolved.request_type,
+            socket: None,
+            args: resolved.args,
+            test: Some(test),
+        },
+    )
+    .map(|_| ())
+}
+
+/// Launches the program of a test run under the debugger of a template:
+/// the run adds what it runs to the template's arguments, and the debug
+/// adapter starts it.
+pub(super) fn launch_test(
+    editor: &mut Editor,
+    config: DebugAdapterConfig,
+    template: &str,
+    test: TestRun,
+    add: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<dap::registry::DebugAdapterId, anyhow::Error> {
+    if !editor.debug_adapters.is_empty() {
+        bail!("Debugger is already running");
+    }
+    let mut resolved = resolve_debug_launch(&config, Some(template), None)?;
+    if resolved.request_type != "launch" {
+        bail!("The template '{template}' has to launch the tests (request = \"launch\")");
+    }
+    if let Value::Object(args) = &mut resolved.args {
+        add(args);
+    }
     start_debug_launch(
         editor,
         LastDebugLaunch {
@@ -386,7 +421,10 @@ fn resolve_debug_launch(
     })
 }
 
-fn start_debug_launch(editor: &mut Editor, launch: LastDebugLaunch) -> Result<(), anyhow::Error> {
+fn start_debug_launch(
+    editor: &mut Editor,
+    launch: LastDebugLaunch,
+) -> Result<dap::registry::DebugAdapterId, anyhow::Error> {
     match launch.request_type.as_str() {
         "launch" | "attach" => {}
         request => bail!("Unsupported request '{}'", request),
@@ -415,7 +453,7 @@ fn start_debug_launch(editor: &mut Editor, launch: LastDebugLaunch) -> Result<()
     match launch.request_type.as_str() {
         "launch" => {
             let call = debugger.launch(args);
-            dap_start_callback(id, "launch".to_owned(), call, false);
+            dap_start_callback(id, "launch".to_owned(), call, launch.test.is_some());
         }
         "attach" => {
             let call = debugger.attach(args);
@@ -424,7 +462,7 @@ fn start_debug_launch(editor: &mut Editor, launch: LastDebugLaunch) -> Result<()
         _ => unreachable!("validated request type"),
     };
 
-    Ok(())
+    Ok(id)
 }
 
 fn prepare_dap_params(template: &DebugTemplate, params: &[String]) -> Vec<String> {
@@ -808,6 +846,18 @@ pub fn dap_launch(cx: &mut Context) {
                     template: template.name.clone(),
                 };
                 super::test::debug_dotnet(cx, kind == "dotnet-test-project", debugger);
+                return;
+            }
+            // debugpy starts a Python test run's program itself, through the
+            // editor, and the test runner takes the process over.
+            if let Some(kind @ ("python-test-function" | "python-test-package")) =
+                first_completion_kind
+            {
+                let debugger = TestDebugger {
+                    config: adapter.clone(),
+                    template: template.name.clone(),
+                };
+                super::test::debug_python(cx, kind == "python-test-package", debugger);
                 return;
             }
             if first_completion_kind == Some("go-test-function") {

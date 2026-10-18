@@ -9,14 +9,15 @@ use std::{
 };
 
 use helix_core::{syntax::config::DebugAdapterConfig, Selection, Transaction};
+use helix_dap::{registry::DebugAdapterId, requests::RunInTerminalArguments};
 use helix_view::{
-    editor::{Action, TestRun},
+    editor::{Action, TestRun, TestTerminal},
     DocumentId, Editor,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
-    sync::watch,
+    sync::{oneshot, watch},
 };
 
 use super::Context;
@@ -126,7 +127,7 @@ pub(super) fn pick(cx: &mut compositor::Context) {
     match language(cx.editor) {
         Some(Language::Go) => go::pick(cx),
         Some(Language::Dotnet) => dotnet::pick(cx, None),
-        Some(Language::Python) => python::pick(cx),
+        Some(Language::Python) => python::pick(cx, None),
         None => cx.editor.set_error(UNSUPPORTED),
     }
 }
@@ -135,7 +136,7 @@ pub(super) fn package(cx: &mut compositor::Context) {
     match language(cx.editor) {
         Some(Language::Go) => go::package(cx),
         Some(Language::Dotnet) => dotnet::package(cx, None),
-        Some(Language::Python) => python::package(cx),
+        Some(Language::Python) => python::package(cx, None),
         None => cx.editor.set_error(UNSUPPORTED),
     }
 }
@@ -155,6 +156,16 @@ pub(super) fn debug_dotnet(cx: &mut compositor::Context, project: bool, debugger
         dotnet::package(cx, Some(debugger));
     } else {
         dotnet::pick(cx, Some(debugger));
+    }
+}
+
+/// A Python test under the debugger: the tests of the focused file's
+/// directory, or what is chosen from the project's tests.
+pub(super) fn debug_python(cx: &mut compositor::Context, directory: bool, debugger: Debugger) {
+    if directory {
+        python::package(cx, Some(debugger));
+    } else {
+        python::pick(cx, Some(debugger));
     }
 }
 
@@ -275,11 +286,23 @@ fn start_in(editor: &mut Editor, target: TestRun, debugger: Option<Debugger>) {
         editor.set_error("Debugger is already running");
         return;
     }
+    // debugpy starts the program of a Python test run itself.
+    let launched = match (&target, &debugger) {
+        (TestRun::Python(_), Some(debugger)) => match launch(editor, &target, debugger) {
+            Ok(launched) => Some(launched),
+            Err(err) => {
+                editor.set_error(format!("Could not start the debugger: {err}"));
+                return;
+            }
+        },
+        _ => None,
+    };
+    let adapter = launched.as_ref().map(|launched| launched.adapter);
     let origin = view!(editor).id;
     let (buffer_name, header) = match &target {
         TestRun::Go(run) => (go::BUFFER_NAME, go::header(run)),
         TestRun::Dotnet(run) => (dotnet::BUFFER_NAME, dotnet::header(run, debugger.is_some())),
-        TestRun::Python(run) => (python::BUFFER_NAME, python::header(run)),
+        TestRun::Python(run) => (python::BUFFER_NAME, python::header(run, debugger.is_some())),
     };
     let id = result_buffer(editor, buffer_name);
     replace_output(editor, id, format!("{header}RUNNING\n"));
@@ -303,10 +326,19 @@ fn start_in(editor: &mut Editor, target: TestRun, debugger: Option<Debugger>) {
                 };
                 dotnet::run(Path::new("dotnet"), run, rx, deadline, attach).await
             }
-            TestRun::Python(run) => python::run(run, rx, python::RUN_TIMEOUT).await,
+            TestRun::Python(run) => match launched {
+                // Time at a breakpoint is not time the tests take.
+                Some(launched) => {
+                    python::run_launched(run, launched.started, rx, DEBUG_TIMEOUT).await
+                }
+                None => python::run(run, rx, python::RUN_TIMEOUT).await,
+            },
         };
         Ok(Callback::Editor(Box::new(move |editor| {
             editor.test_cancel = None;
+            if let Some(adapter) = adapter.filter(|_| !result.started) {
+                stop_debugger(editor, adapter);
+            }
             let status = match editor.test_cancel_reason.take() {
                 Some(reason) if result.status == CANCELLED => format!("{CANCELLED}: {reason}"),
                 _ => result.status,
@@ -539,36 +571,102 @@ fn merged_output(command: &mut Command) -> std::io::Result<tokio::fs::File> {
     Ok(tokio::fs::File::from_std(reader))
 }
 
-/// Runs the command to its end, to cancellation or to the deadline, whichever
-/// comes first, and stops its whole process group, unless `leftovers` keeps
-/// what a tool that has exited left running. Fails only when the process
-/// cannot be started. `seen` follows the standard output as it arrives.
-async fn execute(
-    mut command: Command,
-    mut cancel: watch::Receiver<bool>,
-    deadline: Duration,
-    streams: Streams,
-    leftovers: Leftovers,
-    seen: impl FnMut(&[u8]),
-) -> std::io::Result<Execution> {
+/// A started test process and the reading ends of its output.
+struct Spawned {
+    child: tokio::process::Child,
+    group: ProcessGroup,
+    merged: Option<tokio::fs::File>,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+}
+
+/// What of the editor's terminal the processes of a run have.
+#[derive(Clone, Copy)]
+enum Session {
+    /// The editor's session: a process group of their own in it.
+    Shared,
+    /// A session of their own, without the terminal. debugpy's launcher makes
+    /// the program it starts the foreground process group of the terminal it
+    /// finds, and the editor would stop receiving keys.
+    Own,
+}
+
+/// Starts the command in a process group of its own, with its output on pipes.
+fn spawn(mut command: Command, streams: Streams, session: Session) -> std::io::Result<Spawned> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(not(unix))]
+    let _ = session;
     #[cfg(unix)]
-    command.process_group(0);
+    match session {
+        Session::Shared => {
+            command.process_group(0);
+        }
+        // SAFETY: setsid is async-signal-safe, which is all `pre_exec` requires.
+        // A session is a process group of the same id as well.
+        Session::Own => unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        },
+    }
     let merged = match streams {
         Streams::Separate => None,
         Streams::Merged => Some(merged_output(&mut command)?),
     };
     let mut child = command.spawn()?;
-    let mut group = ProcessGroup(child.id());
+    let group = ProcessGroup(child.id());
     // The command holds the writing ends of a merged pipe, which would keep
     // it open after the process has gone.
     drop(command);
-    let (mut out, mut err) = (Kept::default(), Kept::default());
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    Ok(Spawned {
+        child,
+        group,
+        merged,
+        stdout,
+        stderr,
+    })
+}
+
+/// Runs the command to its end, to cancellation or to the deadline, whichever
+/// comes first, and stops its whole process group, unless `leftovers` keeps
+/// what a tool that has exited left running. Fails only when the process
+/// cannot be started. `seen` follows the standard output as it arrives.
+async fn execute(
+    command: Command,
+    cancel: watch::Receiver<bool>,
+    deadline: Duration,
+    streams: Streams,
+    leftovers: Leftovers,
+    seen: impl FnMut(&[u8]),
+) -> std::io::Result<Execution> {
+    let spawned = spawn(command, streams, Session::Shared)?;
+    Ok(follow(spawned, cancel, deadline, leftovers, seen).await)
+}
+
+/// Follows a started process as [`execute`] does.
+async fn follow(
+    spawned: Spawned,
+    mut cancel: watch::Receiver<bool>,
+    deadline: Duration,
+    leftovers: Leftovers,
+    seen: impl FnMut(&[u8]),
+) -> Execution {
+    let Spawned {
+        mut child,
+        mut group,
+        merged,
+        stdout,
+        stderr,
+    } = spawned;
+    let (mut out, mut err) = (Kept::default(), Kept::default());
     let output = async {
         match (merged, stdout, stderr) {
             (Some(merged), ..) => capture(merged, &mut out, seen).await,
@@ -600,12 +698,117 @@ async fn execute(
         let _ = child.kill().await;
     }
     let ((stdout, cut_out), (stderr, cut_err)) = (out.finish(), err.finish());
-    Ok(Execution {
+    Execution {
         exit,
         stdout,
         stderr,
         truncated: cut_out || cut_err,
-    })
+    }
+}
+
+/// How long a debug adapter may take to start the program of a test run.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits for the program that a debug adapter starts for a test run, then
+/// follows it as [`execute`] does. The reason instead, when no program came.
+async fn follow_launched(
+    started: oneshot::Receiver<Spawned>,
+    mut cancel: watch::Receiver<bool>,
+    deadline: Duration,
+    leftovers: Leftovers,
+    seen: impl FnMut(&[u8]),
+) -> Result<Execution, String> {
+    let started = tokio::select! {
+        biased;
+        _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => {
+            return Err(CANCELLED.to_owned())
+        }
+        started = tokio::time::timeout(LAUNCH_TIMEOUT, started) => started,
+    };
+    match started {
+        Ok(Ok(spawned)) => Ok(follow(spawned, cancel, deadline, leftovers, seen).await),
+        Ok(Err(_)) => Err("COULD NOT START: the debugger did not start the tests".into()),
+        Err(_) => Err("TIMED OUT: the debugger did not start the tests".into()),
+    }
+}
+
+/// The command a debug adapter asks the editor to run in a terminal.
+fn requested(arguments: &RunInTerminalArguments) -> anyhow::Result<Command> {
+    let (program, args) = arguments
+        .args
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("the debug adapter named no program to start"))?;
+    let mut command = Command::new(program);
+    command.args(args);
+    if !arguments.cwd.is_empty() {
+        command.current_dir(&arguments.cwd);
+    }
+    for (name, value) in arguments.env.iter().flatten() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    Ok(command)
+}
+
+/// The program of a debugged test run, which its debug adapter starts.
+struct Launched {
+    adapter: DebugAdapterId,
+    started: oneshot::Receiver<Spawned>,
+}
+
+/// Starts the debugger on a Python test run: debugpy starts the runner
+/// itself, in a terminal that the editor provides, and the run takes the
+/// process over with its output.
+fn launch(editor: &mut Editor, target: &TestRun, debugger: &Debugger) -> anyhow::Result<Launched> {
+    let TestRun::Python(run) = target else {
+        anyhow::bail!("Only the debugger of a Python test starts the tests");
+    };
+    let adapter = super::dap::launch_test(
+        editor,
+        debugger.config.clone(),
+        &debugger.template,
+        target.clone(),
+        |args| python::debug_args(run, args),
+    )?;
+    let (tx, started) = oneshot::channel();
+    editor.test_terminal = Some(TestTerminal {
+        adapter,
+        start: Box::new(move |arguments| {
+            let spawned = spawn(requested(arguments)?, Streams::Merged, Session::Own)?;
+            let pid = spawned
+                .child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("the tests exited at once"))?;
+            // The run may have been cancelled meanwhile; the process then goes.
+            let _ = tx.send(spawned);
+            Ok(pid)
+        }),
+    });
+    Ok(Launched { adapter, started })
+}
+
+/// Ends the debug session of a run that its program never came to.
+fn stop_debugger(editor: &mut Editor, adapter: DebugAdapterId) {
+    if editor
+        .test_terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.adapter == adapter)
+    {
+        editor.test_terminal = None;
+    }
+    if editor.debug_adapters.get_client(adapter).is_some() {
+        if editor
+            .debug_adapters
+            .get_active_client()
+            .is_some_and(|client| client.id() == adapter)
+        {
+            editor.debug_adapters.unset_active_client();
+        }
+        // The adapter's process goes with it.
+        editor.debug_adapters.remove_client(adapter);
+    }
 }
 
 /// The child of a syntax node in the field of that name.
@@ -741,17 +944,22 @@ mod harness {
     }
 
     pub(in crate::commands::test) fn test_app(path: &Path) -> Application {
+        app_with_languages(path, |_| {})
+    }
+
+    /// An editor with a language configuration of its own.
+    pub(in crate::commands::test) fn app_with_languages(
+        path: &Path,
+        edit: impl FnOnce(&mut toml::Value),
+    ) -> Application {
         let mut args = Args::default();
         args.files
             .insert(path.to_owned(), vec![helix_core::Position::new(0, 0)]);
         let mut config = Config::default();
         config.editor.lsp.enable = false;
-        let syntax = helix_core::syntax::Loader::new(
-            helix_loader::config::default_lang_config()
-                .try_into()
-                .unwrap(),
-        )
-        .unwrap();
+        let mut languages = helix_loader::config::default_lang_config();
+        edit(&mut languages);
+        let syntax = helix_core::syntax::Loader::new(languages.try_into().unwrap()).unwrap();
         Application::new(args, config, syntax).unwrap()
     }
 
@@ -804,6 +1012,39 @@ mod harness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session of a started process: the field after the process group
+    /// in `/proc/<pid>/stat`, which `ps -o sid` shows.
+    #[cfg(target_os = "linux")]
+    async fn session_of(session: Session) -> (u32, String) {
+        let mut command = Command::new("cat");
+        command.arg("/proc/self/stat");
+        let spawned = spawn(command, Streams::Merged, session).unwrap();
+        let pid = spawned.child.id().unwrap();
+        let (_tx, rx) = watch::channel(false);
+        let execution = follow(
+            spawned,
+            rx,
+            Duration::from_secs(10),
+            Leftovers::Killed,
+            |_| {},
+        )
+        .await;
+        let stat = String::from_utf8(execution.stdout).unwrap();
+        // "pid (comm) state ppid pgrp session ...": the command name can
+        // contain spaces, so the fields are counted after its parenthesis.
+        let (_, fields) = stat.rsplit_once(") ").unwrap();
+        (pid, fields.split(' ').nth(3).unwrap().to_owned())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_program_that_a_debug_adapter_starts_has_no_terminal_of_the_editor() {
+        let (pid, session) = session_of(Session::Own).await;
+        assert_eq!(session, pid.to_string());
+        let (pid, session) = session_of(Session::Shared).await;
+        assert_ne!(session, pid.to_string());
+    }
 
     #[tokio::test]
     async fn capture_drains_and_keeps_both_ends() {
