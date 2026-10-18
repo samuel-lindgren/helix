@@ -318,20 +318,7 @@ fn is_test_attribute(name: &str) -> bool {
             .any(|suffix| name.ends_with(suffix))
 }
 
-pub(super) fn field<'a>(node: &Node<'a>, name: &str) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    if !cursor.goto_first_child() {
-        return None;
-    }
-    loop {
-        if cursor.field_name() == Some(name) {
-            return Some(cursor.node());
-        }
-        if !cursor.goto_next_sibling() {
-            return None;
-        }
-    }
-}
+pub(super) use super::super::field;
 
 #[cfg(test)]
 mod tests {

@@ -28,6 +28,7 @@ use crate::{
 
 pub(crate) mod dotnet;
 pub(crate) mod go;
+pub(crate) mod python;
 
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024; // per stream; keep draining after the cap
 const TRUNCATED: &str =
@@ -106,6 +107,7 @@ pub fn go_test_cancel(cx: &mut Context) {
 enum Language {
     Go,
     Dotnet,
+    Python,
 }
 
 fn language(editor: &Editor) -> Option<Language> {
@@ -113,16 +115,18 @@ fn language(editor: &Editor) -> Option<Language> {
     match extension.to_str()? {
         "go" => Some(Language::Go),
         "cs" | "csproj" => Some(Language::Dotnet),
+        "py" => Some(Language::Python),
         _ => None,
     }
 }
 
-const UNSUPPORTED: &str = "Open a saved Go or C# file to run its tests";
+const UNSUPPORTED: &str = "Open a saved Go, C# or Python file to run its tests";
 
 pub(super) fn pick(cx: &mut compositor::Context) {
     match language(cx.editor) {
         Some(Language::Go) => go::pick(cx),
         Some(Language::Dotnet) => dotnet::pick(cx, None),
+        Some(Language::Python) => python::pick(cx),
         None => cx.editor.set_error(UNSUPPORTED),
     }
 }
@@ -131,6 +135,7 @@ pub(super) fn package(cx: &mut compositor::Context) {
     match language(cx.editor) {
         Some(Language::Go) => go::package(cx),
         Some(Language::Dotnet) => dotnet::package(cx, None),
+        Some(Language::Python) => python::package(cx),
         None => cx.editor.set_error(UNSUPPORTED),
     }
 }
@@ -162,6 +167,7 @@ pub(super) fn nearest(cx: &mut compositor::Context) {
     match language(cx.editor) {
         Some(Language::Go) => go::nearest(cx),
         Some(Language::Dotnet) => dotnet::nearest(cx),
+        Some(Language::Python) => python::nearest(cx),
         None => cx.editor.set_error(UNSUPPORTED),
     }
 }
@@ -196,6 +202,8 @@ pub(super) fn show_locations(cx: &mut compositor::Context) {
     let title = cx.editor.documents[&id].text().line(0).to_string();
     if title.starts_with(dotnet::TITLE) {
         dotnet::show_locations(cx, id);
+    } else if title.starts_with(python::TITLE) {
+        python::show_locations(cx, id);
     } else {
         go::show_locations(cx, id);
     }
@@ -265,6 +273,7 @@ fn start(cx: &mut compositor::Context, target: TestRun, debugger: Option<Debugge
     let (buffer_name, header) = match &target {
         TestRun::Go(run) => (go::BUFFER_NAME, go::header(run)),
         TestRun::Dotnet(run) => (dotnet::BUFFER_NAME, dotnet::header(run, debugger.is_some())),
+        TestRun::Python(run) => (python::BUFFER_NAME, python::header(run)),
     };
     let id = result_buffer(cx.editor, buffer_name);
     replace_output(cx.editor, id, format!("{header}RUNNING\n"));
@@ -288,6 +297,7 @@ fn start(cx: &mut compositor::Context, target: TestRun, debugger: Option<Debugge
                 };
                 dotnet::run(Path::new("dotnet"), run, rx, deadline, attach).await
             }
+            TestRun::Python(run) => python::run(run, rx, python::RUN_TIMEOUT).await,
         };
         Ok(Callback::Editor(Box::new(move |editor| {
             editor.test_cancel = None;
@@ -590,6 +600,25 @@ async fn execute(
         stderr,
         truncated: cut_out || cut_err,
     })
+}
+
+/// The child of a syntax node in the field of that name.
+fn field<'a>(
+    node: &helix_core::tree_sitter::Node<'a>,
+    name: &str,
+) -> Option<helix_core::tree_sitter::Node<'a>> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        if cursor.field_name() == Some(name) {
+            return Some(cursor.node());
+        }
+        if !cursor.goto_next_sibling() {
+            return None;
+        }
+    }
 }
 
 /// A line of a source file that the output of a run points to.

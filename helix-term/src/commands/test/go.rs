@@ -1035,7 +1035,7 @@ func TestPickSibling(t *testing.T) { t.Fatal("UNSELECTED TEST") }
             .get_status()
             .unwrap()
             .0
-            .contains("Open a saved Go or C# file"));
+            .contains("Open a saved Go, C# or Python file"));
         assert!(app.editor.test_doc_id.is_none());
         app.editor
             .open(&fixture.path().join("nested/sample.go"), Action::Replace)

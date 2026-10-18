@@ -3878,7 +3878,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "test-package",
         aliases: &["go-test-package"],
-        doc: "Run all tests in the current file's Go package or .NET project.",
+        doc: "Run all tests in the current file's Go package, .NET project or Python directory.",
         fun: |cx, _, event| {
             if event == PromptEvent::Validate {
                 super::test::package(cx);

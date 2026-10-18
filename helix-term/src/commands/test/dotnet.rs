@@ -1525,7 +1525,7 @@ mod editor_tests {
         std::fs::write(&notes, "notes\n").unwrap();
         app.editor.open(&notes, Action::Replace).unwrap();
         keys(&mut app, "<space>tp").await;
-        assert!(status(&app).contains("Open a saved Go or C# file"));
+        assert!(status(&app).contains("Open a saved Go, C# or Python file"));
         assert!(app.close().await.is_empty());
     }
 
