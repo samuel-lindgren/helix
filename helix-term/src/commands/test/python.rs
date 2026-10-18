@@ -26,8 +26,10 @@ use crate::{
     ui::{overlay::overlaid, Picker, PickerColumn},
 };
 
+mod corresponding;
 mod discovery;
 
+pub(in crate::commands) use corresponding::corresponding_tests;
 use discovery::{relative, PythonTest};
 
 pub(super) const BUFFER_NAME: &str = "[python-test]";
@@ -2246,6 +2248,28 @@ mod editor_tests {
         assert!(status(&app).contains("No tests found"), "{}", status(&app));
         assert!(app.editor.test_doc_id.is_none());
         assert!(app.editor.test_last_run.is_none());
+        assert!(app.close().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn from_a_function_to_its_test() {
+        let fixture = python_fixture();
+        let root = helix_stdx::path::canonicalize(fixture.path());
+        let mut app = test_app(&root.join("src/shop/cart.py"));
+        let (view, doc) = current!(app.editor);
+        let text = doc.text().to_string();
+        let position = text[..text.find("sum(prices)").unwrap()].chars().count();
+        doc.set_selection(view.id, helix_core::Selection::point(position));
+        keys(&mut app, "gT").await;
+        let test = root.join("src/shop/tests/test_cart.py");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while doc!(app.editor).path() != Some(&test) {
+                keys(&mut app, "").await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{}", status(&app)));
+        assert_eq!(super::super::harness::position(&app), (test, 7));
         assert!(app.close().await.is_empty());
     }
 

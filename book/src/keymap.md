@@ -227,7 +227,7 @@ Jumps to various locations.
 | `c`   | Go to the middle of the screen                   | `goto_window_center`       |
 | `b`   | Go to the bottom of the screen                   | `goto_window_bottom`       |
 | `d`   | Go to definition (**LSP**)                       | `goto_definition`          |
-| `T`   | Go to corresponding test (Go, C#)                | `goto_corresponding_test`  |
+| `T`   | Go to corresponding test (Go, C#, Python)        | `goto_corresponding_test`  |
 | `y`   | Go to type definition (**LSP**)                  | `goto_type_definition`     |
 | `r`   | Go to references (**LSP**)                       | `goto_reference`           |
 | `i`   | Go to implementation (**LSP**)                   | `goto_implementation`      |
@@ -565,6 +565,23 @@ failures, errors and skips, and the tests that ran: `FAILED (1 failure,
 nothing passed is skipped. The whole command is limited to ten minutes; there
 is no limit per test. Processes that the tests started and left running are
 stopped with the run.
+
+`g T` goes the other way round, from code to its tests: from a module, or from
+a class, function or method in it, to the tests written for it. On a use of
+it, the language server says where it is declared; without one, the
+declaration around the cursor counts. Only names tie tests to code. The tests
+of `calc.py` are the test modules `test_calc.py`, `tests_calc.py`,
+`calc_test.py` and `calc_tests.py`, else those named after a part of it, such
+as `test_calc_paths.py`. The tests of a class `Calc` are the classes
+`TestCalc`, `CalcTests`, `CalcTest`, `CalcTestCase` or the like, in any test
+module of the project. The tests of a function or method `add` are those whose
+names contain `add` as a word: `test_add`, `test_add_twice`, `test_calc_add`,
+`testAdd`, but not `test_address`. For a method or class, the tests in the
+class's test classes come first, else those classes, else the tests in the
+module's test modules that name the method or class, else those modules. For a
+function, the module's tests that name it come first, else the tests named
+exactly after it (`test_add`) anywhere in the project, else the module's test
+modules. Several matches are listed in a picker.
 
 ##### Popup
 
