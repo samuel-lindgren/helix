@@ -566,6 +566,30 @@ nothing passed is skipped. The whole command is limited to ten minutes; there
 is no limit per test. Processes that the tests started and left running are
 stopped with the run.
 
+To run Python tests under the debugger, launch a debug target (`Space G l`) in a
+Python file and choose the template `test-func`, which lists the tests of the
+project as `Space t t` does, or `test`, which takes the tests below the file's
+directory as `Space t p` does. The run is the one described above, with one
+difference: debugpy starts it, in a terminal that the editor provides (the
+debug adapter's `runInTerminal` request), and the output still arrives in the
+`[python-test]` buffer. Breakpoints in the tests and in the code they call are
+hit. The results arrive when the run is done, and a debugged run has no time
+limit.
+
+- `Space G R` (rerun last debug target) runs the same selection under the
+  debugger again. `Space t l` runs it without one.
+- Ending the debug session ends the tests, and the run fails with it.
+  `Space t c` cancels the run, and the debug session ends with it.
+- If the debugger cannot start the tests, the run ends and says why.
+
+Such a template has `request = "launch"` and `completion = "python-test-function"`
+or `"python-test-package"` as its first parameter. The run sets `module`,
+`args`, `cwd`, `env` (`PYTHONPATH`, `PYTHONUNBUFFERED`), `console =
+"integratedTerminal"` and `redirectOutput = false` in its arguments; the others,
+such as `justMyCode`, are the template's. The interpreter is the template's
+`python`, else the one the run uses without the debugger. The default
+configuration starts debugpy as `python3 -m debugpy.adapter`.
+
 ##### Popup
 
 Displays documentation for item under cursor. Remapping currently not supported.

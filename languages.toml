@@ -1241,6 +1241,48 @@ language-servers = ["ty", "ruff", "jedi", "pylsp"]
 # TODO: pyls needs utf-8 offsets
 indent = { tab-width = 4, unit = "    " }
 
+# debugpy, installed for the python3 on PATH. Output comes back as debugger
+# output; child processes run undebugged, the editor does not take up their
+# sessions.
+[language.debugger]
+name = "debugpy"
+transport = "stdio"
+command = "python3"
+args = ["-m", "debugpy.adapter"]
+
+[[language.debugger.templates]]
+name = "source"
+request = "launch"
+completion = [ { name = "script", completion = "filename", default = "%{file_path_absolute}" } ]
+args = { program = "{0}", console = "internalConsole", subProcess = false }
+
+[[language.debugger.templates]]
+name = "module"
+request = "launch"
+completion = [ "module" ]
+args = { module = "{0}", console = "internalConsole", subProcess = false }
+
+# The test runner's selection, which debugpy starts through the editor so
+# that the results arrive in the [python-test] buffer.
+[[language.debugger.templates]]
+name = "test"
+request = "launch"
+completion = [ { name = "tests", completion = "python-test-package" } ]
+args = { subProcess = false }
+
+[[language.debugger.templates]]
+name = "test-func"
+request = "launch"
+completion = [ { name = "test", completion = "python-test-function" } ]
+args = { subProcess = false }
+
+# A program started with `python -m debugpy --listen 5678 --wait-for-client …`
+# runs an adapter of its own: `:debug-remote 127.0.0.1:5678 attach`.
+[[language.debugger.templates]]
+name = "attach"
+request = "attach"
+args = {}
+
 [[grammar]]
 name = "python"
 source = { git = "https://github.com/tree-sitter/tree-sitter-python", rev = "293fdc02038ee2bf0e2e206711b69c90ac0d413f" }

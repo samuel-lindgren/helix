@@ -1250,6 +1250,18 @@ pub struct PythonTestRun {
     pub selection_note: Option<String>,
 }
 
+/// Starts the program a debug adapter asks for and gives its process id.
+pub type StartProgram =
+    Box<dyn FnOnce(&dap::requests::RunInTerminalArguments) -> anyhow::Result<u32> + Send>;
+
+/// A test run whose program its debug adapter starts, through the editor's
+/// terminal (DAP `runInTerminal`). The test runner takes over the process.
+pub struct TestTerminal {
+    /// The adapter of the run's debug session.
+    pub adapter: DebugAdapterId,
+    pub start: StartProgram,
+}
+
 /// What the test runner was asked to run, in the terms of the language's own tool.
 #[derive(Debug, Clone)]
 pub enum TestRun {
@@ -1318,6 +1330,8 @@ pub struct Editor {
     pub test_cancel_reason: Option<String>,
     /// Latest selection for which the test process started, even if it failed.
     pub test_last_run: Option<TestRun>,
+    /// A debugged test run that waits for its adapter to start the program.
+    pub test_terminal: Option<TestTerminal>,
 
     pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
@@ -1486,6 +1500,7 @@ impl Editor {
             test_cancel: None,
             test_cancel_reason: None,
             test_last_run: None,
+            test_terminal: None,
             debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             last_debug_launch: None,
