@@ -254,6 +254,14 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
                 "f" => test_locations,
                 "c" => test_cancel,
             },
+            "n" => { "Notes"
+                "c" => note_capture,
+                "n" => note_open,
+                "t" => note_tasks,
+                "T" => note_tasks_all,
+                "g" => note_goto_code,
+                "x" => note_toggle_task,
+            },
             "G" => { "Debug (experimental)" sticky=true
                 "l" => dap_launch,
                 "F2" => dap_rerun_last,

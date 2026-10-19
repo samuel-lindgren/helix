@@ -22,5 +22,6 @@ mod test {
     mod git;
     mod languages;
     mod movement;
+    mod notes;
     mod splits;
 }

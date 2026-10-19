@@ -14,6 +14,7 @@ pub mod handlers;
 pub mod info;
 pub mod input;
 pub mod keyboard;
+pub mod notes;
 pub mod register;
 pub mod review;
 pub mod theme;

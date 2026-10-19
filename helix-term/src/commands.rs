@@ -4,6 +4,9 @@ pub(crate) mod syntax;
 pub(crate) mod test;
 pub(crate) mod typed;
 
+pub(crate) use crate::notes::{
+    note_capture, note_goto_code, note_open, note_tasks, note_tasks_all, note_toggle_task,
+};
 pub use dap::*;
 use futures_util::FutureExt;
 use helix_event::status;
@@ -604,6 +607,12 @@ impl MappableCommand {
         test_results, "Show retained test output",
         test_locations, "Go to the source or test on a test output line, or pick one",
         test_cancel, "Cancel the running test",
+        note_capture, "Capture a task or note about the code at the cursor into the project notes",
+        note_open, "Open the project notes file",
+        note_tasks, "Pick an open task of the project and go to its code",
+        note_tasks_all, "Pick an open task of any project and go to its code",
+        note_goto_code, "Go to the code that the notes entry at the cursor links to",
+        note_toggle_task, "Toggle the notes task at the cursor between open and done",
         go_test_last, "Rerun the last started test selection (same as test_last)",
         go_test_nearest, "Run the test at the cursor without debugging (same as test_nearest)",
         go_test_package, "Run all tests in the current package or project without debugging (same as test_package)",

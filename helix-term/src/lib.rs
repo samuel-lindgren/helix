@@ -12,6 +12,7 @@ pub(crate) mod git;
 pub mod health;
 pub mod job;
 pub mod keymap;
+pub(crate) mod notes;
 pub(crate) mod process;
 pub(crate) mod review;
 pub mod ui;

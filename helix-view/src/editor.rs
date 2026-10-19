@@ -435,6 +435,8 @@ pub struct Config {
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     pub buffer_picker: BufferPickerConfig,
+    /// Project notes captured from code.
+    pub notes: crate::notes::Config,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1159,6 +1161,7 @@ impl Default for Config {
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
+            notes: crate::notes::Config::default(),
         }
     }
 }
@@ -1296,6 +1299,7 @@ type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 pub struct Editor {
     pub review: crate::review::State,
     pub git: crate::git::State,
+    pub notes: crate::notes::State,
     /// Current editing mode.
     pub mode: Mode,
     pub tree: Tree,
@@ -1496,6 +1500,7 @@ impl Editor {
             branch_diff_enabled: false,
             review: crate::review::State::default(),
             git: crate::git::State::default(),
+            notes: crate::notes::State::default(),
             test_doc_id: None,
             test_cancel: None,
             test_cancel_reason: None,

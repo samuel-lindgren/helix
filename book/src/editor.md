@@ -262,6 +262,15 @@ Example
 start-position = "previous"
 ```
 
+### `[editor.notes]` Section
+
+Where [project notes](./notes.md) are kept.
+
+| Key | Description | Default |
+|--|--|---------|
+| `directory` | Directory with one `<project>.md` notes file per project; `~` expands to the home directory | `"~/notes/projects"` |
+| `heading` | Heading that captures are added under; created when missing | `"Inbox"` |
+
 ### `[editor.auto-pairs]` Section
 
 Enables automatic insertion of pairs to parentheses, brackets, etc. Can be a

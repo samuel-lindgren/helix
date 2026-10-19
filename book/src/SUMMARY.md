@@ -8,6 +8,7 @@
 - [Usage](./usage.md)
   - [GitHub review comments](./github-reviews.md)
   - [Git status, commits and push](./git.md)
+  - [Project notes](./notes.md)
   - [Registers](./registers.md)
   - [Surround](./surround.md)
   - [Textobjects](./textobjects.md)

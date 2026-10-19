@@ -500,6 +500,9 @@ fn write_review_reply(cx: &mut compositor::Context, args: &Args, force: bool) ->
     } else if crate::git::is_draft(cx.editor, doc) {
         crate::git::send(cx.editor, force);
         true
+    } else if crate::notes::is_capture(cx.editor, doc) {
+        crate::notes::save_capture(cx.editor);
+        true
     } else {
         false
     }
