@@ -74,6 +74,10 @@
 | `:review-unresolve` | Reopen the selected resolved review discussion. |
 | `:review-insert-commit` | Pick a recent branch commit and insert its id at the cursors. |
 | `:review-yank-commit` | Yank the commit suggested for the selected discussion to register h and the clipboard. |
+| `:git-status` | Show the repository's staged, unstaged and untracked changes; stage, unstage and commit from the picker. |
+| `:git-commit` | Open a commit draft for the staged changes; `:write` in the draft commits. |
+| `:git-push` | Choose the destination of the checked-out branch and push it (never forced). |
+| `:git-cancel` | Cancel the running commit or push in the current repository. |
 | `:test`, `:go-test` | Select and run a saved test without debugging. |
 | `:test-package`, `:go-test-package` | Run all tests in the current file's Go package, .NET project or Python directory. |
 | `:test-nearest`, `:go-test-nearest` | Run the saved test at the cursor without debugging. |

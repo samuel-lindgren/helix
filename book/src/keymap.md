@@ -320,6 +320,20 @@ This layer is a kludge of mappings, mostly pickers.
 
 > 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file.
 
+##### Notes mode
+
+Captures tasks and notes about code into the project's Markdown notes file and
+goes back to the code. See [Project notes](./notes.md).
+
+| Key | Description | Command |
+| --- | --- | --- |
+| `c` | Capture a task or note about the selected lines | `note_capture` |
+| `n` | Open the project notes file | `note_open` |
+| `t` | Pick an open task of the project | `note_tasks` |
+| `T` | Pick an open task of any project | `note_tasks_all` |
+| `g` | Go to the code of the notes entry at the cursor | `note_goto_code` |
+| `x` | Toggle the notes task at the cursor | `note_toggle_task` |
+
 ##### Test mode
 
 Runs tests without a debugger: Go tests with `go test`, .NET tests with
