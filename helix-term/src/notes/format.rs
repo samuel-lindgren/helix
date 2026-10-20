@@ -362,6 +362,57 @@ pub fn tasks(text: &str) -> Vec<Task> {
         .collect()
 }
 
+/// A list item with a code link: a task or a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// 0-based line of the item in the notes file.
+    pub line: usize,
+    /// `None` for a note.
+    pub status: Option<Status>,
+    pub text: String,
+    pub link: Link,
+}
+
+/// All entries in a notes file that link to code.
+pub fn linked_entries(text: &str) -> Vec<Entry> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_item(line))
+        .filter_map(|(i, line)| {
+            let link = item_link(&lines, i)?;
+            let (status, text) = match checkbox(line) {
+                Some((status, text)) => (Some(status), text),
+                None => (None, line.trim_start().trim_start_matches('-').trim()),
+            };
+            Some(Entry {
+                line: i,
+                status,
+                text: text.to_owned(),
+                link,
+            })
+        })
+        .collect()
+}
+
+/// The first line of the anchored code now: the recorded line while the
+/// quoted line is still there, else where the quoted line moved.
+pub fn current_start(lines: &[&str], link: &Link) -> usize {
+    match &link.snippet {
+        Some(snippet) if lines.get(link.start).map(|l| l.trim()) != Some(snippet.as_str()) => {
+            relocate(lines.iter().copied(), link.start, snippet).unwrap_or(link.start)
+        }
+        _ => link.start,
+    }
+}
+
+/// Whether `line` of the code is within the lines that `link` anchors.
+pub fn covers(lines: &[&str], link: &Link, line: usize) -> bool {
+    let start = current_start(lines, link);
+    (start..=start + (link.end - link.start)).contains(&line)
+}
+
 /// The task line with its status toggled between open and done. A cancelled
 /// task reopens.
 pub fn toggle(line: &str) -> Option<String> {
@@ -500,6 +551,24 @@ mod test {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].status, Status::Done);
         assert_eq!(tasks[1].link, None);
+    }
+
+    #[test]
+    fn entries_that_cover_code() {
+        let text = "- [ ] task\n  code: a.go:2-3\n  > b\n- a note\n  code: a.go:5\n- [x] no link\n";
+        let entries = linked_entries(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].status, Some(Status::Open));
+        assert_eq!(entries[1].status, None);
+        assert_eq!(entries[1].text, "a note");
+        let code = ["a", "b", "c", "d", "e"];
+        assert!(covers(&code, &entries[0].link, 2));
+        assert!(!covers(&code, &entries[0].link, 3));
+        // Two lines inserted above: the quoted line moved from 2 to 4.
+        let moved = ["x", "y", "a", "b", "c", "d"];
+        assert!(covers(&moved, &entries[0].link, 3));
+        assert!(covers(&moved, &entries[0].link, 4));
+        assert!(!covers(&moved, &entries[0].link, 1));
     }
 
     #[test]

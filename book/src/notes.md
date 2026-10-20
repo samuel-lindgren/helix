@@ -12,8 +12,8 @@ be searched with any tool.
 | `Space n n` | `note_open` | Open the project's notes file, creating it if needed. |
 | `Space n t` | `note_tasks` | Pick an open task of the project. `Enter` goes to its code (or to the task when it has no link), `Alt-n` to the task in the notes file, `Alt-x` marks it done. |
 | `Space n T` | `note_tasks_all` | The same for every notes file in the notes directory. |
-| `Space n g` | `note_goto_code` | In a notes file, go to the code that the entry at the cursor links to. |
-| `Space n x` | `note_toggle_task` | In a notes file, toggle the task at the cursor between open and done. |
+| `Space n g` | `note_goto_code` | In a notes file, go to the code that the entry at the cursor links to. In code, go to the notes entry that links to the cursor line. |
+| `Space n x` | `note_toggle_task` | Toggle a task between open and done: in a notes file the task at the cursor, in code the task that links to the cursor line. |
 
 ## Configuration
 

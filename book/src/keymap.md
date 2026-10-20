@@ -331,8 +331,8 @@ goes back to the code. See [Project notes](./notes.md).
 | `n` | Open the project notes file | `note_open` |
 | `t` | Pick an open task of the project | `note_tasks` |
 | `T` | Pick an open task of any project | `note_tasks_all` |
-| `g` | Go to the code of the notes entry at the cursor | `note_goto_code` |
-| `x` | Toggle the notes task at the cursor | `note_toggle_task` |
+| `g` | Go between a notes entry and its code | `note_goto_code` |
+| `x` | Toggle the task at the cursor, or the task linked to the code line | `note_toggle_task` |
 
 ##### Test mode
 
