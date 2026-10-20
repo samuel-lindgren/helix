@@ -21,7 +21,7 @@ use crate::{
     ui::{overlay::overlaid, Picker, PickerColumn},
 };
 
-use format::{Link, Status, Task};
+use format::{Entry, Link, Status, Task};
 
 fn notes_directory(editor: &Editor) -> PathBuf {
     helix_stdx::path::expand_tilde(editor.config().notes.directory.clone()).into_owned()
@@ -444,14 +444,47 @@ fn goto_code(editor: &mut Editor, project: &Path, link: &Link, action: Action) {
     }
 }
 
-/// `note_goto_code`: from an entry in a notes buffer to its code.
+/// Whether the focused buffer is a notes file: in the notes directory with
+/// front matter naming its project.
+fn in_notes(editor: &Editor) -> bool {
+    let doc = doc!(editor);
+    let directory = helix_stdx::path::canonicalize(notes_directory(editor));
+    doc.path().is_some_and(|path| path.starts_with(&directory))
+        && format::project_root(&doc.text().to_string()).is_some()
+}
+
+/// The project notes file and its entries that link to the code at the
+/// cursor, following moved lines.
+fn entries_at_cursor(editor: &Editor) -> anyhow::Result<(PathBuf, Vec<Entry>)> {
+    let (view, doc) = current_ref!(editor);
+    let Some(path) = doc.path() else {
+        anyhow::bail!("The buffer has no file, so no notes link to it");
+    };
+    let project = current_project(editor);
+    let file = notes_file(editor, &project)?;
+    let text = read(editor, &file).unwrap_or_default();
+    let rope = doc.text();
+    let line = rope.char_to_line(doc.selection(view.id).primary().cursor(rope.slice(..)));
+    let code: Vec<String> = rope.lines().map(|line| line.to_string()).collect();
+    let code: Vec<&str> = code.iter().map(String::as_str).collect();
+    let entries = format::linked_entries(&text)
+        .into_iter()
+        .filter(|entry| project.join(&entry.link.path) == *path)
+        .filter(|entry| format::covers(&code, &entry.link, line))
+        .collect();
+    Ok((file, entries))
+}
+
+/// `note_goto_code`: in a notes file, from the entry at the cursor to its
+/// code; in code, to the notes entry that links to the cursor line.
 pub fn note_goto_code(cx: &mut Context) {
+    if !in_notes(cx.editor) {
+        return goto_note(cx.editor);
+    }
     let (view, doc) = current_ref!(cx.editor);
     let text = doc.text().to_string();
     let Some(project) = format::project_root(&text) else {
-        return cx
-            .editor
-            .set_error("Not a notes file: its front matter names no project");
+        return;
     };
     let line = doc.text().char_to_line(
         doc.selection(view.id)
@@ -463,6 +496,24 @@ pub fn note_goto_code(cx: &mut Context) {
         None => cx
             .editor
             .set_error("No code: link in the entry at the cursor"),
+    }
+}
+
+/// From code to the first notes entry that links to the cursor line.
+fn goto_note(editor: &mut Editor) {
+    let (file, entries) = match entries_at_cursor(editor) {
+        Ok(found) => found,
+        Err(err) => return editor.set_error(err.to_string()),
+    };
+    let Some(entry) = entries.first() else {
+        return editor.set_error("No notes entry links to this line; Space n c captures one");
+    };
+    open_at(editor, &file, entry.line, Action::Replace);
+    if entries.len() > 1 {
+        editor.set_status(format!(
+            "{} notes entries link here; this is the first",
+            entries.len()
+        ));
     }
 }
 
@@ -487,8 +538,12 @@ fn toggle_task(editor: &mut Editor, path: &Path, line: usize) -> anyhow::Result<
 }
 
 /// `note_toggle_task`: toggles the task at the cursor between open and done.
-/// Edits the buffer, so the change saves with it.
+/// In a notes file it edits the buffer, so the change saves with it; in code it
+/// toggles the task that links to the cursor line in the notes file.
 pub fn note_toggle_task(cx: &mut Context) {
+    if !in_notes(cx.editor) {
+        return toggle_linked_task(cx.editor);
+    }
     let (view, doc) = current!(cx.editor);
     let text = doc.text().to_string();
     let cursor_line = doc.text().char_to_line(
@@ -510,6 +565,30 @@ pub fn note_toggle_task(cx: &mut Context) {
     let transaction = Transaction::change(rope, [(start, end, Some(toggled.into()))].into_iter());
     doc.apply(&transaction, view.id);
     doc.append_changes_to_history(view);
+}
+
+/// Toggles the one task that links to the code at the cursor.
+fn toggle_linked_task(editor: &mut Editor) {
+    let (file, entries) = match entries_at_cursor(editor) {
+        Ok(found) => found,
+        Err(err) => return editor.set_error(err.to_string()),
+    };
+    let tasks: Vec<&Entry> = entries.iter().filter(|e| e.status.is_some()).collect();
+    let task = match tasks.as_slice() {
+        [] => return editor.set_error("No task links to this line; Space n c captures one"),
+        [task] => *task,
+        _ => {
+            return editor.set_error(format!(
+                "{} tasks link to this line; Space n g opens them in the notes",
+                tasks.len()
+            ))
+        }
+    };
+    match toggle_task(editor, &file, task.line) {
+        Ok(Status::Open) => editor.set_status(format!("Reopened: {}", task.text)),
+        Ok(_) => editor.set_status(format!("Done: {}", task.text)),
+        Err(err) => editor.set_error(format!("Cannot toggle the task: {err}")),
+    }
 }
 
 #[derive(Debug, Clone)]

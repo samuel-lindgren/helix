@@ -303,8 +303,8 @@
 | `note_open` | Open the project notes file | normal: `` <space>nn ``, select: `` <space>nn `` |
 | `note_tasks` | Pick an open task of the project and go to its code | normal: `` <space>nt ``, select: `` <space>nt `` |
 | `note_tasks_all` | Pick an open task of any project and go to its code | normal: `` <space>nT ``, select: `` <space>nT `` |
-| `note_goto_code` | Go to the code that the notes entry at the cursor links to | normal: `` <space>ng ``, select: `` <space>ng `` |
-| `note_toggle_task` | Toggle the notes task at the cursor between open and done | normal: `` <space>nx ``, select: `` <space>nx `` |
+| `note_goto_code` | Go from a notes entry to its code, or from code to the notes entry linking to it | normal: `` <space>ng ``, select: `` <space>ng `` |
+| `note_toggle_task` | Toggle the notes task at the cursor, or the task linked to the code line | normal: `` <space>nx ``, select: `` <space>nx `` |
 | `go_test_last` | Rerun the last started test selection (same as test_last) |  |
 | `go_test_nearest` | Run the test at the cursor without debugging (same as test_nearest) |  |
 | `go_test_package` | Run all tests in the current package or project without debugging (same as test_package) |  |

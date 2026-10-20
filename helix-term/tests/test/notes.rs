@@ -59,6 +59,24 @@ async fn capture_list_and_return_to_code() -> anyhow::Result<()> {
         "the draft closes and the code is back in focus"
     );
 
+    // From the code: toggle the linked task and go to its entry.
+    keys.send(&mut app, "<space>nx").await?;
+    assert_eq!(status(&app), "Done: Check the line");
+    assert!(fs::read_to_string(&file)?.contains("- [x] Check the line\n"));
+    keys.send(&mut app, "<space>nx").await?;
+    assert_eq!(status(&app), "Reopened: Check the line");
+    keys.send(&mut app, "gg<space>nx").await?;
+    assert!(
+        status(&app).starts_with("No task links to this line"),
+        "{}",
+        status(&app)
+    );
+    keys.send(&mut app, "3gg<space>ng").await?;
+    assert_eq!(helix_view::doc!(app.editor).path(), Some(&file));
+    assert_eq!(cursor_line(&app), 7);
+    keys.send(&mut app, "<C-o>").await?;
+    assert_eq!(helix_view::doc!(app.editor).path(), Some(&source));
+
     // Two lines above the anchor move it from line 3 to line 5.
     keys.send(&mut app, "ggOzero<ret>zero<esc>:w<ret>").await?;
     keys.send(&mut app, "<space>nt").await?;
