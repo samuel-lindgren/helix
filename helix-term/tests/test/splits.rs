@@ -1,6 +1,7 @@
 use super::*;
 
 use helix_stdx::path;
+use helix_term::application::Application;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_split_write_quit_all() -> anyhow::Result<()> {
@@ -210,6 +211,60 @@ async fn test_changes_in_splits_jumplist_sync() -> anyhow::Result<()> {
         "#[|]#",
         LineFeedHandling::AsIs,
     ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_resize_split() -> anyhow::Result<()> {
+    // The heights of the two views of a horizontal split, top first.
+    fn heights(app: &Application) -> Vec<u16> {
+        app.editor
+            .tree
+            .views()
+            .map(|(view, _)| view.area.height)
+            .collect()
+    }
+    fn split_heights(app: &Application) -> (u16, u16) {
+        let height = app.editor.tree.area().height;
+        (height / 2, height - height / 2)
+    }
+
+    let mut app = helpers::AppBuilder::new().build()?;
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (
+                // Resize mode is sticky: `k` grows the focused (lower) view
+                // twice and `j` shrinks it once, two lines a step.
+                Some("<C-w>s<C-w>rkkj<esc>"),
+                Some(&|app| {
+                    let (top, bottom) = split_heights(app);
+                    assert_eq!(vec![top - 2, bottom + 2], heights(app));
+                }),
+            ),
+            (
+                // After escape, `k` moves the cursor again.
+                Some("k"),
+                Some(&|app| {
+                    let (top, bottom) = split_heights(app);
+                    assert_eq!(vec![top - 2, bottom + 2], heights(app));
+                }),
+            ),
+            (
+                // A count resizes by that many steps.
+                Some("<space>wr3j<esc>"),
+                Some(&|app| {
+                    let (top, bottom) = split_heights(app);
+                    assert_eq!(vec![top + 4, bottom - 4], heights(app));
+                }),
+            ),
+            (Some(":qa!<ret>"), None),
+        ],
+        true,
+    )
     .await?;
 
     Ok(())
