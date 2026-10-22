@@ -154,6 +154,62 @@ impl Children {
 
         self.views.remove(index)
     }
+
+    /// Grows the child at `index` by `amount` of the container, or shrinks it
+    /// for a negative amount. Growing takes the space from the siblings on
+    /// both sides, nearest first, and never leaves one below `min`, so the
+    /// child grows less when they have no more to give. Shrinking stops at
+    /// `min` and hands the space to the adjacent siblings.
+    fn resize(&mut self, index: usize, amount: f64, min: f64) {
+        let bounds = &mut self.bounds;
+        let before = index > 0;
+        let after = index + 1 < bounds.len();
+
+        if amount < 0.0 {
+            let freed = (-amount).min(bounds[index].portion - min).max(0.0);
+            match (before, after) {
+                (true, true) => {
+                    bounds[index - 1].portion += freed / 2.0;
+                    bounds[index + 1].portion += freed / 2.0;
+                }
+                (true, false) => bounds[index - 1].portion += freed,
+                (false, true) => bounds[index + 1].portion += freed,
+                (false, false) => return,
+            }
+            bounds[index].portion -= freed;
+            return;
+        }
+
+        let spare = |bound: &ContainerBounds| (bound.portion - min).max(0.0);
+        let spare_before: f64 = bounds[..index].iter().map(spare).sum();
+        let spare_after: f64 = bounds[index + 1..].iter().map(spare).sum();
+
+        // Half from each side, or all from the only one; a side with space
+        // left covers what the other cannot give.
+        let (want_before, want_after) = match (before, after) {
+            (true, true) => (amount / 2.0, amount / 2.0),
+            (true, false) => (amount, 0.0),
+            (false, _) => (0.0, amount),
+        };
+        let mut take_before = want_before.min(spare_before);
+        let mut take_after = want_after.min(spare_after);
+        let missing = amount - take_before - take_after;
+        let extra = missing.min(spare_before - take_before).max(0.0);
+        take_before += extra;
+        take_after += (missing - extra).min(spare_after - take_after).max(0.0);
+
+        bounds[index].portion += take_before + take_after;
+        for bound in bounds[..index].iter_mut().rev() {
+            let take = take_before.min(spare(bound));
+            bound.portion -= take;
+            take_before -= take;
+        }
+        for bound in &mut bounds[index + 1..] {
+            let take = take_after.min(spare(bound));
+            bound.portion -= take;
+            take_after -= take;
+        }
+    }
 }
 
 impl<Idx> Index<Idx> for Children
@@ -181,12 +237,32 @@ pub struct ContainerBounds {
     portion: f64,
 }
 
+impl ContainerBounds {
+    /// The whole cells of `size` that the portion covers. The tolerance keeps a
+    /// rounding error in the portion (1.9999… for 2) from costing a cell.
+    fn cells(self, size: u16) -> u16 {
+        (size as f64 * self.portion + 1e-6).floor() as u16
+    }
+}
+
 impl Container {
     pub fn new(layout: Layout) -> Self {
         Self {
             layout,
             children: Children::new(),
             area: Rect::default(),
+        }
+    }
+
+    /// The cells the children share: the height of a horizontal container,
+    /// the width less the gaps between the views of a vertical one.
+    fn shared_size(&self) -> u16 {
+        match self.layout {
+            Layout::Horizontal => self.area.height,
+            Layout::Vertical => {
+                let gaps = (self.children.len() as u16).saturating_sub(2);
+                self.area.width.saturating_sub(gaps)
+            }
         }
     }
 }
@@ -501,7 +577,9 @@ impl Tree {
 
                             for (i, child) in container.children.iter().enumerate() {
                                 let bounds = container.children.bounds[i];
-                                let height = (area.height as f64 * bounds.portion).floor() as u16;
+                                let height = bounds.cells(area.height);
+                                // never past the container, whatever the portions add up to
+                                let height = height.min(area.bottom() - child_y);
 
                                 let mut area = Rect::new(
                                     container.area.x,
@@ -522,18 +600,17 @@ impl Tree {
                         }
                         Layout::Vertical => {
                             let len = container.children.len();
-                            let len_u16 = len as u16;
 
                             let inner_gap = 1u16;
-                            let total_gap = inner_gap * len_u16.saturating_sub(2);
-
-                            let used_area = area.width.saturating_sub(total_gap);
+                            let used_area = container.shared_size();
 
                             let mut child_x = area.x;
 
                             for (i, child) in container.children.iter().enumerate() {
                                 let bounds = container.children.bounds[i];
-                                let width = (used_area as f64 * bounds.portion).floor() as u16;
+                                let width = bounds.cells(used_area);
+                                // never past the container, whatever the portions add up to
+                                let width = width.min(area.right() - child_x);
 
                                 let mut area = Rect::new(
                                     child_x,
@@ -541,12 +618,12 @@ impl Tree {
                                     width,
                                     container.area.height,
                                 );
-                                child_x += width + inner_gap;
+                                child_x = (child_x + width + inner_gap).min(container.area.right());
 
                                 // last child takes the remaining width because we can get uneven
                                 // space from rounding
                                 if i == len - 1 {
-                                    area.width = container.area.x + container.area.width - area.x;
+                                    area.width = container.area.right() - area.x;
                                 }
 
                                 self.stack.push((*child, area));
@@ -751,43 +828,24 @@ impl Tree {
         };
 
         if let Some((container, idx)) = self.find_container(layout) {
-            if container.children.len() == 1 {
+            let size = container.shared_size();
+            if size == 0 {
                 return;
             }
+            let cell = 1.0 / size as f64;
 
-            let diff = match dimension {
-                Dimension::Width => 1.0 / container.area.width as f64 * 2.0,
-                Dimension::Height => 1.0 / container.area.height as f64 * 2.0,
-            };
+            // two cells per step, so that a view between two others moves both
+            // of its edges by a whole cell
+            let diff = 2.0 * cell * count as f64;
             let diff = match resize_type {
                 Resize::Shrink => -diff,
                 Resize::Grow => diff,
             };
-            let diff = diff * count as f64;
 
-            let min = 0.05;
-            let max = 1.0 - ((container.children.len() - 1) as f64 * min);
+            // 5% of the container, and room for a line and the statusline
+            let min = f64::max(0.05, 2.0 * cell);
 
-            let bounds = &mut container.children.bounds;
-            if bounds[idx].portion <= min && bounds[idx].portion >= max {
-                return;
-            }
-
-            let portion = bounds[idx].portion;
-            bounds[idx].portion = f64::clamp(portion + diff, min, max);
-
-            let diff = bounds[idx].portion - portion;
-            if let Some(prev) = idx.checked_sub(1) {
-                if let Some(next) = bounds.get_mut(idx + 1) {
-                    next.portion -= diff / 2.0;
-                    bounds[prev].portion -= diff / 2.0;
-                } else {
-                    bounds[prev].portion -= diff;
-                }
-            } else if let Some(next) = bounds.get_mut(idx + 1) {
-                next.portion -= diff;
-            }
-
+            container.children.resize(idx, diff, min);
             self.recalculate();
         }
     }
@@ -1160,5 +1218,190 @@ mod test {
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A tree of `count` views in one container with `layout`, in an 80x40 area,
+    /// and the ids of the views in order.
+    fn split_tree(layout: Layout, count: usize) -> (Tree, Vec<ViewId>) {
+        let mut tree = Tree::new(Rect::new(0, 0, 80, 40));
+        let mut ids = vec![tree.insert(View::new(DocumentId::default(), GutterConfig::default()))];
+        for _ in 1..count {
+            let view = View::new(DocumentId::default(), GutterConfig::default());
+            ids.push(tree.split(view, layout));
+        }
+        (tree, ids)
+    }
+
+    fn heights(tree: &Tree, ids: &[ViewId]) -> Vec<u16> {
+        ids.iter().map(|id| tree.get(*id).area.height).collect()
+    }
+
+    fn widths(tree: &Tree, ids: &[ViewId]) -> Vec<u16> {
+        ids.iter().map(|id| tree.get(*id).area.width).collect()
+    }
+
+    /// The views of a horizontal container are stacked without gaps or
+    /// overlap and fill its height.
+    fn assert_stacked(tree: &Tree, ids: &[ViewId]) {
+        let mut y = tree.area.top();
+        for id in ids {
+            let area = tree.get(*id).area;
+            assert_eq!(y, area.top(), "{:?}", heights(tree, ids));
+            y = area.bottom();
+        }
+        assert_eq!(tree.area.bottom(), y, "{:?}", heights(tree, ids));
+    }
+
+    /// The views of a vertical container sit side by side with one column
+    /// between them and fill its width.
+    fn assert_side_by_side(tree: &Tree, ids: &[ViewId]) {
+        let mut x = tree.area.left();
+        for id in ids {
+            let area = tree.get(*id).area;
+            assert_eq!(x, area.left(), "{:?}", widths(tree, ids));
+            x = area.right() + 1;
+        }
+        assert_eq!(tree.area.right() + 1, x, "{:?}", widths(tree, ids));
+    }
+
+    #[test]
+    fn resize_moves_the_border_two_cells_per_step() {
+        let (mut tree, ids) = split_tree(Layout::Horizontal, 2);
+        tree.focus = ids[0];
+
+        for step in 1..=5 {
+            tree.resize_view(Resize::Grow, Dimension::Height, 1);
+            assert_eq!(vec![20 + 2 * step, 20 - 2 * step], heights(&tree, &ids));
+        }
+        tree.resize_view(Resize::Shrink, Dimension::Height, 3);
+        assert_eq!(vec![24, 16], heights(&tree, &ids));
+        assert_stacked(&tree, &ids);
+    }
+
+    #[test]
+    fn resize_keeps_a_minimum_size() {
+        let (mut tree, ids) = split_tree(Layout::Horizontal, 2);
+        tree.focus = ids[1];
+
+        tree.resize_view(Resize::Shrink, Dimension::Height, 100);
+        assert_eq!(vec![38, 2], heights(&tree, &ids));
+        tree.resize_view(Resize::Grow, Dimension::Height, 100);
+        assert_eq!(vec![2, 38], heights(&tree, &ids));
+    }
+
+    #[test]
+    fn resize_middle_of_three_stays_inside_the_container() {
+        let (mut tree, ids) = split_tree(Layout::Horizontal, 3);
+        tree.focus = ids[2];
+        tree.resize_view(Resize::Shrink, Dimension::Height, 100);
+        tree.focus = ids[1];
+        tree.resize_view(Resize::Grow, Dimension::Height, 100);
+        assert_eq!(vec![2, 36, 2], heights(&tree, &ids));
+        assert_stacked(&tree, &ids);
+
+        let (mut tree, ids) = split_tree(Layout::Vertical, 3);
+        tree.focus = ids[2];
+        tree.resize_view(Resize::Shrink, Dimension::Width, 100);
+        tree.focus = ids[1];
+        tree.resize_view(Resize::Grow, Dimension::Width, 100);
+        assert_side_by_side(&tree, &ids);
+        assert!(widths(&tree, &ids).iter().all(|width| *width >= 3));
+    }
+
+    #[test]
+    fn resize_takes_from_the_next_sibling_when_the_nearest_is_at_its_minimum() {
+        let (mut tree, ids) = split_tree(Layout::Horizontal, 3);
+        tree.focus = ids[0];
+
+        tree.resize_view(Resize::Grow, Dimension::Height, 100);
+        assert_eq!(vec![36, 2, 2], heights(&tree, &ids));
+        assert_stacked(&tree, &ids);
+
+        tree.focus = ids[2];
+        tree.resize_view(Resize::Grow, Dimension::Height, 100);
+        assert_eq!(vec![2, 2, 36], heights(&tree, &ids));
+        assert_stacked(&tree, &ids);
+    }
+
+    #[test]
+    fn resize_with_more_views_than_fit_at_their_minimum() {
+        // Twenty-five views cannot all keep 5% of the container.
+        let (mut tree, mut ids) = split_tree(Layout::Horizontal, 2);
+        tree.focus = ids[0];
+        tree.resize_view(Resize::Grow, Dimension::Height, 100);
+        for _ in 0..23 {
+            let view = View::new(DocumentId::default(), GutterConfig::default());
+            ids.insert(1, tree.split(view, Layout::Horizontal));
+            tree.focus = ids[0];
+        }
+
+        tree.resize_view(Resize::Grow, Dimension::Height, 3);
+        assert_stacked(&tree, &ids);
+        tree.resize_view(Resize::Shrink, Dimension::Height, 3);
+        assert_stacked(&tree, &ids);
+    }
+
+    #[test]
+    fn views_tile_the_area_through_splits_resizes_and_closes() {
+        // A fixed pseudo-random sequence of operations; after each, the views
+        // cover the whole area without overlapping.
+        let area = Rect::new(0, 0, 97, 31);
+        let mut tree = Tree::new(area);
+        tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+
+        for step in 0..5000 {
+            let views: Vec<ViewId> = tree.views().map(|(view, _)| view.id).collect();
+            tree.focus = views[next(views.len() as u64) as usize];
+            let count = 1 + next(30) as usize;
+            match next(10) {
+                0 | 1 if views.len() < 12 => {
+                    let view = View::new(DocumentId::default(), GutterConfig::default());
+                    tree.split(view, Layout::Horizontal);
+                }
+                2 | 3 if views.len() < 12 => {
+                    let view = View::new(DocumentId::default(), GutterConfig::default());
+                    tree.split(view, Layout::Vertical);
+                }
+                4 if views.len() > 1 => tree.remove(tree.focus),
+                5 | 6 => tree.resize_view(Resize::Grow, Dimension::Height, count),
+                7 => tree.resize_view(Resize::Shrink, Dimension::Height, count),
+                8 => tree.resize_view(Resize::Grow, Dimension::Width, count),
+                _ => tree.resize_view(Resize::Shrink, Dimension::Width, count),
+            }
+
+            let areas: Vec<Rect> = tree.views().map(|(view, _)| view.area).collect();
+            for (i, a) in areas.iter().enumerate() {
+                assert_eq!(*a, a.intersection(area), "step {step}: {areas:?}");
+                for b in &areas[i + 1..] {
+                    assert!(a.intersection(*b).area() == 0, "step {step}: {areas:?}");
+                }
+            }
+            // The one-column gaps between side-by-side views are not covered.
+            let covered: usize = areas.iter().map(|a| a.area()).sum();
+            assert!(covered <= area.area(), "step {step}: {areas:?}");
+            assert!(
+                covered + 11 * area.height as usize >= area.area(),
+                "step {step}: {areas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_a_split_shares_its_space_by_size() {
+        let (mut tree, ids) = split_tree(Layout::Horizontal, 3);
+        tree.focus = ids[0];
+        tree.resize_view(Resize::Grow, Dimension::Height, 4);
+        assert_eq!(vec![21, 5, 14], heights(&tree, &ids));
+
+        tree.remove(ids[2]);
+        assert_eq!(vec![32, 8], heights(&tree, &ids[..2]));
+        assert_stacked(&tree, &ids[..2]);
     }
 }
