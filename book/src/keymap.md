@@ -280,6 +280,20 @@ This layer is similar to Vim keybindings as Kakoune does not support windows.
 | `J`                    | Swap window downwards                                | `swap_view_down`  |
 | `K`                    | Swap window upwards                                  | `swap_view_up`    |
 | `L`                    | Swap window to the right                             | `swap_view_right` |
+| `r`                    | Enter [window resize mode](#window-resize-mode)      |                   |
+
+#### Window resize mode
+
+Accessed by typing `r` in [window mode](#window-mode). This mode is sticky: it
+stays active until `Esc`. Each key moves the borders of the current window by
+two cells, and a count repeats it.
+
+| Key           | Description                  | Command              |
+| -----         | -------------                | -------              |
+| `h`, `Left`   | Shrink the window's width    | `shrink_view_width`  |
+| `l`, `Right`  | Grow the window's width      | `grow_view_width`    |
+| `j`, `Down`   | Shrink the window's height   | `shrink_view_height` |
+| `k`, `Up`     | Grow the window's height     | `grow_view_height`   |
 
 #### Space mode
 

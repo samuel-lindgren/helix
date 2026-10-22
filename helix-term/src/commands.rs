@@ -57,7 +57,7 @@ use helix_view::{
     input::KeyEvent,
     keyboard::KeyCode,
     theme::Style,
-    tree,
+    tree::{self, Dimension, Resize},
     view::View,
     Document, DocumentId, Editor, ViewId,
 };
@@ -476,6 +476,10 @@ impl MappableCommand {
         diff_peek, "Show the diff of the change at cursor (HEAD and branch diff)",
         git_blame_line, "Show git blame popup for line at cursor",
         reset_branch_change, "Reset branch diff hunk at cursor to merge-base content",
+        grow_view_width, "Grow focused container width",
+        shrink_view_width, "Shrink focused container width",
+        grow_view_height, "Grow focused container height",
+        shrink_view_height, "Shrink focused container height",
         goto_line_start, "Goto line start",
         goto_line_end, "Goto line end",
         goto_column, "Goto column",
@@ -949,6 +953,26 @@ fn goto_line_start(cx: &mut Context) {
             Movement::Move
         },
     )
+}
+
+fn grow_view_width(cx: &mut Context) {
+    cx.editor
+        .resize_view(Resize::Grow, Dimension::Width, cx.count());
+}
+
+fn shrink_view_width(cx: &mut Context) {
+    cx.editor
+        .resize_view(Resize::Shrink, Dimension::Width, cx.count());
+}
+
+fn grow_view_height(cx: &mut Context) {
+    cx.editor
+        .resize_view(Resize::Grow, Dimension::Height, cx.count());
+}
+
+fn shrink_view_height(cx: &mut Context) {
+    cx.editor
+        .resize_view(Resize::Shrink, Dimension::Height, cx.count());
 }
 
 fn goto_next_buffer(cx: &mut Context) {
