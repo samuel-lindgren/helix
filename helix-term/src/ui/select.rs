@@ -31,7 +31,8 @@ impl<T: Item> Select<T> {
             let option = &option.unwrap();
             callback(editor, option, event)
         })
-        .auto_close(true);
+        .auto_close(true)
+        .filter_on_type(true);
         // Select the first option by default.
         menu.move_down();
 

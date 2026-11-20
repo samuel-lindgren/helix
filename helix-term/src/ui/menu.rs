@@ -1,12 +1,27 @@
+use std::cmp::Reverse;
+
 use crate::{
+    alt,
     compositor::{Callback, Component, Compositor, Context, Event, EventResult},
     ctrl, key, shift,
 };
-use tui::{buffer::Buffer as Surface, widgets::Table};
+use helix_core::{fuzzy::MATCHER, unicode::segmentation::UnicodeSegmentation};
+use nucleo::{
+    pattern::{CaseMatching, Normalization, Pattern},
+    Config, Utf32Str,
+};
+use tui::{buffer::Buffer as Surface, text::Span, widgets::Table};
 
 pub use tui::widgets::{Cell, Row};
 
-use helix_view::{editor::SmartTabConfig, graphics::Rect, Editor};
+use helix_view::{
+    editor::SmartTabConfig,
+    graphics::{Modifier, Rect},
+    input::KeyEvent,
+    keyboard::{KeyCode, KeyModifiers},
+    theme::Style,
+    Editor,
+};
 use tui::layout::Constraint;
 
 pub trait Item: Sync + Send + 'static {
@@ -36,6 +51,9 @@ pub struct Menu<T: Item> {
     viewport: (u16, u16),
     recalculate: bool,
     auto_close: bool,
+    /// The text typed to filter the options, when typing filters them (see
+    /// [`Menu::filter_on_type`]).
+    filter: Option<String>,
 }
 
 impl<T: Item> Menu<T> {
@@ -61,6 +79,7 @@ impl<T: Item> Menu<T> {
             viewport: (0, 0),
             recalculate: true,
             auto_close: false,
+            filter: None,
         }
     }
 
@@ -97,6 +116,9 @@ impl<T: Item> Menu<T> {
     }
 
     pub fn move_up(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
         let len = self.matches.len();
         let max_index = len.saturating_sub(1);
         let pos = self.cursor.map_or(max_index, |i| (i + max_index) % len) % len;
@@ -105,14 +127,20 @@ impl<T: Item> Menu<T> {
     }
 
     pub fn move_half_page_up(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
         let len = self.matches.len();
-        let max_index = len.saturating_sub((self.size.1 as usize / 2).max(1));
+        let max_index = len.saturating_sub((self.list_height() / 2).max(1));
         let pos = self.cursor.map_or(max_index, |i| (i + max_index) % len) % len;
         self.cursor = Some(pos);
         self.adjust_scroll();
     }
 
     pub fn move_down(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
         let len = self.matches.len();
         let pos = self.cursor.map_or(0, |i| i + 1) % len;
         self.cursor = Some(pos);
@@ -120,10 +148,13 @@ impl<T: Item> Menu<T> {
     }
 
     pub fn move_half_page_down(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
         let len = self.matches.len();
         let pos = self
             .cursor
-            .map_or(0, |i| i + (self.size.1 as usize / 2).max(1))
+            .map_or(0, |i| i + (self.list_height() / 2).max(1))
             % len;
         self.cursor = Some(pos);
         self.adjust_scroll();
@@ -132,6 +163,65 @@ impl<T: Item> Menu<T> {
     pub fn auto_close(mut self, auto_close: bool) -> Self {
         self.auto_close = auto_close;
         self
+    }
+
+    /// Lets typing filter the options, as in pickers: the best matches come
+    /// first, and the typed text shows above them. Menus whose filter is typed
+    /// elsewhere, such as completion in the document, leave this off.
+    pub fn filter_on_type(mut self, filter_on_type: bool) -> Self {
+        self.filter = filter_on_type.then(String::new);
+        self
+    }
+
+    /// The rows above the options that show the filter.
+    fn filter_rows(&self) -> u16 {
+        u16::from(
+            self.filter
+                .as_ref()
+                .is_some_and(|filter| !filter.is_empty()),
+        )
+    }
+
+    /// The rows that show options.
+    fn list_height(&self) -> usize {
+        self.size.1.saturating_sub(self.filter_rows()) as usize
+    }
+
+    /// Matches the options against the filter, best first, and selects the
+    /// best match. Options that match equally keep their order.
+    fn apply_filter(&mut self) {
+        let Some(filter) = &self.filter else {
+            return;
+        };
+
+        let pattern = Pattern::parse(filter, CaseMatching::Smart, Normalization::Smart);
+        let mut matcher = MATCHER.lock();
+        matcher.config = Config::DEFAULT;
+        let mut buf = Vec::new();
+
+        self.matches.clear();
+        for (index, option) in self.options.iter().enumerate() {
+            let text = row_text(&option.format(&self.editor_data));
+            if let Some(score) = pattern.score(Utf32Str::new(&text, &mut buf), &mut matcher) {
+                self.matches.push((index as u32, score));
+            }
+        }
+        self.matches
+            .sort_by_key(|&(index, score)| (Reverse(score), index));
+
+        self.cursor = (!self.matches.is_empty()).then_some(0);
+        self.scroll = 0;
+        self.recalculate = true;
+    }
+
+    /// Changes the filter, re-filters the options and reports the selection.
+    fn edit_filter(&mut self, cx: &mut Context, edit: impl FnOnce(&mut String)) {
+        let Some(filter) = &mut self.filter else {
+            return;
+        };
+        edit(filter);
+        self.apply_filter();
+        (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
     }
 
     fn recalculate_size(&mut self, viewport: (u16, u16)) {
@@ -153,7 +243,12 @@ impl<T: Item> Menu<T> {
             acc
         });
 
-        let height = self.matches.len().min(10).min(viewport.1 as usize);
+        let filter_rows = self.filter_rows() as usize;
+        let height = self
+            .matches
+            .len()
+            .min(10)
+            .min((viewport.1 as usize).saturating_sub(filter_rows));
         // do all the matches fit on a single screen?
         let fits = self.matches.len() <= height;
 
@@ -171,7 +266,7 @@ impl<T: Item> Menu<T> {
             .map(|len| Constraint::Length(len as u16))
             .collect();
 
-        self.size = (width as u16, height as u16);
+        self.size = (width as u16, (height + filter_rows) as u16);
 
         // adjust scroll offsets if size changed
         self.adjust_scroll();
@@ -179,7 +274,7 @@ impl<T: Item> Menu<T> {
     }
 
     fn adjust_scroll(&mut self) {
-        let win_height = self.size.1 as usize;
+        let win_height = self.list_height();
         if let Some(cursor) = self.cursor {
             let mut scroll = self.scroll;
             if cursor > (win_height + scroll).saturating_sub(1) {
@@ -211,6 +306,31 @@ impl<T: Item> Menu<T> {
 
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
+    }
+
+    /// Draws the typed filter, with the count of matching options on the right.
+    fn render_filter_line(&self, area: Rect, surface: &mut Surface, style: Style) {
+        let filter = self.filter.as_deref().unwrap_or_default();
+        let count = format!("{}/{}", self.matches.len(), self.options.len());
+        let area = area.clip_left(Self::LEFT_PADDING as u16).clip_right(1);
+        let count_width = count.len() as u16;
+
+        surface.set_stringn(
+            area.x,
+            area.y,
+            filter,
+            area.width.saturating_sub(count_width + 1) as usize,
+            style,
+        );
+        if area.width > count_width {
+            surface.set_stringn(
+                area.right() - count_width,
+                area.y,
+                &count,
+                count_width as usize,
+                style,
+            );
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -292,23 +412,32 @@ impl<T: Item + 'static> Component for Menu<T> {
                 if let Some(selection) = self.selection() {
                     (self.callback_fn)(cx.editor, Some(selection), MenuEvent::Validate);
                     return EventResult::Consumed(close_fn);
+                } else if self.filter.is_some() {
+                    // Nothing matches the filter: stay open so it can be fixed.
+                    return EventResult::Consumed(None);
                 } else {
                     return EventResult::Ignored(close_fn);
                 }
             }
-            // KeyEvent {
-            //     code: KeyCode::Char(c),
-            //     modifiers: KeyModifiers::NONE,
-            // } => {
-            //     self.insert_char(c);
-            //     (self.callback_fn)(cx.editor, &self.line, MenuEvent::Update);
-            // }
-
-            // / -> edit_filter?
-            //
-            // enter confirms the match and closes the menu
-            // typing filters the menu
-            // if we run out of options the menu closes itself
+            key!(Backspace) | ctrl!('h') if self.filter.is_some() => {
+                self.edit_filter(cx, |filter| {
+                    filter.pop();
+                });
+                return EventResult::Consumed(None);
+            }
+            ctrl!('w') | alt!(Backspace) | ctrl!(Backspace) if self.filter.is_some() => {
+                self.edit_filter(cx, delete_word_backwards);
+                return EventResult::Consumed(None);
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+            } if self.filter.is_some()
+                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.edit_filter(cx, |filter| filter.push(c));
+                return EventResult::Consumed(None);
+            }
             _ if self.auto_close => {
                 (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Abort);
                 return EventResult::Consumed(close_fn);
@@ -338,6 +467,12 @@ impl<T: Item + 'static> Component for Menu<T> {
 
         surface.clear_with(area, style);
 
+        let filter_rows = self.filter_rows();
+        if filter_rows != 0 {
+            self.render_filter_line(area.with_height(1), surface, theme.get("ui.text"));
+        }
+        let area = area.clip_top(filter_rows);
+
         let scroll = self.scroll;
 
         let options: Vec<_> = self
@@ -353,9 +488,31 @@ impl<T: Item + 'static> Component for Menu<T> {
 
         let win_height = area.height as usize;
 
-        let rows = options
-            .iter()
-            .map(|option| option.format(&self.editor_data));
+        let highlight_style = theme.get("special").add_modifier(Modifier::BOLD);
+        let mut highlighter = self
+            .filter
+            .as_deref()
+            .filter(|filter| !filter.is_empty())
+            .map(|filter| {
+                let pattern = Pattern::parse(filter, CaseMatching::Smart, Normalization::Smart);
+                let mut matcher = MATCHER.lock();
+                matcher.config = Config::DEFAULT;
+                (pattern, matcher)
+            });
+        let (mut buf, mut indices) = (Vec::new(), Vec::new());
+
+        let rows = options.iter().map(|option| {
+            let row = option.format(&self.editor_data);
+            let Some((pattern, matcher)) = &mut highlighter else {
+                return row;
+            };
+            indices.clear();
+            let text = row_text(&row);
+            pattern.indices(Utf32Str::new(&text, &mut buf), matcher, &mut indices);
+            indices.sort_unstable();
+            indices.dedup();
+            highlight_row(row, &indices, highlight_style)
+        });
         let table = Table::new(rows)
             .style(style)
             .highlight_style(selected)
@@ -414,5 +571,210 @@ impl<T: Item + 'static> Component for Menu<T> {
                 }
             }
         }
+    }
+}
+
+/// The text that a filter matches in a row: the first line of each cell, with
+/// a space between cells.
+fn row_text(row: &Row) -> String {
+    let mut text = String::new();
+    for (index, cell) in row.cells.iter().enumerate() {
+        if index != 0 {
+            text.push(' ');
+        }
+        if let Some(line) = cell.content.lines.first() {
+            for span in &line.0 {
+                text.push_str(&span.content);
+            }
+        }
+    }
+    text
+}
+
+/// Patches `highlight` onto the graphemes of the row that a filter matched.
+/// `indices` are sorted indices into [`row_text`]; nucleo matches the first
+/// character of each grapheme, so they count graphemes.
+fn highlight_row<'a>(mut row: Row<'a>, indices: &[u32], highlight: Style) -> Row<'a> {
+    let mut indices = indices.iter().copied().peekable();
+    let mut index = 0u32;
+
+    for cell in &mut row.cells {
+        if let Some(line) = cell.content.lines.first_mut() {
+            let mut spans = Vec::with_capacity(line.0.len());
+            for span in line.0.drain(..) {
+                let mut run = String::new();
+                let mut run_matched = false;
+                for grapheme in span.content.graphemes(true) {
+                    let matched = indices.next_if_eq(&index).is_some();
+                    index += 1;
+                    if matched != run_matched && !run.is_empty() {
+                        let style = if run_matched {
+                            span.style.patch(highlight)
+                        } else {
+                            span.style
+                        };
+                        spans.push(Span::styled(std::mem::take(&mut run), style));
+                    }
+                    run_matched = matched;
+                    run.push_str(grapheme);
+                }
+                if !run.is_empty() {
+                    let style = if run_matched {
+                        span.style.patch(highlight)
+                    } else {
+                        span.style
+                    };
+                    spans.push(Span::styled(run, style));
+                }
+            }
+            line.0 = spans;
+        }
+        // The space between cells.
+        index += 1;
+    }
+
+    row
+}
+
+/// Deletes the last word of the filter and the spaces after it.
+fn delete_word_backwards(filter: &mut String) {
+    let end = filter.trim_end().len();
+    let start = filter[..end]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    filter.truncate(start);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Action(&'static str);
+
+    impl Item for Action {
+        type Data = ();
+
+        fn format(&self, _data: &Self::Data) -> Row<'_> {
+            self.0.into()
+        }
+    }
+
+    fn menu(options: &[&'static str]) -> Menu<Action> {
+        let options = options.iter().map(|&option| Action(option)).collect();
+        Menu::new(options, (), |_editor, _option, _event| {}).filter_on_type(true)
+    }
+
+    fn filter(menu: &mut Menu<Action>, filter: &str) -> Vec<&'static str> {
+        menu.filter = Some(filter.to_string());
+        menu.apply_filter();
+        menu.matches
+            .iter()
+            .map(|&(index, _score)| menu.options[index as usize].0)
+            .collect()
+    }
+
+    const ACTIONS: [&str; 4] = [
+        "Extract to function",
+        "Inline variable",
+        "Extract to variable",
+        "Organize imports",
+    ];
+
+    #[test]
+    fn filter_keeps_matches_best_first() {
+        let mut menu = menu(&ACTIONS);
+
+        assert_eq!(filter(&mut menu, "orgimp"), ["Organize imports"]);
+        // Equal matches keep their order.
+        assert_eq!(
+            filter(&mut menu, "variable"),
+            ["Inline variable", "Extract to variable"]
+        );
+        // Atoms narrow together, as in pickers.
+        assert_eq!(filter(&mut menu, "ext var"), ["Extract to variable"]);
+        assert_eq!(
+            menu.selection().map(|action| action.0),
+            Some("Extract to variable")
+        );
+    }
+
+    #[test]
+    fn empty_filter_shows_all_options_in_order() {
+        let mut menu = menu(&ACTIONS);
+
+        assert_eq!(filter(&mut menu, ""), ACTIONS);
+        assert_eq!(menu.cursor, Some(0));
+    }
+
+    #[test]
+    fn no_match_leaves_nothing_selected() {
+        let mut menu = menu(&ACTIONS);
+
+        assert!(filter(&mut menu, "zzz").is_empty());
+        assert!(menu.selection().is_none());
+        // Moving through an empty menu does nothing.
+        menu.move_down();
+        menu.move_up();
+        menu.move_half_page_down();
+        menu.move_half_page_up();
+        assert!(menu.selection().is_none());
+    }
+
+    #[test]
+    fn filter_line_takes_a_row() {
+        let mut menu = menu(&ACTIONS);
+
+        assert_eq!(menu.required_size((80, 20)).unwrap().1, 4);
+        filter(&mut menu, "ext");
+        assert_eq!(menu.required_size((80, 20)).unwrap().1, 3);
+        assert_eq!(menu.list_height(), 2);
+        filter(&mut menu, "zzz");
+        assert_eq!(menu.required_size((80, 20)).unwrap().1, 1);
+        assert_eq!(menu.list_height(), 0);
+    }
+
+    #[test]
+    fn highlight_spans_cells() {
+        let highlight = Style::default().add_modifier(Modifier::BOLD);
+        let row = Row::new(["ab", "cd"]);
+        assert_eq!(row_text(&row), "ab cd");
+
+        // "b" in the first cell and "c" in the second; index 2 is the space.
+        let row = highlight_row(row, &[1, 3], highlight);
+        let runs: Vec<Vec<_>> = row
+            .cells
+            .iter()
+            .map(|cell| {
+                cell.content.lines[0]
+                    .0
+                    .iter()
+                    .map(|span| (span.content.to_string(), span.style == highlight))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                vec![("a".to_string(), false), ("b".to_string(), true)],
+                vec![("c".to_string(), true), ("d".to_string(), false)],
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_word_removes_the_last_word() {
+        let mut filter = String::from("extract to ");
+        delete_word_backwards(&mut filter);
+        assert_eq!(filter, "extract ");
+        delete_word_backwards(&mut filter);
+        assert_eq!(filter, "");
+        delete_word_backwards(&mut filter);
+        assert_eq!(filter, "");
+
+        let mut filter = String::from("ext\u{3000}fün");
+        delete_word_backwards(&mut filter);
+        assert_eq!(filter, "ext\u{3000}");
     }
 }

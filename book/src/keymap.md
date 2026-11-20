@@ -767,6 +767,28 @@ mode before pressing `n` or `N` makes it possible to keep the current
 selection. Toggling it on and off during your iterative searching allows
 you to selectively add search terms to your selections.
 
+## Menu
+
+Keys to use within the code action menu (`Space a`) and within the choices
+that a language server asks you to make. Remapping currently not supported.
+
+| Key                                         | Description                          |
+| -----                                       | -------------                        |
+| `Shift-Tab`, `Up`, `Ctrl-p`                 | Previous entry                       |
+| `Tab`, `Down`, `Ctrl-n`                     | Next entry                           |
+| `PageUp`, `Ctrl-u`                          | Page up                              |
+| `PageDown`, `Ctrl-d`                        | Page down                            |
+| `Enter`                                     | Accept the selected entry            |
+| `Escape`, `Ctrl-c`                          | Close the menu                       |
+| `Backspace`, `Ctrl-h`                       | Delete the last character of the filter |
+| `Ctrl-w`, `Alt-Backspace`, `Ctrl-Backspace` | Delete the last word of the filter   |
+
+Typing filters the entries, with the [syntax of
+pickers](./pickers.md#filtering-picker-results). The typed text shows above
+the entries with the number of matches, the best matches come first and the
+first one is selected. The completion menu is filtered by what you type in the
+document instead.
+
 ## Picker
 
 Keys to use within picker. Remapping currently not supported.
