@@ -1,5 +1,5 @@
 mod handlers;
-mod query;
+pub(crate) mod query;
 
 use crate::{
     alt,
