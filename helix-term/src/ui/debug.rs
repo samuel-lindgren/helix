@@ -32,6 +32,12 @@ const EMPTY: &str = "No variables available for the current frame.";
 const NO_MATCHES: &str = "No variables match the filter.";
 /// Shown next to an empty filter line.
 const FILTER_HINT: &str = "name, %type, %value";
+/// The narrowest filter line: `/`, a column of query and the two columns that
+/// the prompt keeps free at its end.
+const MIN_FILTER_WIDTH: u16 = 4;
+/// The query keeps at least this much of the filter line when the line also
+/// shows the hint or the match count.
+const MIN_QUERY_WIDTH: u16 = 12;
 /// The columns a filter can name with `%`; text without a column matches the first one.
 const FILTER_COLUMNS: [&str; 3] = ["name", "type", "value"];
 
@@ -52,20 +58,27 @@ pub struct DebugVariables {
 
 /// Narrows the rows to the variables that match a query typed after `/`.
 ///
-/// A row stays when it matches, when one of its loaded children matches at any
-/// depth, or when a row above it matches. Nothing is fetched from the debugger
-/// for the filter, and rows keep their expanded state.
+/// A row stays when its variable matches, when one of its loaded children
+/// matches at any depth, or when a row above it matches and no `!` term of the
+/// query excludes it. Scopes do not match; their rows stay above matches.
+/// Nothing is fetched from the debugger for the filter, and rows keep their
+/// expanded state.
 struct Filter {
     prompt: Prompt,
     query: PickerQuery,
     /// One pattern per entry of [`FILTER_COLUMNS`], `None` where the query has no text.
     patterns: [Option<Pattern>; 3],
+    /// The `!` terms of each pattern, which also hide rows below a match.
+    exclusions: [Option<Pattern>; 3],
     /// Whether keys go to the filter line rather than to the tree.
     editing: bool,
-    /// Loaded nodes that match.
+    /// Loaded variables that match.
     matched: usize,
-    /// Loaded nodes.
+    /// Loaded variables.
     total: usize,
+    /// The node the cursor was last on, to go back to when a query that
+    /// matches nothing is changed or cleared.
+    anchor: Option<Vec<usize>>,
 }
 
 /// Where the rows of a filtered tree put the cursor after the query changes.
@@ -306,7 +319,7 @@ impl DebugVariables {
             Some(filter) => {
                 let mut guard = MATCHER.lock();
                 guard.config = Config::DEFAULT;
-                let mut matcher = FilterMatcher::new(&filter.patterns, &mut guard);
+                let mut matcher = FilterMatcher::new(filter, &mut guard);
                 Self::collect_filtered_paths(
                     &self.roots,
                     &mut prefix,
@@ -411,8 +424,9 @@ impl DebugVariables {
         holds_match
     }
 
-    /// Pushes the rows below a matching node as the tree shows them, and offers
-    /// the ones that match as well as cursor targets.
+    /// Pushes the rows below a matching node as the tree shows them, except the
+    /// ones that a `!` term excludes, and offers the ones that match as well as
+    /// cursor targets.
     fn collect_matched_paths(
         nodes: &[Node],
         prefix: &mut Vec<usize>,
@@ -421,6 +435,9 @@ impl DebugVariables {
         targets: &mut FilterTargets,
     ) {
         for (index, node) in nodes.iter().enumerate() {
+            if !matcher.passes_exclusions(node) {
+                continue;
+            }
             prefix.push(index);
             if let Some(rank) = matcher.rank(node) {
                 targets.offer_match(rank, visible_paths.len());
@@ -441,7 +458,7 @@ impl DebugVariables {
         }
     }
 
-    /// Counts the loaded nodes, and the ones among them that match.
+    /// Counts the loaded variables, and the ones among them that match.
     fn count_matches(
         nodes: &[Node],
         matcher: &mut FilterMatcher,
@@ -449,9 +466,11 @@ impl DebugVariables {
         total: &mut usize,
     ) {
         for node in nodes {
-            *total += 1;
-            if matcher.rank(node).is_some() {
-                *matched += 1;
+            if !node.is_scope() {
+                *total += 1;
+                if matcher.rank(node).is_some() {
+                    *matched += 1;
+                }
             }
             Self::count_matches(node.loaded_children(), matcher, matched, total);
         }
@@ -473,22 +492,29 @@ impl DebugVariables {
 
     /// Shows all rows again, with the cursor on the node it was on.
     fn clear_filter(&mut self) {
-        if self.filter.take().is_some() {
-            self.refresh_visible_paths();
-        }
+        let Some(filter) = self.filter.take() else {
+            return;
+        };
+        let selected = self.selected_path().or(filter.anchor);
+        self.collect_rows();
+        self.restore_cursor(selected);
     }
 
     /// Filters the rows by `input` and puts the cursor on the best match, or on
     /// the first collapsed row that holds one.
     fn set_filter_query(&mut self, input: &str) {
+        let selected = self.selected_path();
         let Some(filter) = &mut self.filter else {
             return;
         };
         if !filter.set_query(input) {
             return;
         }
+        if selected.is_some() {
+            filter.anchor = selected;
+        }
 
-        let selected = self.selected_path();
+        let selected = filter.anchor.clone();
         let targets = self.collect_rows();
         match targets.best.map(|(_rank, row)| row).or(targets.holder) {
             Some(row) => {
@@ -662,6 +688,11 @@ impl DebugVariables {
         } else if self.cursor >= self.scroll + page_size {
             self.scroll = self.cursor + 1 - page_size;
         }
+        // Fill the page when fewer rows than a page are left below the offset,
+        // say after the filter narrowed them.
+        self.scroll = self
+            .scroll
+            .min(self.visible_paths.len().saturating_sub(page_size));
     }
 
     fn expand_selected(&mut self, editor: &mut Editor) {
@@ -959,21 +990,8 @@ impl DebugVariables {
         }
     }
 
-    fn footer_text(&self) -> Cow<'_, str> {
-        if let Some(status) = &self.status {
-            return status.as_str().into();
-        }
-
-        match &self.filter {
-            Some(filter) => format!(
-                "/{}  {}/{} | / edit | esc clear",
-                filter.prompt.line(),
-                filter.matched,
-                filter.total
-            )
-            .into(),
-            None => HELP.into(),
-        }
+    fn footer_text(&self) -> &str {
+        self.status.as_deref().unwrap_or(HELP)
     }
 
     /// Splits the browser's area into the rows and the footer line.
@@ -990,7 +1008,7 @@ impl DebugVariables {
     }
 
     /// Draws the filter line being edited, with the match count or a hint on
-    /// the right.
+    /// the right when there is room for it.
     fn render_filter_line(
         filter: &mut Filter,
         area: Rect,
@@ -998,22 +1016,50 @@ impl DebugVariables {
         cx: &mut Context,
         style: Style,
     ) {
+        if area.width < MIN_FILTER_WIDTH {
+            return;
+        }
+
         let note = if filter.is_active() {
             Cow::from(format!("{}/{}", filter.matched, filter.total))
         } else {
             Cow::from(FILTER_HINT)
         };
-        let note_width = (note.len() as u16).min(area.width);
+        let note_width = note.len() as u16;
+        let show_note = area.width >= note_width + 1 + MIN_QUERY_WIDTH;
 
-        // The prompt clears its background, so draw it first.
-        filter
-            .prompt
-            .render(area.clip_right(note_width + 1), surface, cx);
+        let prompt_area = if show_note {
+            area.clip_right(note_width + 1)
+        } else {
+            area
+        };
+        filter.prompt.render(prompt_area, surface, cx);
+        if show_note {
+            surface.set_stringn(
+                area.right() - note_width,
+                area.y,
+                &note,
+                note_width as usize,
+                style,
+            );
+        }
+        // The prompt clears its line with the editor's background.
+        if let Some(bg) = style.bg {
+            surface.set_style(area, Style::default().bg(bg));
+        }
+    }
+
+    /// Draws the query of an applied filter, then the match count and the keys.
+    fn render_applied_filter(filter: &Filter, area: Rect, surface: &mut Surface, style: Style) {
+        let query = format!("/{}", sanitize_inline(filter.prompt.line().clone()));
+        let rest = format!("  {}/{} | / edit | esc clear", filter.matched, filter.total);
+        let query_width = area.width.saturating_sub(rest.len() as u16);
+        let (x, _) = surface.set_stringn(area.x, area.y, &query, query_width as usize, style);
         surface.set_stringn(
-            area.right().saturating_sub(note_width),
+            x,
             area.y,
-            &note,
-            note_width as usize,
+            &rest,
+            area.right().saturating_sub(x) as usize,
             style,
         );
     }
@@ -1034,6 +1080,12 @@ impl Component for DebugVariables {
 
         let key_event = match event {
             Event::Key(event) => *event,
+            // Pasted text would go to the buffer behind the browser.
+            Event::Paste(_) => {
+                self.edit_filter();
+                self.edit_filter_line(event, ctx);
+                return EventResult::Consumed(None);
+            }
             Event::Resize(..) => return EventResult::Consumed(None),
             _ => return EventResult::Ignored(None),
         };
@@ -1130,7 +1182,7 @@ impl Component for DebugVariables {
                 .filter
                 .as_ref()
                 .filter(|filter| filter.is_active())
-                .map(|filter| FilterMatcher::new(&filter.patterns, &mut guard));
+                .map(|filter| FilterMatcher::new(filter, &mut guard));
 
             let rows = self.visible_paths.iter().map(|path| {
                 let depth = path.len().saturating_sub(1);
@@ -1185,9 +1237,16 @@ impl Component for DebugVariables {
         }
 
         if footer_area.height != 0 {
+            let footer_style = match styles.help.bg.or(styles.base.bg) {
+                Some(bg) => styles.help.bg(bg),
+                None => styles.help,
+            };
             match &mut self.filter {
                 Some(filter) if filter.editing => {
-                    Self::render_filter_line(filter, footer_area, surface, ctx, styles.help)
+                    Self::render_filter_line(filter, footer_area, surface, ctx, footer_style)
+                }
+                Some(filter) if self.status.is_none() => {
+                    Self::render_applied_filter(filter, footer_area, surface, styles.help)
                 }
                 _ => {
                     let footer = TuiText::from(self.footer_text());
@@ -1202,7 +1261,11 @@ impl Component for DebugVariables {
     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
         let (_list_area, footer_area) = Self::layout(area);
         match &self.filter {
-            Some(filter) if filter.editing && footer_area.height != 0 => {
+            Some(filter)
+                if filter.editing
+                    && footer_area.height != 0
+                    && footer_area.width >= MIN_FILTER_WIDTH =>
+            {
                 filter.prompt.cursor(footer_area, editor)
             }
             _ => (None, CursorKind::Hidden),
@@ -1225,9 +1288,11 @@ impl Filter {
             ),
             query: PickerQuery::new(FILTER_COLUMNS.iter().map(|&column| column.into()), 0),
             patterns: [None, None, None],
+            exclusions: [None, None, None],
             editing: true,
             matched: 0,
             total: 0,
+            anchor: None,
         }
     }
 
@@ -1244,12 +1309,27 @@ impl Filter {
             return false;
         }
 
-        for (pattern, column) in self.patterns.iter_mut().zip(FILTER_COLUMNS) {
+        for ((pattern, exclusion), column) in self
+            .patterns
+            .iter_mut()
+            .zip(&mut self.exclusions)
+            .zip(FILTER_COLUMNS)
+        {
             *pattern = self
                 .query
                 .get(column)
                 .map(|text| Pattern::parse(text, CaseMatching::Smart, Normalization::Smart))
                 .filter(|pattern| !pattern.atoms.is_empty());
+            *exclusion = pattern.as_ref().and_then(|pattern| {
+                let mut exclusion = Pattern::default();
+                exclusion.atoms = pattern
+                    .atoms
+                    .iter()
+                    .filter(|atom| atom.negative)
+                    .cloned()
+                    .collect();
+                (!exclusion.atoms.is_empty()).then_some(exclusion)
+            });
         }
         true
     }
@@ -1257,26 +1337,30 @@ impl Filter {
 
 /// Matches nodes against the patterns of a filter.
 struct FilterMatcher<'a> {
-    patterns: &'a [Option<Pattern>; 3],
+    filter: &'a Filter,
     matcher: &'a mut Matcher,
-    buf: Vec<char>,
+    haystack: Haystack,
 }
 
 impl<'a> FilterMatcher<'a> {
-    fn new(patterns: &'a [Option<Pattern>; 3], matcher: &'a mut Matcher) -> Self {
+    fn new(filter: &'a Filter, matcher: &'a mut Matcher) -> Self {
         Self {
-            patterns,
+            filter,
             matcher,
-            buf: Vec::new(),
+            haystack: Haystack::default(),
         }
     }
 
-    /// How well the node matches, when every column of the query matches it.
+    /// How well the node matches, when it is a variable and every column of
+    /// the query matches it.
     fn rank(&mut self, node: &Node) -> Option<Rank> {
+        if node.is_scope() {
+            return None;
+        }
         let mut rank = Rank { score: 0, len: 0 };
-        for (pattern, text) in self.patterns.iter().zip(node.filter_columns()) {
+        for (pattern, text) in self.filter.patterns.iter().zip(node.filter_columns()) {
             if let Some(pattern) = pattern {
-                let text = Utf32Str::new(text, &mut self.buf);
+                let text = self.haystack.utf32(text);
                 rank.score += pattern.score(text, self.matcher)?;
                 rank.len += text.len();
             }
@@ -1284,17 +1368,36 @@ impl<'a> FilterMatcher<'a> {
         Some(rank)
     }
 
+    /// Whether no `!` term of the query excludes the node.
+    fn passes_exclusions(&mut self, node: &Node) -> bool {
+        for (exclusion, text) in self.filter.exclusions.iter().zip(node.filter_columns()) {
+            if let Some(exclusion) = exclusion {
+                if exclusion
+                    .score(self.haystack.utf32(text), self.matcher)
+                    .is_none()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// The matched grapheme indices of each column, sorted, when the node matches.
     fn indices(&mut self, node: &Node) -> Option<[Vec<u32>; 3]> {
+        if node.is_scope() {
+            return None;
+        }
         let mut matches: [Vec<u32>; 3] = Default::default();
         for ((pattern, text), indices) in self
+            .filter
             .patterns
             .iter()
             .zip(node.filter_columns())
             .zip(&mut matches)
         {
             if let Some(pattern) = pattern {
-                pattern.indices(Utf32Str::new(text, &mut self.buf), self.matcher, indices)?;
+                pattern.indices(self.haystack.utf32(text), self.matcher, indices)?;
                 indices.sort_unstable();
                 indices.dedup();
             }
@@ -1318,9 +1421,40 @@ impl Rank {
     }
 }
 
+/// Hands text to nucleo with one character per grapheme, so that match
+/// indices count graphemes. `Utf32Str::new` hands on the bytes of text whose
+/// graphemes all start with an ASCII character, such as an `e` with a combining
+/// accent, and its indices then count bytes.
+#[derive(Default)]
+struct Haystack {
+    chars: Vec<char>,
+    ascii: Vec<u8>,
+}
+
+impl Haystack {
+    fn utf32<'a>(&'a mut self, text: &'a str) -> Utf32Str<'a> {
+        if text.is_ascii() && !text.contains("\r\n") {
+            return Utf32Str::Ascii(text.as_bytes());
+        }
+        self.chars.clear();
+        self.chars.extend(
+            text.graphemes(true)
+                .filter_map(|grapheme| grapheme.chars().next()),
+        );
+        if self.chars.iter().all(char::is_ascii) {
+            // Nucleo matches ASCII text more fully than the same characters
+            // as Unicode, so keep it ASCII.
+            self.ascii.clear();
+            self.ascii.extend(self.chars.iter().map(|&c| c as u8));
+            Utf32Str::Ascii(&self.ascii)
+        } else {
+            Utf32Str::Unicode(&self.chars)
+        }
+    }
+}
+
 /// Pushes `text` as spans in `style`, with `matched` patched onto the graphemes
-/// at `indices`. Nucleo matches the first character of each grapheme, so its
-/// indices count graphemes.
+/// at `indices`, which count graphemes (see [`Haystack`]).
 fn push_highlighted(
     spans: &mut Vec<Span<'static>>,
     text: &str,
@@ -1444,6 +1578,10 @@ impl Node {
         match &self.kind {
             NodeKind::Scope { name, .. } | NodeKind::Variable { name, .. } => name.clone(),
         }
+    }
+
+    fn is_scope(&self) -> bool {
+        matches!(self.kind, NodeKind::Scope { .. })
     }
 
     fn loaded_children(&self) -> &[Node] {
@@ -1777,10 +1915,10 @@ mod tests {
         filter(&mut variables, "s");
 
         let filter = variables.filter.as_ref().unwrap();
-        // Locals, Globals and the seven variables are loaded.
-        assert_eq!(filter.total, 9);
-        // Locals, resp, StatusCode, Status and Globals.
-        assert_eq!(filter.matched, 5);
+        // The seven variables are loaded; scopes do not count.
+        assert_eq!(filter.total, 7);
+        // resp, StatusCode and Status.
+        assert_eq!(filter.matched, 3);
     }
 
     #[test]
@@ -1859,6 +1997,206 @@ mod tests {
             &mut indices,
         );
         assert_eq!(indices, [0, 5]);
+    }
+
+    #[test]
+    fn scope_names_do_not_match() {
+        let mut variables = response_browser(true);
+
+        filter(&mut variables, "locals");
+        assert!(rows(&variables).is_empty());
+
+        // "s" is in Locals, but only the variables that have it stay.
+        filter(&mut variables, "s");
+        assert_eq!(
+            rows(&variables),
+            [
+                "Locals",
+                "  resp",
+                "    StatusCode",
+                "    Status",
+                "    Body"
+            ]
+        );
+    }
+
+    #[test]
+    fn negations_hide_rows_below_a_match_too() {
+        let mut variables = response_browser(true);
+
+        filter(&mut variables, "%v !nil");
+        assert_eq!(
+            rows(&variables),
+            [
+                "Locals",
+                "  resp",
+                "    StatusCode",
+                "    Status",
+                "  errCount",
+                "  buffer"
+            ]
+        );
+
+        filter(&mut variables, "!err");
+        assert_eq!(
+            rows(&variables),
+            [
+                "Locals",
+                "  resp",
+                "    StatusCode",
+                "    Status",
+                "    Body",
+                "  buffer"
+            ]
+        );
+    }
+
+    #[test]
+    fn narrowing_the_rows_pulls_the_scroll_back() {
+        let locals = (0..30)
+            .map(|index| variable(&format!("v{index}"), "int", "0"))
+            .chain([variable("needle", "int", "1")])
+            .collect();
+        let mut variables = browser(vec![scope("Locals", true, locals)]);
+        variables.page_size = 10;
+        variables.move_end();
+        assert_eq!(variables.scroll, 22);
+
+        filter(&mut variables, "needle");
+        assert_eq!(rows(&variables), ["Locals", "  needle"]);
+        // Both rows show, not only the selected one.
+        assert_eq!(variables.scroll, 0);
+    }
+
+    #[test]
+    fn a_query_without_matches_keeps_the_node_to_go_back_to() {
+        let mut variables = response_browser(false);
+        variables.move_end();
+        variables.move_up();
+        assert_eq!(selected(&variables), "buffer");
+
+        filter(&mut variables, "zzz");
+        assert!(variables.selected_path().is_none());
+        filter(&mut variables, "");
+        assert_eq!(selected(&variables), "buffer");
+
+        filter(&mut variables, "zzz");
+        variables.clear_filter();
+        assert_eq!(selected(&variables), "buffer");
+    }
+
+    #[test]
+    fn highlights_count_graphemes_of_decomposed_text() {
+        // An `e` with a combining accent, which `Utf32Str::new` passes as bytes.
+        let text = "cafe\u{301} au lait";
+        let pattern = Pattern::parse("'lait", CaseMatching::Smart, Normalization::Smart);
+        let mut matcher = Matcher::default();
+        let mut indices = Vec::new();
+        pattern.indices(Haystack::default().utf32(text), &mut matcher, &mut indices);
+        assert_eq!(indices, [8, 9, 10, 11]);
+
+        let matched = Style::default().add_modifier(Modifier::BOLD);
+        let mut spans = Vec::new();
+        push_highlighted(&mut spans, text, Style::default(), &indices, matched);
+        let runs: Vec<_> = spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style == matched))
+            .collect();
+        assert_eq!(runs, [("cafe\u{301} au ", false), ("lait", true)]);
+    }
+
+    #[cfg(feature = "integration")]
+    fn editor() -> Editor {
+        use std::sync::Arc;
+
+        use crate::config::Config;
+
+        let config = Arc::new(arc_swap::ArcSwap::from_pointee(Config::default()));
+        let handlers = crate::handlers::setup(config.clone());
+        Editor::new(
+            Rect::new(0, 0, 120, 40),
+            Arc::new(helix_view::theme::Loader::new(&[])),
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                helix_core::syntax::Loader::default(),
+            )),
+            Arc::new(arc_swap::access::Map::new(config, |config: &Config| {
+                &config.editor
+            })),
+            handlers,
+        )
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keys_go_to_the_filter_line_or_to_the_editor() {
+        let mut editor = editor();
+        let mut jobs = crate::job::Jobs::new();
+        let mut cx = Context {
+            editor: &mut editor,
+            scroll: None,
+            jobs: &mut jobs,
+        };
+        let mut variables = response_browser(true);
+        let mut press =
+            |variables: &mut DebugVariables, key| variables.handle_event(&Event::Key(key), &mut cx);
+
+        // The browser does not use `n`, so it goes on to the editor's debug menu.
+        assert!(matches!(
+            press(&mut variables, key!('n')),
+            EventResult::Ignored(None)
+        ));
+
+        assert!(matches!(
+            press(&mut variables, key!('/')),
+            EventResult::Consumed(None)
+        ));
+        // On the filter line `n` is text like any other key.
+        for key in [key!('n'), key!('a'), key!('m'), key!('e')] {
+            assert!(matches!(
+                press(&mut variables, key),
+                EventResult::Consumed(None)
+            ));
+        }
+        assert_eq!(variables.filter.as_ref().unwrap().prompt.line(), "name");
+        assert!(rows(&variables).is_empty());
+
+        press(&mut variables, ctrl!('w'));
+        for key in [key!('b'), key!('o'), key!('d')] {
+            press(&mut variables, key);
+        }
+        assert_eq!(rows(&variables), ["Locals", "  resp", "    Body"]);
+        assert_eq!(selected(&variables), "Body");
+
+        // Enter keeps the filter, and the tree keys work on its rows.
+        press(&mut variables, key!(Enter));
+        assert!(!variables.filter.as_ref().unwrap().editing);
+        press(&mut variables, key!('k'));
+        assert_eq!(selected(&variables), "resp");
+        assert!(matches!(
+            press(&mut variables, key!('x')),
+            EventResult::Ignored(None)
+        ));
+
+        // Esc clears the filter, then closes the browser.
+        assert!(matches!(
+            press(&mut variables, key!(Esc)),
+            EventResult::Consumed(None)
+        ));
+        assert!(variables.filter.is_none());
+        assert_eq!(selected(&variables), "resp");
+        assert!(matches!(
+            press(&mut variables, key!(Esc)),
+            EventResult::Consumed(Some(_))
+        ));
+
+        // Pasted text filters instead of going to the buffer behind.
+        let mut variables = response_browser(true);
+        let paste = Event::Paste("errc".to_string());
+        assert!(matches!(
+            variables.handle_event(&paste, &mut cx),
+            EventResult::Consumed(None)
+        ));
+        assert_eq!(rows(&variables), ["Locals", "  errCount"]);
     }
 }
 
