@@ -5,7 +5,10 @@ use crate::{
     compositor::{Callback, Component, Compositor, Context, Event, EventResult},
     ctrl, key, shift,
 };
-use helix_core::{fuzzy::MATCHER, unicode::segmentation::UnicodeSegmentation};
+use helix_core::{
+    fuzzy::MATCHER,
+    unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidthStr},
+};
 use nucleo::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Utf32Str,
@@ -51,9 +54,17 @@ pub struct Menu<T: Item> {
     viewport: (u16, u16),
     recalculate: bool,
     auto_close: bool,
-    /// The text typed to filter the options, when typing filters them (see
+    /// What was typed to filter the options, when typing filters them (see
     /// [`Menu::filter_on_type`]).
-    filter: Option<String>,
+    filter: Option<Filter>,
+}
+
+/// The text typed to filter a menu.
+#[derive(Default)]
+struct Filter {
+    text: String,
+    /// `text` parsed as the query of a picker.
+    pattern: Pattern,
 }
 
 impl<T: Item> Menu<T> {
@@ -169,7 +180,7 @@ impl<T: Item> Menu<T> {
     /// first, and the typed text shows above them. Menus whose filter is typed
     /// elsewhere, such as completion in the document, leave this off.
     pub fn filter_on_type(mut self, filter_on_type: bool) -> Self {
-        self.filter = filter_on_type.then(String::new);
+        self.filter = filter_on_type.then(Filter::default);
         self
     }
 
@@ -178,7 +189,7 @@ impl<T: Item> Menu<T> {
         u16::from(
             self.filter
                 .as_ref()
-                .is_some_and(|filter| !filter.is_empty()),
+                .is_some_and(|filter| !filter.text.is_empty()),
         )
     }
 
@@ -194,15 +205,14 @@ impl<T: Item> Menu<T> {
             return;
         };
 
-        let pattern = Pattern::parse(filter, CaseMatching::Smart, Normalization::Smart);
         let mut matcher = MATCHER.lock();
         matcher.config = Config::DEFAULT;
-        let mut buf = Vec::new();
+        let mut haystack = Haystack::default();
 
         self.matches.clear();
         for (index, option) in self.options.iter().enumerate() {
             let text = row_text(&option.format(&self.editor_data));
-            if let Some(score) = pattern.score(Utf32Str::new(&text, &mut buf), &mut matcher) {
+            if let Some(score) = filter.pattern.score(haystack.utf32(&text), &mut matcher) {
                 self.matches.push((index as u32, score));
             }
         }
@@ -214,14 +224,37 @@ impl<T: Item> Menu<T> {
         self.recalculate = true;
     }
 
-    /// Changes the filter, re-filters the options and reports the selection.
+    /// Changes the filter text, and reports the new selection when the query
+    /// changed with it.
     fn edit_filter(&mut self, cx: &mut Context, edit: impl FnOnce(&mut String)) {
+        if self.edit_filter_text(edit) {
+            (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
+        }
+    }
+
+    /// Changes the filter text. When that changes the query, the options are
+    /// filtered again and the best match is selected; edits that leave the
+    /// query as it was, such as a space at the end, keep the selection.
+    /// Returns whether the query changed.
+    fn edit_filter_text(&mut self, edit: impl FnOnce(&mut String)) -> bool {
         let Some(filter) = &mut self.filter else {
-            return;
+            return false;
         };
-        edit(filter);
+        let old_text = filter.text.clone();
+        edit(&mut filter.text);
+        if filter.text == old_text {
+            return false;
+        }
+        // The filter line may have appeared, gone or grown.
+        self.recalculate = true;
+
+        let pattern = Pattern::parse(&filter.text, CaseMatching::Smart, Normalization::Smart);
+        if pattern.atoms == filter.pattern.atoms {
+            return false;
+        }
+        filter.pattern = pattern;
         self.apply_filter();
-        (self.callback_fn)(cx.editor, self.selection(), MenuEvent::Update);
+        true
     }
 
     fn recalculate_size(&mut self, viewport: (u16, u16)) {
@@ -244,9 +277,14 @@ impl<T: Item> Menu<T> {
         });
 
         let filter_rows = self.filter_rows() as usize;
-        let height = self
-            .matches
-            .len()
+        // A menu that filters keeps the height of all its options, so that it
+        // stays in place while matches come and go.
+        let rows = if self.filter.is_some() {
+            self.options.len()
+        } else {
+            self.matches.len()
+        };
+        let height = rows
             .min(10)
             .min((viewport.1 as usize).saturating_sub(filter_rows));
         // do all the matches fit on a single screen?
@@ -259,6 +297,15 @@ impl<T: Item> Menu<T> {
         }
 
         len += Self::LEFT_PADDING;
+        if let Some(filter) = self
+            .filter
+            .as_ref()
+            .filter(|filter| !filter.text.is_empty())
+        {
+            // The filter line: the text, a space and the widest count.
+            let count = format!("{0}/{0}", self.options.len());
+            len = len.max(Self::LEFT_PADDING + filter.text.width() + 1 + count.len() + 1);
+        }
         let width = len.min(viewport.0 as usize);
 
         self.widths = max_lens
@@ -310,19 +357,31 @@ impl<T: Item> Menu<T> {
 
     /// Draws the typed filter, with the count of matching options on the right.
     fn render_filter_line(&self, area: Rect, surface: &mut Surface, style: Style) {
-        let filter = self.filter.as_deref().unwrap_or_default();
+        let Some(filter) = &self.filter else {
+            return;
+        };
         let count = format!("{}/{}", self.matches.len(), self.options.len());
         let area = area.clip_left(Self::LEFT_PADDING as u16).clip_right(1);
         let count_width = count.len() as u16;
+        // The count gives way to the text when the line is narrow.
+        let show_count = area.width > count_width + 1;
+        let text_width = if show_count {
+            area.width - count_width - 1
+        } else {
+            area.width
+        };
 
-        surface.set_stringn(
+        // What was typed last stays in view.
+        surface.set_string_truncated(
             area.x,
             area.y,
-            filter,
-            area.width.saturating_sub(count_width + 1) as usize,
-            style,
+            &filter.text,
+            text_width as usize,
+            |_| style,
+            true,
+            true,
         );
-        if area.width > count_width {
+        if show_count {
             surface.set_stringn(
                 area.right() - count_width,
                 area.y,
@@ -419,7 +478,7 @@ impl<T: Item + 'static> Component for Menu<T> {
                     return EventResult::Ignored(close_fn);
                 }
             }
-            key!(Backspace) | ctrl!('h') if self.filter.is_some() => {
+            key!(Backspace) | shift!(Backspace) | ctrl!('h') if self.filter.is_some() => {
                 self.edit_filter(cx, |filter| {
                     filter.pop();
                 });
@@ -432,9 +491,7 @@ impl<T: Item + 'static> Component for Menu<T> {
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers,
-            } if self.filter.is_some()
-                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
+            } if self.filter.is_some() && is_text(modifiers) => {
                 self.edit_filter(cx, |filter| filter.push(c));
                 return EventResult::Consumed(None);
             }
@@ -468,7 +525,7 @@ impl<T: Item + 'static> Component for Menu<T> {
         surface.clear_with(area, style);
 
         let filter_rows = self.filter_rows();
-        if filter_rows != 0 {
+        if filter_rows != 0 && area.height != 0 {
             self.render_filter_line(area.with_height(1), surface, theme.get("ui.text"));
         }
         let area = area.clip_top(filter_rows);
@@ -491,15 +548,14 @@ impl<T: Item + 'static> Component for Menu<T> {
         let highlight_style = theme.get("special").add_modifier(Modifier::BOLD);
         let mut highlighter = self
             .filter
-            .as_deref()
-            .filter(|filter| !filter.is_empty())
+            .as_ref()
+            .filter(|filter| !filter.pattern.atoms.is_empty())
             .map(|filter| {
-                let pattern = Pattern::parse(filter, CaseMatching::Smart, Normalization::Smart);
                 let mut matcher = MATCHER.lock();
                 matcher.config = Config::DEFAULT;
-                (pattern, matcher)
+                (&filter.pattern, matcher)
             });
-        let (mut buf, mut indices) = (Vec::new(), Vec::new());
+        let (mut haystack, mut indices) = (Haystack::default(), Vec::new());
 
         let rows = options.iter().map(|option| {
             let row = option.format(&self.editor_data);
@@ -508,7 +564,7 @@ impl<T: Item + 'static> Component for Menu<T> {
             };
             indices.clear();
             let text = row_text(&row);
-            pattern.indices(Utf32Str::new(&text, &mut buf), matcher, &mut indices);
+            pattern.indices(haystack.utf32(&text), matcher, &mut indices);
             indices.sort_unstable();
             indices.dedup();
             highlight_row(row, &indices, highlight_style)
@@ -534,7 +590,11 @@ impl<T: Item + 'static> Component for Menu<T> {
         let render_borders = cx.editor.menu_border();
 
         if !render_borders {
-            if let Some(cursor) = self.cursor {
+            // The list can be empty below the filter line in a tiny area.
+            if let Some(cursor) = self
+                .cursor
+                .filter(|&cursor| cursor >= scroll && cursor - scroll < win_height)
+            {
                 let offset_from_top = cursor - scroll;
                 let left = &mut surface[(area.left(), area.y + offset_from_top as u16)];
                 left.set_style(selected);
@@ -574,6 +634,45 @@ impl<T: Item + 'static> Component for Menu<T> {
     }
 }
 
+/// Whether a character typed with `modifiers` is text for the filter. AltGr
+/// arrives as Ctrl and Alt together from some terminals.
+fn is_text(modifiers: KeyModifiers) -> bool {
+    let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    !modifiers.intersects(ctrl_alt) || modifiers.contains(ctrl_alt)
+}
+
+/// Hands text to nucleo with one character per grapheme, so that match
+/// indices count graphemes. `Utf32Str::new` hands on the bytes of text whose
+/// graphemes all start with an ASCII character, such as an `e` with a combining
+/// accent, and its indices then count bytes.
+#[derive(Default)]
+struct Haystack {
+    chars: Vec<char>,
+    ascii: Vec<u8>,
+}
+
+impl Haystack {
+    fn utf32<'a>(&'a mut self, text: &'a str) -> Utf32Str<'a> {
+        if text.is_ascii() && !text.contains("\r\n") {
+            return Utf32Str::Ascii(text.as_bytes());
+        }
+        self.chars.clear();
+        self.chars.extend(
+            text.graphemes(true)
+                .filter_map(|grapheme| grapheme.chars().next()),
+        );
+        if self.chars.iter().all(char::is_ascii) {
+            // Nucleo matches ASCII text more fully than the same characters
+            // as Unicode, so keep it ASCII.
+            self.ascii.clear();
+            self.ascii.extend(self.chars.iter().map(|&c| c as u8));
+            Utf32Str::Ascii(&self.ascii)
+        } else {
+            Utf32Str::Unicode(&self.chars)
+        }
+    }
+}
+
 /// The text that a filter matches in a row: the first line of each cell, with
 /// a space between cells.
 fn row_text(row: &Row) -> String {
@@ -605,6 +704,8 @@ fn highlight_row<'a>(mut row: Row<'a>, indices: &[u32], highlight: Style) -> Row
                 let mut run = String::new();
                 let mut run_matched = false;
                 for grapheme in span.content.graphemes(true) {
+                    // Skip indices that fell between cells.
+                    while indices.next_if(|&matched| matched < index).is_some() {}
                     let matched = indices.next_if_eq(&index).is_some();
                     index += 1;
                     if matched != run_matched && !run.is_empty() {
@@ -667,8 +768,8 @@ mod tests {
     }
 
     fn filter(menu: &mut Menu<Action>, filter: &str) -> Vec<&'static str> {
-        menu.filter = Some(filter.to_string());
-        menu.apply_filter();
+        let text = filter.to_string();
+        menu.edit_filter_text(|filter| *filter = text);
         menu.matches
             .iter()
             .map(|&(index, _score)| menu.options[index as usize].0)
@@ -704,6 +805,7 @@ mod tests {
     fn empty_filter_shows_all_options_in_order() {
         let mut menu = menu(&ACTIONS);
 
+        filter(&mut menu, "ext");
         assert_eq!(filter(&mut menu, ""), ACTIONS);
         assert_eq!(menu.cursor, Some(0));
     }
@@ -723,16 +825,102 @@ mod tests {
     }
 
     #[test]
-    fn filter_line_takes_a_row() {
+    fn filter_line_takes_a_row_and_the_list_keeps_its_height() {
         let mut menu = menu(&ACTIONS);
 
         assert_eq!(menu.required_size((80, 20)).unwrap().1, 4);
         filter(&mut menu, "ext");
-        assert_eq!(menu.required_size((80, 20)).unwrap().1, 3);
-        assert_eq!(menu.list_height(), 2);
+        assert_eq!(menu.required_size((80, 20)).unwrap().1, 5);
+        assert_eq!(menu.list_height(), 4);
         filter(&mut menu, "zzz");
-        assert_eq!(menu.required_size((80, 20)).unwrap().1, 1);
-        assert_eq!(menu.list_height(), 0);
+        assert_eq!(menu.required_size((80, 20)).unwrap().1, 5);
+    }
+
+    #[test]
+    fn better_matches_move_up() {
+        let mut menu = menu(&["Convert to raw string", "var"]);
+
+        assert_eq!(filter(&mut menu, "var"), ["var", "Convert to raw string"]);
+    }
+
+    #[test]
+    fn edits_that_keep_the_query_keep_the_selection() {
+        let mut menu = menu(&ACTIONS);
+        menu.move_down();
+        menu.move_down();
+        assert_eq!(
+            menu.selection().map(|action| action.0),
+            Some("Inline variable")
+        );
+
+        // Deleting from an empty filter changes nothing.
+        assert!(!menu.edit_filter_text(|filter| {
+            filter.pop();
+        }));
+        assert!(!menu.edit_filter_text(delete_word_backwards));
+        assert_eq!(
+            menu.selection().map(|action| action.0),
+            Some("Inline variable")
+        );
+
+        filter(&mut menu, "a");
+        menu.move_down();
+        let selected = menu.selection().map(|action| action.0);
+        // A space at the end only separates terms.
+        assert!(!menu.edit_filter_text(|filter| filter.push(' ')));
+        assert_eq!(menu.selection().map(|action| action.0), selected);
+        assert_eq!(menu.filter_rows(), 1);
+    }
+
+    #[test]
+    fn filter_line_keeps_the_end_of_a_long_filter() {
+        let mut menu = menu(&["Yes", "No"]);
+        filter(&mut menu, "abcdefghij");
+        // The menu grows for the filter line as far as it can.
+        // One column of padding on each side, the text, a space and "2/2".
+        assert_eq!(menu.required_size((80, 20)).unwrap().0, 16);
+        assert_eq!(menu.required_size((10, 20)).unwrap().0, 10);
+
+        let area = Rect::new(0, 0, 10, 1);
+        let mut surface = Surface::empty(area);
+        menu.render_filter_line(area, &mut surface, Style::default());
+        let line: String = (0..10).map(|x| surface[(x, 0)].symbol.clone()).collect();
+        assert_eq!(line, " …ij  0/2 ");
+    }
+
+    #[test]
+    fn highlight_steps_over_the_space_between_cells() {
+        let highlight = Style::default().add_modifier(Modifier::BOLD);
+        // "b", the space between the cells, and "c".
+        let row = highlight_row(Row::new(["ab", "cd"]), &[1, 2, 3], highlight);
+        let matched: Vec<_> = row
+            .cells
+            .iter()
+            .flat_map(|cell| cell.content.lines[0].0.iter())
+            .filter(|span| span.style == highlight)
+            .map(|span| span.content.to_string())
+            .collect();
+        assert_eq!(matched, ["b", "c"]);
+    }
+
+    #[test]
+    fn highlights_count_graphemes_of_decomposed_text() {
+        // An `e` with a combining accent, which `Utf32Str::new` passes as bytes.
+        let text = "cafe\u{301} au lait";
+        let pattern = Pattern::parse("'lait", CaseMatching::Smart, Normalization::Smart);
+        let mut matcher = nucleo::Matcher::default();
+        let mut indices = Vec::new();
+        pattern.indices(Haystack::default().utf32(text), &mut matcher, &mut indices);
+        assert_eq!(indices, [8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn altgr_characters_are_text() {
+        assert!(is_text(KeyModifiers::NONE));
+        assert!(is_text(KeyModifiers::SHIFT));
+        assert!(is_text(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert!(!is_text(KeyModifiers::CONTROL));
+        assert!(!is_text(KeyModifiers::ALT));
     }
 
     #[test]
@@ -759,6 +947,101 @@ mod tests {
             [
                 vec![("a".to_string(), false), ("b".to_string(), true)],
                 vec![("c".to_string(), true), ("d".to_string(), false)],
+            ]
+        );
+    }
+
+    #[cfg(feature = "integration")]
+    fn editor() -> Editor {
+        use std::sync::Arc;
+
+        use crate::config::Config;
+
+        let config = Arc::new(arc_swap::ArcSwap::from_pointee(Config::default()));
+        let handlers = crate::handlers::setup(config.clone());
+        Editor::new(
+            Rect::new(0, 0, 120, 40),
+            Arc::new(helix_view::theme::Loader::new(&[])),
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                helix_core::syntax::Loader::default(),
+            )),
+            Arc::new(arc_swap::access::Map::new(config, |config: &Config| {
+                &config.editor
+            })),
+            handlers,
+        )
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn select_answers_while_nothing_matches() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let mut editor = editor();
+        let mut jobs = crate::job::Jobs::new();
+        let mut cx = Context {
+            editor: &mut editor,
+            scroll: None,
+            jobs: &mut jobs,
+        };
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let mut select = crate::ui::Select::new(
+            "Restart the server?",
+            [Action("Yes"), Action("No")],
+            (),
+            move |_editor, action: Option<&Action>, event| {
+                let event = match event {
+                    MenuEvent::Update => "update",
+                    MenuEvent::Validate => "validate",
+                    MenuEvent::Abort => "abort",
+                };
+                recorded
+                    .borrow_mut()
+                    .push((action.map(|action| action.0), event));
+            },
+        );
+        let mut press = |select: &mut crate::ui::Select<Action>, key| {
+            select.handle_event(&Event::Key(key), &mut cx)
+        };
+        let alt_gr = |c| KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
+        };
+
+        // `q` matches no option, so none is selected.
+        assert!(matches!(
+            press(&mut select, key!('q')),
+            EventResult::Consumed(None)
+        ));
+        assert!(matches!(
+            press(&mut select, key!(Down)),
+            EventResult::Consumed(None)
+        ));
+        // Enter waits for a match.
+        assert!(matches!(
+            press(&mut select, key!(Enter)),
+            EventResult::Consumed(None)
+        ));
+        // Shift-Backspace deletes, and AltGr types.
+        press(&mut select, shift!(Backspace));
+        press(&mut select, alt_gr('n'));
+        press(&mut select, key!('q'));
+        // Esc still answers, with nothing selected.
+        assert!(matches!(
+            press(&mut select, key!(Esc)),
+            EventResult::Consumed(Some(_))
+        ));
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                (None, "update"),
+                (None, "update"),
+                (Some("Yes"), "update"),
+                (Some("No"), "update"),
+                (None, "update"),
+                (None, "abort"),
             ]
         );
     }

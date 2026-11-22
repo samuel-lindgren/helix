@@ -20,19 +20,16 @@ impl<T: Item> Select<T> {
     where
         M: Into<Cow<'static, str>>,
         I: IntoIterator<Item = T>,
-        F: Fn(&mut Editor, &T, PromptEvent) + 'static,
+        // While a typed filter matches no option, none is selected, so the
+        // callback gets `None`; Abort still has to be answered then.
+        F: Fn(&mut Editor, Option<&T>, PromptEvent) + 'static,
     {
         let message = tui::text::Text::from(message.into()).into();
         let options: Vec<_> = options.into_iter().collect();
         assert!(!options.is_empty());
-        let mut menu = Menu::new(options, data, move |editor, option, event| {
-            // Options are non-empty (asserted above) and an option is selected by default,
-            // so `option` must be Some here.
-            let option = &option.unwrap();
-            callback(editor, option, event)
-        })
-        .auto_close(true)
-        .filter_on_type(true);
+        let mut menu = Menu::new(options, data, callback)
+            .auto_close(true)
+            .filter_on_type(true);
         // Select the first option by default.
         menu.move_down();
 
