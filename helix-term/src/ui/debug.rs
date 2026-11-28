@@ -536,11 +536,17 @@ impl DebugVariables {
         self.set_filter_query(&input);
     }
 
+    /// Pastes `text` into the filter line, as one line.
+    fn paste_into_filter(&mut self, text: &str, ctx: &mut Context) {
+        let event = Event::Paste(sanitize_inline(text.to_string()));
+        self.edit_filter_line(&event, ctx);
+    }
+
     fn handle_filter_event(&mut self, event: &Event, ctx: &mut Context) -> EventResult {
         let key_event = match event {
             Event::Key(event) => *event,
-            Event::Paste(_) => {
-                self.edit_filter_line(event, ctx);
+            Event::Paste(text) => {
+                self.paste_into_filter(text, ctx);
                 return EventResult::Consumed(None);
             }
             Event::Resize(..) => return EventResult::Consumed(None),
@@ -1081,9 +1087,9 @@ impl Component for DebugVariables {
         let key_event = match event {
             Event::Key(event) => *event,
             // Pasted text would go to the buffer behind the browser.
-            Event::Paste(_) => {
+            Event::Paste(text) => {
                 self.edit_filter();
-                self.edit_filter_line(event, ctx);
+                self.paste_into_filter(text, ctx);
                 return EventResult::Consumed(None);
             }
             Event::Resize(..) => return EventResult::Consumed(None),
@@ -2189,13 +2195,15 @@ mod tests {
             EventResult::Consumed(Some(_))
         ));
 
-        // Pasted text filters instead of going to the buffer behind.
+        // Pasted text filters instead of going to the buffer behind, on one
+        // line.
         let mut variables = response_browser(true);
-        let paste = Event::Paste("errc".to_string());
+        let paste = Event::Paste("err\nc".to_string());
         assert!(matches!(
             variables.handle_event(&paste, &mut cx),
             EventResult::Consumed(None)
         ));
+        assert_eq!(variables.filter.as_ref().unwrap().prompt.line(), "err c");
         assert_eq!(rows(&variables), ["Locals", "  errCount"]);
     }
 }
