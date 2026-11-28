@@ -19,6 +19,7 @@
 - [Insert mode](#insert-mode)
 - [Select / extend mode](#select--extend-mode)
 - [Picker](#picker)
+- [Debug variables](#debug-variables)
 - [Prompt](#prompt)
 
 > 💡 Mappings marked (**LSP**) require an active language server for the file.
@@ -787,6 +788,46 @@ See the documentation page on [pickers](./pickers.md) for more info.
 | `Ctrl-v`                     | Open vertically                                            |
 | `Ctrl-t`                     | Toggle preview                                             |
 | `Escape`, `Ctrl-c`           | Close picker                                               |
+
+## Debug variables
+
+Keys to use within the debug variables browser (`Space G v`). Keys that the
+browser does not use go to the editor.
+
+| Key                     | Description                              |
+| -----                   | -------------                            |
+| `Up`, `k`, `Ctrl-p`     | Previous row                             |
+| `Down`, `j`, `Ctrl-n`   | Next row                                 |
+| `PageUp`, `Ctrl-u`      | Page up                                  |
+| `PageDown`, `Ctrl-d`    | Page down                                |
+| `Home`                  | Go to first row                          |
+| `End`                   | Go to last row                           |
+| `Right`, `l`, `Enter`   | Expand the row                           |
+| `Left`, `h`             | Collapse the row, or go to its parent    |
+| `/`                     | Filter the rows                          |
+| `Escape`, `Ctrl-c`      | Clear the filter, or close the browser   |
+
+`/` opens a filter line at the bottom, and the rows narrow as you type. Pasting
+opens it too, with the pasted text. The query has the [syntax of
+pickers](./pickers.md#filtering-picker-results): text matches the name of a
+variable, and `%type` and `%value` (or `%t` and `%v`) match its type and value,
+so `err %v nil` finds the variables named like `err` whose value is `nil`, and
+`%v !nil` the ones whose value is not.
+
+A variable's row stays when it matches, when it holds a match further down, or
+when a row above it matches, so the fields of a matching struct show when you
+expand it. A `!` term hides rows there too. Scopes such as `Locals` do not
+match; their rows stay above the variables that do. The cursor goes to the best
+match. The filter only searches what the browser has loaded, which is the
+variables of the scopes and rows that have been expanded, and a collapsed row
+that holds a match stays collapsed.
+
+On the filter line the picker keys move the cursor (`Up`, `Down`, `Tab`,
+`Shift-Tab`, `Ctrl-p`, `Ctrl-n`, `PageUp`, `PageDown`, `Ctrl-u`, `Ctrl-d`,
+`Home` and `End`), and the other [prompt](#prompt) keys edit the query.
+`Enter` goes back to the rows and keeps the filter: the keys above then work on
+the filtered rows, and `/` edits the query again. `Escape` clears the filter,
+and the cursor stays on its row.
 
 ## Prompt
 

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, mem, ops::Range, sync::Arc};
 
 #[derive(Debug)]
-pub(super) struct PickerQuery {
+pub(crate) struct PickerQuery {
     /// The column names of the picker.
     column_names: Box<[Arc<str>]>,
     /// The index of the primary column in `column_names`.
@@ -24,7 +24,7 @@ impl PartialEq<HashMap<Arc<str>, Arc<str>>> for PickerQuery {
 }
 
 impl PickerQuery {
-    pub(super) fn new<I: Iterator<Item = Arc<str>>>(
+    pub(crate) fn new<I: Iterator<Item = Arc<str>>>(
         column_names: I,
         primary_column: usize,
     ) -> Self {
@@ -39,11 +39,11 @@ impl PickerQuery {
         }
     }
 
-    pub(super) fn get(&self, column: &str) -> Option<&Arc<str>> {
+    pub(crate) fn get(&self, column: &str) -> Option<&Arc<str>> {
         self.inner.get(column)
     }
 
-    pub(super) fn parse(&mut self, input: &str) -> HashMap<Arc<str>, Arc<str>> {
+    pub(crate) fn parse(&mut self, input: &str) -> HashMap<Arc<str>, Arc<str>> {
         let mut fields: HashMap<Arc<str>, String> = HashMap::new();
         let primary_field = &self.column_names[self.primary_column];
         let mut escaped = false;
