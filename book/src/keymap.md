@@ -18,6 +18,7 @@
     - [Unimpaired](#unimpaired)
 - [Insert mode](#insert-mode)
 - [Select / extend mode](#select--extend-mode)
+- [Menu](#menu)
 - [Picker](#picker)
 - [Debug variables](#debug-variables)
 - [Prompt](#prompt)
@@ -767,6 +768,31 @@ selection and select the next instance of the search term. Toggling this
 mode before pressing `n` or `N` makes it possible to keep the current
 selection. Toggling it on and off during your iterative searching allows
 you to selectively add search terms to your selections.
+
+## Menu
+
+Keys to use within the code action menu (`Space a`) and within the choices
+that a language server asks you to make. Remapping currently not supported.
+
+| Key                                         | Description                          |
+| -----                                       | -------------                        |
+| `Shift-Tab`, `Up`, `Ctrl-p`                 | Previous entry                       |
+| `Tab`, `Down`, `Ctrl-n`                     | Next entry                           |
+| `PageUp`, `Ctrl-u`                          | Half a page up                       |
+| `PageDown`, `Ctrl-d`                        | Half a page down                     |
+| `Enter`                                     | Accept the selected entry            |
+| `Escape`, `Ctrl-c`                          | Close the menu                       |
+| `Backspace`, `Shift-Backspace`, `Ctrl-h`    | Delete the last character of the filter |
+| `Ctrl-w`, `Alt-Backspace`, `Ctrl-Backspace` | Delete the last word of the filter   |
+
+Typing filters the entries by fuzzy matching. The terms of the [picker
+syntax](./pickers.md#filtering-picker-results) work, such as `'exact`,
+`^start`, `end$` and `!not`, but a menu has no columns to name with `%`, and
+`Ctrl-r` does not insert registers. The typed text shows above the entries with
+the number of matches, the best matches come first, and the first one is
+selected. While nothing matches, `Enter` does nothing, so that the filter can be
+fixed. The completion menu is filtered by what you type in the document
+instead.
 
 ## Picker
 

@@ -1147,7 +1147,7 @@ impl Application {
                                 move |editor, action, event| {
                                     let reply = match event {
                                         ui::PromptEvent::Update => return,
-                                        ui::PromptEvent::Validate => Some(action.clone()),
+                                        ui::PromptEvent::Validate => action.cloned(),
                                         ui::PromptEvent::Abort => None,
                                     };
                                     if let Some(language_server) =

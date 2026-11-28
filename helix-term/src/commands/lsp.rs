@@ -855,7 +855,8 @@ pub fn code_action(cx: &mut Context) {
                         }
                     }
                 }
-            });
+            })
+            .filter_on_type(true);
             picker.move_down(); // pre-select the first item
 
             let popup = Popup::new("code-action", picker)
